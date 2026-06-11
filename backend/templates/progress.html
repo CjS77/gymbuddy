@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+
+{% block title %}Progress - Corre Gym{% endblock %}
+
+{% block head %}
+<script src="/static/chart.min.js"></script>
+{% endblock %}
+
+{% block content %}
+<h1>Progress</h1>
+
+<div class="card-grid">
+    <div class="card chart-card">
+        <h2>Weight Progression</h2>
+        <div class="chart-controls">
+            <select id="exercise-select">
+                <option value="">Select exercise...</option>
+            </select>
+            <select id="time-range">
+                <option value="30">Last 30 days</option>
+                <option value="90" selected>Last 90 days</option>
+                <option value="180">Last 6 months</option>
+                <option value="365">Last year</option>
+            </select>
+        </div>
+        <div class="chart-container"><canvas id="weight-chart"></canvas></div>
+    </div>
+
+    <div class="card chart-card">
+        <h2>Volume per Muscle Group</h2>
+        <div class="chart-controls">
+            <select id="volume-weeks">
+                <option value="4">Last 4 weeks</option>
+                <option value="8">Last 8 weeks</option>
+                <option value="12" selected>Last 12 weeks</option>
+                <option value="24">Last 24 weeks</option>
+            </select>
+        </div>
+        <div class="chart-container"><canvas id="volume-chart"></canvas></div>
+    </div>
+
+    <div class="card chart-card">
+        <h2>Workout Frequency</h2>
+        <div class="chart-controls">
+            <select id="freq-weeks">
+                <option value="8">Last 8 weeks</option>
+                <option value="12" selected>Last 12 weeks</option>
+                <option value="24">Last 24 weeks</option>
+            </select>
+        </div>
+        <div class="chart-container"><canvas id="frequency-chart"></canvas></div>
+    </div>
+
+    <div class="card">
+        <h2>Personal Records</h2>
+        <div class="table-wrap">
+            <table id="records-table">
+                <thead>
+                    <tr><th>Exercise</th><th>Muscle Group</th><th>PR</th><th>Date</th></tr>
+                </thead>
+                <tbody id="records-body">
+                    <tr><td colspan="4" class="placeholder">Loading...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    const EXERCISES = {{ exercises_json|safe }};
+</script>
+<script src="/static/dashboard.js"></script>
+<script>
+    document.addEventListener('DOMContentLoaded', () => { initProgress(EXERCISES); });
+</script>
+{% endblock %}

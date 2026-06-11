@@ -1,0 +1,52 @@
+services:
+  whisper:
+    profiles: [voice]
+    build:
+      context: services/whisper
+      args:
+        WHISPER_MODEL: ggml-base.en.bin
+    # For GPU support (requires nvidia-container-toolkit), uncomment:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    healthcheck:
+      test: [CMD, curl, -f, "http://localhost:5005/health"]
+      interval: 30s
+      start_period: 15s
+    restart: unless-stopped
+    networks: [corre-internal]
+
+  piper:
+    profiles: [voice]
+    build:
+      context: services/piper
+    healthcheck:
+      test: [CMD, curl, -f, "http://localhost:5000/health"]
+      interval: 30s
+      start_period: 10s
+    restart: unless-stopped
+    networks: [corre-internal]
+
+  gymbuddy:
+    build:
+      context: backend
+      dockerfile: backend/Dockerfile
+    command: ["/app/gymbuddy", "-c", "/data/gymbuddy.toml"]
+    ports:
+      - "5520:5520"
+    volumes:
+      - ${CORRE_DATA_DIR:-/var/corre}:/data
+    env_file: [.env]
+    environment:
+      CORRE_DATA_DIR: /data
+      RUST_LOG: "${RUST_LOG:-info}"
+    restart: unless-stopped
+    networks: [corre-internal]
+
+networks:
+  corre-internal:
+    driver: bridge

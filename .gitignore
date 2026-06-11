@@ -1,0 +1,16 @@
+/target
+/target-cross
+Cargo.lock
+.env
+**/.env
+*.swp
+*.swo
+.idea/
+todos.md
+dist/
+mcp-registry/site/
+plans/
+# local data
+data/
+.minesweeper/
+gymbuddy.toml

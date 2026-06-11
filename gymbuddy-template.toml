@@ -1,0 +1,54 @@
+[general]
+data_dir = "~/.local/share/corre"
+log_level = "info"
+
+[llm]
+provider = "openai-compatible"
+base_url = "https://api.venice.ai/api/v1"
+model = "nvidia-nemotron-3-nano-30b-a3b"
+api_key = "${VENICE_API_KEY}"
+temperature = 0.3
+max_concurrent = 10        # parallel LLM requests; tune to your provider's rate limit
+
+[gym]
+bind = "127.0.0.1:5520"              # web dashboard (M3, unused in M1)
+telegram_bot_token = "${CORRE_GYM_BOT_TOKEN}"
+telegram_allowed_ids = []             # empty = allow all (dev mode); set to restrict access
+default_timezone = "Europe/London"
+conversation_history_limit = 20       # messages to include in LLM context
+db_path = "data/gym-tracker.db"       # relative to data_dir
+max_message_length = 2000             # truncate user messages beyond this before sending to LLM
+session_timeout_hours = 4             # auto-close stale sessions older than this
+
+ [gym.voice]                        # optional voice pipeline (requires whisper + piper sidecars)
+ stt_enabled = true                  # enable speech-to-text
+ stt_url = "http://localhost:5005"   # whisper.cpp server endpoint
+ stt_language = "en"                 # language hint for whisper
+ tts_enabled = true                  # enable text-to-speech
+ tts_url = "http://localhost:5000"    # piper HTTP server endpoint
+ tts_voice = "en_GB-semaine-medium"  # piper voice model name
+ tts_speaker = "prudence"            # semaine speakers: prudence, spike, obadiah, poppy
+ tts_speed = 1.0                     # speaking speed: 1.0 = normal, 1.5 = 50% faster, 0.75 = slower
+ response_mode = "both"              # "voice", "text", or "both"
+ max_voice_duration_secs = 60        # reject voice messages longer than this
+
+ [gym.llm]                          # optional per-service LLM overrides
+ model = "qwen3-next-80b"
+ temperature = 0.3
+
+ # [gym.github]                                 # optional /feedback target
+ # repo = "owner/repo"                          # GitHub "owner/repo" slug
+ # token = "${GITHUB_REPORT_TOKEN}"             # PAT with `public_repo` scope
+ # labels = ["beta-feedback"]                   # labels applied to filed issues
+ # The /feedback slash command is gated by the per-user `beta_tester` flag.
+ # Flip `users.beta_tester = 1` (via SQL) to authorise an account.
+
+ [safety]
+ enabled = true                    # toggle the prompt-injection defense layer
+ max_output_bytes = 100000         # truncate MCP tool outputs exceeding this size
+ sanitize_injections = true        # detect and neutralize prompt injection phrases
+ detect_leaks = true               # scan for leaked API keys and credentials
+ boundary_wrap = true              # wrap tool outputs in XML delimiters
+ high_severity_action = "sanitize" # "warn", "sanitize", or "block"
+ custom_block_patterns = []        # additional regex patterns that trigger a block
+

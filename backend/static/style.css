@@ -1,0 +1,146 @@
+/* ── Reset & Base ──────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+    --bg: #f8f9fa; --bg-card: #fff; --text: #1a1a2e; --text-muted: #6c757d;
+    --primary: #4361ee; --primary-hover: #3a56d4; --border: #dee2e6;
+    --success: #06d6a0; --warning: #ffd166; --danger: #ef476f;
+    --sidebar-bg: #1a1a2e; --sidebar-text: #e0e0e0; --sidebar-active: #4361ee;
+    --chat-user: #4361ee; --chat-bot: #2d2d44; --radius: 8px;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #0d1117; --bg-card: #161b22; --text: #e6edf3; --text-muted: #8b949e;
+        --border: #30363d; --sidebar-bg: #010409;
+    }
+}
+
+html { font-size: 16px; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+       background: var(--bg); color: var(--text); display: flex; min-height: 100vh; }
+
+a { color: var(--primary); text-decoration: none; }
+
+/* ── Sidebar ──────────────────────────────────────────────────── */
+.sidebar { width: 220px; background: var(--sidebar-bg); color: var(--sidebar-text);
+           display: flex; flex-direction: column; padding: 1rem 0; flex-shrink: 0; }
+.sidebar-brand { font-size: 1.25rem; font-weight: 700; padding: 0.5rem 1.25rem 1.5rem;
+                 color: #fff; letter-spacing: 0.5px; }
+.nav-link { display: block; padding: 0.75rem 1.25rem; color: var(--sidebar-text);
+            transition: background 0.15s; }
+.nav-link:hover { background: rgba(255,255,255,0.08); }
+.nav-link.active { background: var(--sidebar-active); color: #fff; font-weight: 600; }
+.nav-spacer { flex: 1; }
+.nav-logout { color: var(--text-muted); }
+
+/* ── Content area ─────────────────────────────────────────────── */
+.content { flex: 1; padding: 2rem; max-width: 1200px; overflow-y: auto; }
+.content h1 { margin-bottom: 1.5rem; }
+
+/* ── Cards ────────────────────────────────────────────────────── */
+.card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+             gap: 1.5rem; }
+.card { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius);
+        padding: 1.25rem; }
+.card h2 { font-size: 1rem; margin-bottom: 1rem; color: var(--text-muted); text-transform: uppercase;
+           letter-spacing: 0.5px; }
+.chart-card { grid-column: 1 / -1; }
+
+/* ── Stats ────────────────────────────────────────────────────── */
+.stats-row { display: flex; gap: 2rem; }
+.stat { display: flex; flex-direction: column; align-items: center; }
+.stat-value { font-size: 2rem; font-weight: 700; color: var(--primary); }
+.stat-label { font-size: 0.8rem; color: var(--text-muted); text-transform: uppercase; }
+
+/* ── Goals ────────────────────────────────────────────────────── */
+.goals-list .goal-item { margin-bottom: 0.75rem; }
+.goal-bar { height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; margin-top: 4px; }
+.goal-fill { height: 100%; background: var(--primary); border-radius: 4px; transition: width 0.3s; }
+.goal-fill.achieved { background: var(--success); }
+.goal-header { display: flex; justify-content: space-between; font-size: 0.9rem; }
+
+/* ── Tables ───────────────────────────────────────────────────── */
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+th, td { padding: 0.6rem 0.75rem; text-align: left; border-bottom: 1px solid var(--border); }
+th { color: var(--text-muted); text-transform: uppercase; font-size: 0.75rem; letter-spacing: 0.5px;
+     font-weight: 600; }
+
+/* ── Filters ──────────────────────────────────────────────────── */
+.filters { display: flex; flex-wrap: wrap; gap: 0.75rem; margin-bottom: 1.5rem; align-items: end; }
+.filters label { display: flex; flex-direction: column; font-size: 0.8rem; color: var(--text-muted); gap: 4px; }
+.filters input, .filters select, .chart-controls select {
+    padding: 0.4rem 0.6rem; border: 1px solid var(--border); border-radius: var(--radius);
+    background: var(--bg-card); color: var(--text); font-size: 0.9rem; }
+.chart-controls { display: flex; gap: 0.75rem; margin-bottom: 1rem; }
+
+/* ── Buttons ──────────────────────────────────────────────────── */
+.btn { padding: 0.5rem 1rem; background: var(--primary); color: #fff; border: none;
+       border-radius: var(--radius); cursor: pointer; font-size: 0.9rem; transition: background 0.15s; }
+.btn:hover { background: var(--primary-hover); }
+.btn-secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
+.btn-secondary:hover { background: var(--border); }
+
+/* ── Pagination ───────────────────────────────────────────────── */
+.pagination { display: flex; gap: 0.5rem; margin-top: 1rem; justify-content: center; }
+.pagination button { padding: 0.4rem 0.75rem; border: 1px solid var(--border); background: var(--bg-card);
+                     color: var(--text); border-radius: var(--radius); cursor: pointer; }
+.pagination button.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+.pagination button:disabled { opacity: 0.4; cursor: default; }
+
+/* ── Charts ───────────────────────────────────────────────────── */
+.chart-container { position: relative; height: 300px; }
+
+/* ── Chat ─────────────────────────────────────────────────────── */
+.chat-container { display: flex; flex-direction: column; height: calc(100vh - 4rem); }
+.chat-messages { flex: 1; overflow-y: auto; padding: 1rem 0; display: flex; flex-direction: column; gap: 0.75rem; }
+.chat-bubble { max-width: 75%; padding: 0.75rem 1rem; border-radius: 1rem; line-height: 1.5; word-wrap: break-word; }
+.chat-bubble.user { background: var(--chat-user); color: #fff; align-self: flex-end; border-bottom-right-radius: 4px; }
+.chat-bubble.assistant { background: var(--bg-card); border: 1px solid var(--border);
+                         align-self: flex-start; border-bottom-left-radius: 4px; }
+.chat-input { display: flex; gap: 0.5rem; padding-top: 0.75rem; border-top: 1px solid var(--border); }
+.chat-input input { flex: 1; padding: 0.6rem 1rem; border: 1px solid var(--border); border-radius: 1.5rem;
+                    background: var(--bg-card); color: var(--text); font-size: 1rem; }
+.chat-input input:focus { outline: none; border-color: var(--primary); }
+.chat-typing { font-style: italic; color: var(--text-muted); font-size: 0.85rem; align-self: flex-start; padding: 0.5rem; }
+
+/* ── Health badges ────────────────────────────────────────────── */
+.health-item { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.5rem; font-size: 0.9rem; }
+.badge { padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; }
+.badge-injury { background: #ef476f22; color: var(--danger); }
+.badge-illness { background: #ffd16622; color: #b8860b; }
+.badge-wellbeing { background: #06d6a022; color: var(--success); }
+
+/* ── Session list ─────────────────────────────────────────────── */
+.session-item { display: flex; justify-content: space-between; padding: 0.5rem 0;
+                border-bottom: 1px solid var(--border); font-size: 0.9rem; }
+.session-item:last-child { border-bottom: none; }
+
+/* ── Placeholder ──────────────────────────────────────────────── */
+.placeholder { color: var(--text-muted); font-style: italic; }
+
+/* ── Login page ───────────────────────────────────────────────── */
+.login-page { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+.login-container { text-align: center; padding: 3rem; background: var(--bg-card);
+                   border: 1px solid var(--border); border-radius: var(--radius); }
+.login-container h1 { font-size: 2rem; margin-bottom: 1rem; }
+.login-container p { color: var(--text-muted); margin-bottom: 2rem; }
+.telegram-login { display: flex; justify-content: center; }
+
+/* ── Mobile ───────────────────────────────────────────────────── */
+@media (max-width: 768px) {
+    body { flex-direction: column; }
+    .sidebar { width: 100%; flex-direction: row; overflow-x: auto; padding: 0;
+               position: fixed; bottom: 0; z-index: 10; }
+    .sidebar-brand { display: none; }
+    .nav-link { padding: 0.75rem 1rem; white-space: nowrap; text-align: center; font-size: 0.85rem; }
+    .nav-spacer { display: none; }
+    .nav-logout { display: none; }
+    .content { padding: 1rem; padding-bottom: 4rem; }
+    .card-grid { grid-template-columns: 1fr; }
+    .stats-row { gap: 1rem; }
+    .stat-value { font-size: 1.5rem; }
+    .chat-bubble { max-width: 90%; }
+    .filters { flex-direction: column; }
+}

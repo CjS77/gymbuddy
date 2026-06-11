@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Corre Gym{% endblock %}</title>
+    <link rel="stylesheet" href="/static/style.css">
+    {% block head %}{% endblock %}
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="sidebar-brand">Corre Gym</div>
+        <a href="/" class="nav-link{% if active_page == "dashboard" %} active{% endif %}">Dashboard</a>
+        <a href="/history" class="nav-link{% if active_page == "history" %} active{% endif %}">History</a>
+        <a href="/progress" class="nav-link{% if active_page == "progress" %} active{% endif %}">Progress</a>
+        <a href="/chat" class="nav-link{% if active_page == "chat" %} active{% endif %}">Chat</a>
+        <div class="nav-spacer"></div>
+        <a href="/logout" class="nav-link nav-logout">Logout</a>
+    </nav>
+    <main class="content">
+        {% block content %}{% endblock %}
+    </main>
+    {% block scripts %}{% endblock %}
+</body>
+</html>
