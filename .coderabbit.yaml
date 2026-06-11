@@ -1,0 +1,45 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit configuration — https://docs.coderabbit.ai/getting-started/configure-coderabbit
+language: en-US
+early_access: false
+
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+  changed_files_summary: true
+  sequence_diagrams: true
+
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - main
+
+  path_filters:
+    - "!**/Cargo.lock"
+    - "!**/target/**"
+    - "!**/*.lock"
+    - "!**/static/**"
+    - "!**/migrations/**"
+
+  path_instructions:
+    - path: "**/*.rs"
+      instructions: >-
+        Follow Rust 2024 edition idioms. Enforce: max line width 140 chars,
+        4-space indentation, inline format string args (e.g. `format!("{e}")`
+        not `format!("{}", e)`), and a functional/iterator style over
+        imperative `for` loops where it reads naturally. Flag functions that do
+        more than one thing or that could be split into helpers for readability.
+        Check for missing error handling, `.unwrap()`/`.expect()` on fallible
+        paths, and unhandled async cancellation.
+
+  tools:
+    clippy:
+      enabled: true
+
+chat:
+  auto_reply: true
