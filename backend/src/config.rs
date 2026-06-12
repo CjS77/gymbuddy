@@ -7,8 +7,6 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct GymConfig {
-    #[serde(default = "default_bind")]
-    pub bind: String,
     pub telegram_bot_token: String,
     /// Telegram user IDs allowed to use the bot. Empty = allow all (dev mode).
     #[serde(default)]
@@ -130,10 +128,6 @@ fn default_tts_speed() -> f32 {
 
 fn default_max_voice_duration() -> u32 {
     60
-}
-
-fn default_bind() -> String {
-    "127.0.0.1:5520".into()
 }
 
 fn default_timezone() -> String {

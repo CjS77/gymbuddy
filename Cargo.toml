@@ -26,11 +26,6 @@ toml = "0.8"
 
 # HTTP
 reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls"], default-features = false }
-axum = "0.8"
-tower-http = { version = "0.6", features = ["fs", "cors"] }
-
-# Templating
-askama = "0.13"
 
 # Time & scheduling
 chrono = { version = "0.4", features = ["serde"] }
@@ -65,10 +60,8 @@ uuid = { version = "1", features = ["v4"] }
 url = "2"
 ammonia = "4"
 aho-corasick = "1"
-base64 = "0.22"
 log = "0.4.29"
 regex = "1"
-rust-embed = "8"
 dialoguer = "0.11"
 console = "0.15"
 sysinfo = "0.34"
@@ -79,8 +72,6 @@ rusqlite_migration = { version = "2", features = ["from-directory"] }
 include_dir = "0.7"
 csv = "1"
 lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
-sha2 = "0.10"
-hmac = "0.12"
 hex = "0.4"
 dashmap = "6"
 dotenvy = "0.15.7"

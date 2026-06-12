@@ -1412,7 +1412,6 @@ mod tests {
 
     fn test_config() -> GymConfig {
         GymConfig {
-            bind: "127.0.0.1:5520".to_string(),
             telegram_bot_token: "123456:ABC".to_string(),
             telegram_allowed_ids: vec![],
             default_timezone: "UTC".to_string(),

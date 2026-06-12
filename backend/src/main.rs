@@ -14,7 +14,6 @@ use gymbuddy_backend::db::Database;
 use gymbuddy_backend::github::{GithubIssueReporter, IssueReporter};
 use gymbuddy_backend::telegram::{Message, TelegramClient, Voice};
 use gymbuddy_backend::voice::VoicePipeline;
-use gymbuddy_backend::web;
 use corre_llm::OpenAiCompatProvider;
 
 #[derive(Parser)]
@@ -35,21 +34,11 @@ fn default_config_path() -> PathBuf {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let (telegram, handler, allowed_ids, voice_pipeline, gym_config, db, bot_username) = setup().await?;
+    let (telegram, handler, allowed_ids, voice_pipeline, _gym_config, _db) = setup().await?;
     let handler = Arc::new(handler);
 
     tokio::select! {
         result = run_polling_loop(&telegram, &handler, &allowed_ids, voice_pipeline.as_ref()) => {
-            result
-        }
-        result = web::serve(
-            &gym_config.bind,
-            db,
-            handler.clone(),
-            gym_config.clone(),
-            bot_username,
-            None,
-        ) => {
             result
         }
         _ = tokio::signal::ctrl_c() => {
@@ -60,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn setup()
--> anyhow::Result<(TelegramClient, AssistantHandler, Vec<i64>, Option<VoicePipeline>, GymConfig, Arc<Mutex<Database>>, String)> {
+-> anyhow::Result<(TelegramClient, AssistantHandler, Vec<i64>, Option<VoicePipeline>, GymConfig, Arc<Mutex<Database>>)> {
     // 1. Load .env from data dir (best-effort, same as corre-news)
     let default_data_dir = default_data_dir();
     tracing::info!("Loading environment from {}", default_data_dir.display());
@@ -99,7 +88,7 @@ async fn setup()
         raw_llm
     };
 
-    // 6. Open database (RwLock for parallel reads from web + Telegram)
+    // 6. Open database
     let db_path = data_dir.join(&gym_config.db_path);
     tracing::info!("Loading database from {}", db_path.display());
     let db = Database::open(&db_path)?;
@@ -109,9 +98,7 @@ async fn setup()
     // 7. Create Telegram client, verify connection
     let telegram = TelegramClient::new(&gym_config.telegram_bot_token)?;
     let me = telegram.get_me().await?;
-    let bot_username = me.username.clone().unwrap_or_default();
-    debug_assert!(!bot_username.starts_with('@'), "bot_username should not start with @");
-    tracing::info!("Bot @{bot_username} connected (id: {})", me.id);
+    tracing::info!("Bot connected (id: {})", me.id);
 
     let allowed_ids = gym_config.telegram_allowed_ids.clone();
 
@@ -154,7 +141,7 @@ async fn setup()
         }
     };
 
-    Ok((telegram, handler, allowed_ids, voice_pipeline, gym_config, db, bot_username))
+    Ok((telegram, handler, allowed_ids, voice_pipeline, gym_config, db))
 }
 
 async fn run_polling_loop(
