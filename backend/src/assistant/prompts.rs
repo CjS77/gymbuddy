@@ -117,6 +117,14 @@ re-labels the whole exercise block; `new_value` is the new weight_kg (or duratio
 / distance_m for timed / distance exercises). Include ONLY the fields the user wants \
 changed. Never send an id — the host finds the set by recency and appends the exact \
 before→after summary to your reply.\n\
+- {{\"type\": \"get_last_exercise\", \"exercise\": \"<EXACT or fuzzy name>\"}}\n\
+  Looks up the user's most recent exercise_entry for the named exercise and \
+appends a summary (resolved exercise name, start time, every set) to your reply. \
+Use this whenever the user asks what / when / how they last did an exercise (\"what \
+was my last bench press?\", \"when did I last squat?\"). Do NOT invent numbers \
+from RECENT HISTORY — emit the action and let the host fetch the authoritative \
+entry. If the user gave a parent or muscle-group word the host falls back to the \
+nearest descendant that has been logged.\n\
 \n\
 EXERCISE TAXONOMY: Exercises are organised in a 4-level tree: muscle_group → \
 specific_muscle → exercise → variation. Users can log against any level.\n\
@@ -201,6 +209,11 @@ The correct response is:\n\
   {{\"message\": \"<one short acknowledgement>\", \"actions\": [{{\"type\": \
 \"end_session\"}}]}}\n\
 - Auto-start a session (start_session action) before logging if no session is active\n\
+- When the user asks about their most recent performance of an exercise (e.g. \
+\"what was my last bench press?\", \"when did I last squat?\", \"how heavy did I \
+go on deadlift?\"), emit a get_last_exercise action with the exercise name. Do \
+NOT make up numbers from RECENT HISTORY — the host fetches the authoritative \
+entry and appends the summary to your reply.\n\
 - If the user mentions pain, injury, or illness, log it with log_health\n\
 - Keep responses concise -- this is a chat interface\n\
 - Be encouraging but not patronizing\n\
@@ -217,8 +230,8 @@ COLLECTING DATA BEFORE LOGGING:\n\
 This rule applies ONLY to data-collection actions (log_exercise, log_exercise_timed, \
 log_exercise_distance, log_health, set_goal). Navigation actions (start_session, \
 end_session, close_exercise_entry, confirm_close_exercise_entry, \
-close_all_open_entries, delete_exercise_entry, edit_set) MUST be emitted as soon as the \
-user's intent is clear, even with no other data.\n\
+close_all_open_entries, delete_exercise_entry, edit_set, get_last_exercise) MUST be \
+emitted as soon as the user's intent is clear, even with no other data.\n\
 \n\
 Do NOT emit any log_exercise action until you have ALL required data. Respond with \
 \"actions\": [] while gathering info. Collect data across multiple messages using \
@@ -684,5 +697,12 @@ mod tests {
     fn format_no_goals() {
         let text = format_active_goals(&[]);
         assert!(text.contains("ACTIVE GOALS: None"));
+    }
+
+    #[test]
+    fn prompt_describes_get_last_exercise_action() {
+        let ctx = base_context();
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("get_last_exercise"), "prompt must advertise the get_last_exercise action");
     }
 }

@@ -692,6 +692,7 @@ impl AssistantHandler {
             AssistantAction::EditSet { exercise, new_exercise, new_reps, new_value, new_difficulty } => {
                 self.edit_set_action(user, exercise.as_deref(), new_exercise.as_deref(), *new_reps, *new_value, *new_difficulty).await
             }
+            AssistantAction::GetLastExercise { exercise } => self.get_last_exercise_action(user, exercise).await,
             AssistantAction::Unknown => {
                 tracing::debug!("Ignoring unknown action type from LLM");
                 Ok(None)
@@ -876,6 +877,44 @@ impl AssistantHandler {
             return Ok(None);
         }
         Ok(Some(format!("Updated your last set — {}.", parts.join(", "))))
+    }
+
+    /// Look up and render the user's most recent `exercise_entry` for an exercise
+    /// named in free text. Tries an exact-type match first; if nothing is logged,
+    /// falls back to a descendants-inclusive query so coarse names like "chest"
+    /// still resolve to a logged variation. Always user-scoped via SQL.
+    async fn get_last_exercise_action(&self, user: &User, exercise: &str) -> anyhow::Result<Option<String>> {
+        let Some(et) = find_exercise_type(&self.catalogue, exercise) else {
+            return Ok(Some(format!("I don't have \"{exercise}\" in my exercise list.")));
+        };
+        let asked_name = et.exercise_type.name.clone();
+        let db = self.db.lock().await;
+        let (entry, fell_back) = match db.most_recent_entry_for_exercise(user.id, et.exercise_type.id, false)? {
+            Some(e) => (e, false),
+            None => match db.most_recent_entry_for_exercise(user.id, et.exercise_type.id, true)? {
+                Some(e) => (e, true),
+                None => return Ok(Some(format!("You haven't logged any {asked_name} yet."))),
+            },
+        };
+        let sets = db.list_sets_for_entry(entry.id)?;
+        let resolved_name = entry_exercise_name(&db, &self.catalogue, entry.id)?;
+        let summary = sets.iter().map(format_set_short).collect::<Vec<_>>().join(", ");
+        let suffix = if fell_back && resolved_name != asked_name {
+            format!(
+                "No direct {asked_name} entries — showing nearest match {resolved_name} from {start} ({n} {sets_word}: {summary}).",
+                start = entry.start_timestamp,
+                n = sets.len(),
+                sets_word = if sets.len() == 1 { "set" } else { "sets" },
+            )
+        } else {
+            format!(
+                "Your last {resolved_name} was {start} ({n} {sets_word}: {summary}).",
+                start = entry.start_timestamp,
+                n = sets.len(),
+                sets_word = if sets.len() == 1 { "set" } else { "sets" },
+            )
+        };
+        Ok(Some(suffix))
     }
 
     /// Set-count checkpoint: every time the user logs a set in an open entry that
@@ -2305,5 +2344,42 @@ mod tests {
         assert!(body.starts_with("the squat rack is broken"));
         assert!(body.contains("Reported by: Alice"));
         assert!(body.contains("telegram_id: 999"));
+    }
+
+    // ─── get_last_exercise ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_last_exercise_returns_entry_when_logged() {
+        let log = r#"{"message": "Logged.", "actions": [
+            {"type": "log_exercise", "exercise": "Bench Press", "reps": 8, "weight_kg": 80.0, "perceived_difficulty": "medium"}
+        ]}"#;
+        let (handler, llm) = setup_handler(log).await;
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
+        let _ = handler.handle_text_message(&msg, "bench 80kg 8 medium").await.unwrap();
+
+        llm.set_response(
+            r#"{"message": "Here's your last bench press.", "actions": [
+                {"type": "get_last_exercise", "exercise": "Bench Press"}
+            ]}"#,
+        );
+        let reply = handler.handle_text_message(&msg, "what was my last bench press?").await.unwrap();
+        assert!(reply.text.contains("Bench Press"), "reply must name the resolved exercise, got: {}", reply.text);
+        assert!(reply.text.contains("8×80.0kg"), "reply must include the set, got: {}", reply.text);
+    }
+
+    #[tokio::test]
+    async fn get_last_exercise_returns_not_found_message_when_absent() {
+        let (handler, llm) = setup_handler(r#"{"message": "ok", "actions": []}"#).await;
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
+
+        llm.set_response(
+            r#"{"message": "Looking it up.", "actions": [
+                {"type": "get_last_exercise", "exercise": "Bench Press"}
+            ]}"#,
+        );
+        let reply = handler.handle_text_message(&msg, "what was my last bench press?").await.unwrap();
+        assert!(reply.text.to_lowercase().contains("haven't logged"), "expected not-found phrasing, got: {}", reply.text);
     }
 }

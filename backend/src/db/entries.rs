@@ -553,6 +553,44 @@ impl Database {
         rows.next().transpose().context("Failed to read most recent set")
     }
 
+    /// Most recently started `exercise_entry` for `user_id` whose sets reference
+    /// `exercise_type_id`. When `include_descendants` is true the match is
+    /// expanded to any descendant of `exercise_type_id` in the exercise taxonomy,
+    /// mirroring `list_sets_for_exercise_type` / `personal_record`. Entries with
+    /// no sets are skipped via the `EXISTS` predicate. Tie-break order matches
+    /// `most_recent_set_for_user`: start_timestamp DESC, then entry id DESC.
+    pub fn most_recent_entry_for_exercise(
+        &self,
+        user_id: i64,
+        exercise_type_id: i64,
+        include_descendants: bool,
+    ) -> anyhow::Result<Option<ExerciseEntry>> {
+        let sql = if include_descendants {
+            "WITH RECURSIVE tree(id) AS ( \
+                 SELECT id FROM exercise_types WHERE id = ?2 \
+                 UNION ALL \
+                 SELECT et.id FROM exercise_types et JOIN tree t ON et.parent_id = t.id \
+             ) \
+             SELECT ee.id, ee.user_id, ee.session_id, ee.start_timestamp, ee.end_timestamp, ee.comment \
+             FROM exercise_entry ee \
+             WHERE ee.user_id = ?1 \
+               AND EXISTS (SELECT 1 FROM sets s \
+                           WHERE s.exercise_entry_id = ee.id \
+                             AND s.exercise_type_id IN (SELECT id FROM tree)) \
+             ORDER BY ee.start_timestamp DESC, ee.id DESC LIMIT 1"
+        } else {
+            "SELECT ee.id, ee.user_id, ee.session_id, ee.start_timestamp, ee.end_timestamp, ee.comment \
+             FROM exercise_entry ee \
+             WHERE ee.user_id = ?1 \
+               AND EXISTS (SELECT 1 FROM sets s \
+                           WHERE s.exercise_entry_id = ee.id AND s.exercise_type_id = ?2) \
+             ORDER BY ee.start_timestamp DESC, ee.id DESC LIMIT 1"
+        };
+        let mut stmt = self.conn().prepare(sql)?;
+        let mut rows = stmt.query_map(params![user_id, exercise_type_id], row_to_entry)?;
+        rows.next().transpose().context("Failed to read most recent entry for exercise")
+    }
+
     /// Re-point every set in an entry at a different exercise type and
     /// measurement type. Returns the number of rows updated.
     pub fn set_exercise_type_for_entry(&self, entry_id: i64, exercise_type_id: i64, mt: MeasurementType) -> anyhow::Result<usize> {
@@ -979,6 +1017,101 @@ mod tests {
         let other = db.insert_user(&new_user("Other", None, "UTC")).unwrap();
         seed_set(&db, other, bp_id, 50.0, 5);
         assert!(db.most_recent_set_for_user(user_id, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn most_recent_entry_for_exercise_returns_exact_match() {
+        let (db, user_id, bp_id) = fixture();
+        let entry_id = db.insert_entry(&new_exercise_entry(user_id, None, None)).unwrap();
+        let mut s = new_exercise_set(entry_id, bp_id, MeasurementType::WeightReps, 80.0);
+        s.count = Some(8);
+        db.insert_set(&s).unwrap();
+
+        let found = db.most_recent_entry_for_exercise(user_id, bp_id, false).unwrap().unwrap();
+        assert_eq!(found.id, entry_id);
+    }
+
+    #[test]
+    fn most_recent_entry_for_exercise_none_when_only_unrelated_logged() {
+        let (db, user_id, bp_id) = fixture();
+        let squat_id = db.get_exercise_type_by_name("Squat").unwrap().unwrap().id;
+        let entry_id = db.insert_entry(&new_exercise_entry(user_id, None, None)).unwrap();
+        let mut s = new_exercise_set(entry_id, squat_id, MeasurementType::WeightReps, 100.0);
+        s.count = Some(5);
+        db.insert_set(&s).unwrap();
+
+        // Different taxonomy branch — exact and descendants-inclusive queries both miss.
+        assert!(db.most_recent_entry_for_exercise(user_id, bp_id, false).unwrap().is_none());
+        assert!(db.most_recent_entry_for_exercise(user_id, bp_id, true).unwrap().is_none());
+    }
+
+    #[test]
+    fn most_recent_entry_for_exercise_descendant_rolls_up() {
+        let (db, user_id, bp_id) = fixture();
+        let flat_id = db.get_exercise_type_by_name("Flat Barbell Bench Press").unwrap().unwrap().id;
+        let entry_id = db.insert_entry(&new_exercise_entry(user_id, None, None)).unwrap();
+        let mut s = new_exercise_set(entry_id, flat_id, MeasurementType::WeightReps, 90.0);
+        s.count = Some(5);
+        db.insert_set(&s).unwrap();
+
+        // Querying Bench Press (parent) without descendants → no hit, since the
+        // logged set is against the variation, not the parent.
+        assert!(db.most_recent_entry_for_exercise(user_id, bp_id, false).unwrap().is_none());
+        // With descendants → finds the variation entry.
+        let found = db.most_recent_entry_for_exercise(user_id, bp_id, true).unwrap().unwrap();
+        assert_eq!(found.id, entry_id);
+    }
+
+    #[test]
+    fn most_recent_entry_for_exercise_picks_latest_when_multiple() {
+        let (db, user_id, bp_id) = fixture();
+        let older = db.insert_entry(&new_exercise_entry(user_id, None, None)).unwrap();
+        db.conn()
+            .execute("UPDATE exercise_entry SET start_timestamp = ?1 WHERE id = ?2", params!["2025-01-01 09:00:00", older])
+            .unwrap();
+        let mut s = new_exercise_set(older, bp_id, MeasurementType::WeightReps, 60.0);
+        s.count = Some(8);
+        db.insert_set(&s).unwrap();
+
+        let newer = db.insert_entry(&new_exercise_entry(user_id, None, None)).unwrap();
+        db.conn()
+            .execute("UPDATE exercise_entry SET start_timestamp = ?1 WHERE id = ?2", params!["2025-02-01 09:00:00", newer])
+            .unwrap();
+        let mut s = new_exercise_set(newer, bp_id, MeasurementType::WeightReps, 75.0);
+        s.count = Some(5);
+        db.insert_set(&s).unwrap();
+
+        let found = db.most_recent_entry_for_exercise(user_id, bp_id, false).unwrap().unwrap();
+        assert_eq!(found.id, newer);
+    }
+
+    #[test]
+    fn most_recent_entry_for_exercise_is_user_scoped() {
+        let (db, user_id, bp_id) = fixture();
+        let other = db.insert_user(&new_user("Other", None, "UTC")).unwrap();
+        let other_entry = db.insert_entry(&new_exercise_entry(other, None, None)).unwrap();
+        let mut s = new_exercise_set(other_entry, bp_id, MeasurementType::WeightReps, 100.0);
+        s.count = Some(5);
+        db.insert_set(&s).unwrap();
+
+        // The requesting user has nothing logged for this exercise.
+        assert!(db.most_recent_entry_for_exercise(user_id, bp_id, false).unwrap().is_none());
+        assert!(db.most_recent_entry_for_exercise(user_id, bp_id, true).unwrap().is_none());
+    }
+
+    #[test]
+    fn most_recent_entry_for_exercise_ignores_empty_entries() {
+        let (db, user_id, bp_id) = fixture();
+        // An empty entry that would otherwise win the recency tie-break.
+        db.insert_entry(&new_exercise_entry(user_id, None, None)).unwrap();
+        // The real, populated entry.
+        let real = db.insert_entry(&new_exercise_entry(user_id, None, None)).unwrap();
+        let mut s = new_exercise_set(real, bp_id, MeasurementType::WeightReps, 80.0);
+        s.count = Some(8);
+        db.insert_set(&s).unwrap();
+
+        let found = db.most_recent_entry_for_exercise(user_id, bp_id, false).unwrap().unwrap();
+        assert_eq!(found.id, real);
     }
 
     #[test]

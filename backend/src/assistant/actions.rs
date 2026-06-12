@@ -115,6 +115,15 @@ pub enum AssistantAction {
         #[serde(default, alias = "difficulty")]
         new_difficulty: Option<Difficulty>,
     },
+    /// Look up the user's most recent `exercise_entry` for a named exercise and
+    /// report its sets. Free-text `exercise` is resolved through
+    /// `find_exercise_type`; when nothing is logged against the exact type the
+    /// handler falls back to a descendants-inclusive query so coarse names like
+    /// "chest" still surface a logged variation.
+    GetLastExercise {
+        #[serde(alias = "exercise_entry", alias = "name")]
+        exercise: String,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -296,6 +305,27 @@ mod tests {
         match action {
             AssistantAction::EditSet { new_value, .. } => assert_eq!(new_value, Some(50.0)),
             _ => panic!("expected EditSet"),
+        }
+    }
+
+    #[test]
+    fn parse_get_last_exercise() {
+        let json = r#"{"type": "get_last_exercise", "exercise": "Bench Press"}"#;
+        let action: AssistantAction = serde_json::from_str(json).unwrap();
+        match action {
+            AssistantAction::GetLastExercise { exercise } => assert_eq!(exercise, "Bench Press"),
+            _ => panic!("expected GetLastExercise"),
+        }
+    }
+
+    #[test]
+    fn parse_get_last_exercise_alias() {
+        // The issue body suggests `exercise_entry` as the field name; accept it via alias.
+        let json = r#"{"type": "get_last_exercise", "exercise_entry": "Squat"}"#;
+        let action: AssistantAction = serde_json::from_str(json).unwrap();
+        match action {
+            AssistantAction::GetLastExercise { exercise } => assert_eq!(exercise, "Squat"),
+            _ => panic!("expected GetLastExercise"),
         }
     }
 
