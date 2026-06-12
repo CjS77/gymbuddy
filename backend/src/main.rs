@@ -13,6 +13,7 @@ use gymbuddy_backend::config::GymConfig;
 use gymbuddy_backend::db::Database;
 use gymbuddy_backend::github::{GithubIssueReporter, IssueReporter};
 use gymbuddy_backend::telegram::{Message, TelegramClient, Voice};
+use gymbuddy_backend::transport;
 use gymbuddy_backend::voice::VoicePipeline;
 use corre_llm::OpenAiCompatProvider;
 
@@ -34,13 +35,32 @@ fn default_config_path() -> PathBuf {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let (telegram, handler, allowed_ids, voice_pipeline, _gym_config, _db) = setup().await?;
+    let (telegram, handler, allowed_ids, voice_pipeline, gym_config) = setup().await?;
     let handler = Arc::new(handler);
 
-    tokio::select! {
-        result = run_polling_loop(&telegram, &handler, &allowed_ids, voice_pipeline.as_ref()) => {
-            result
+    anyhow::ensure!(
+        telegram.is_some() || gym_config.confide.is_some(),
+        "no transport configured: set telegram_bot_token and/or [gym.confide] in the config"
+    );
+
+    // Each transport runs only when configured; the absent one parks forever so it
+    // never wins the select!.
+    let telegram_loop = async {
+        match telegram.as_ref() {
+            Some(tg) => run_polling_loop(tg, &handler, &allowed_ids, voice_pipeline.as_ref()).await,
+            None => std::future::pending::<anyhow::Result<()>>().await,
         }
+    };
+    let confide_loop = async {
+        match gym_config.confide.clone() {
+            Some(cfg) => transport::confide::serve(handler.clone(), cfg).await,
+            None => std::future::pending::<anyhow::Result<()>>().await,
+        }
+    };
+
+    tokio::select! {
+        result = telegram_loop => result,
+        result = confide_loop => result,
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Ctrl+C received, shutting down");
             Ok(())
@@ -49,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn setup()
--> anyhow::Result<(TelegramClient, AssistantHandler, Vec<i64>, Option<VoicePipeline>, GymConfig, Arc<Mutex<Database>>)> {
+-> anyhow::Result<(Option<TelegramClient>, AssistantHandler, Vec<i64>, Option<VoicePipeline>, GymConfig)> {
     // 1. Load .env from data dir (best-effort, same as corre-news)
     let default_data_dir = default_data_dir();
     tracing::info!("Loading environment from {}", default_data_dir.display());
@@ -95,10 +115,20 @@ async fn setup()
     let db = Arc::new(Mutex::new(db));
     tracing::info!("Database ready!");
 
-    // 7. Create Telegram client, verify connection
-    let telegram = TelegramClient::new(&gym_config.telegram_bot_token)?;
-    let me = telegram.get_me().await?;
-    tracing::info!("Bot connected (id: {})", me.id);
+    // 7. Create Telegram client only when a token is configured (a confide-only
+    //    server runs with no Telegram token); verify the connection if present.
+    let telegram = match gym_config.telegram_bot_token.as_deref() {
+        Some(token) => {
+            let client = TelegramClient::new(token)?;
+            let me = client.get_me().await?;
+            tracing::info!("Bot connected (id: {})", me.id);
+            Some(client)
+        }
+        None => {
+            tracing::info!("No Telegram token configured; Telegram transport disabled");
+            None
+        }
+    };
 
     let allowed_ids = gym_config.telegram_allowed_ids.clone();
 
@@ -141,7 +171,7 @@ async fn setup()
         }
     };
 
-    Ok((telegram, handler, allowed_ids, voice_pipeline, gym_config, db))
+    Ok((telegram, handler, allowed_ids, voice_pipeline, gym_config))
 }
 
 async fn run_polling_loop(

@@ -1,6 +1,9 @@
 [workspace]
 members = [
-    "backend"
+    "backend",
+    "crates/proto",
+    "crates/client",
+    "crates/tui",
 ]
 resolver = "2"
 
@@ -10,6 +13,13 @@ edition = "2024"
 license = "MPL-2"
 
 [workspace.dependencies]
+# GymBuddy crates
+gymbuddy-proto = { path = "crates/proto" }
+gymbuddy-client = { path = "crates/client" }
+
+# Encrypted p2p transport (iroh-based, E2E-encrypted, ed25519 PeerId = identity)
+confide = { path = "../confide" }
+
 corre-sdk = { version = "0.21", git = "https://github.com/corre-pa/corre", branch = "main" }
 corre-core = { version = "0.21", git = "https://github.com/corre-pa/corre", branch = "main" }
 corre-llm = { version = "0.21", git = "https://github.com/corre-pa/corre", branch = "main" }
@@ -21,6 +31,8 @@ tokio = { version = "1", features = ["full"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+postcard = { version = "1", features = ["use-std"] }
+bytes = { version = "1", features = ["serde"] }
 serde_yaml_ng = "0.9"
 toml = "0.8"
 
@@ -40,6 +52,10 @@ tantivy = "0.22"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+
+# TUI
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
 
 # Logging
 tracing = "0.1"

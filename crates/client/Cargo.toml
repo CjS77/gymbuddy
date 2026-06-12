@@ -1,0 +1,16 @@
+[package]
+name = "gymbuddy-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reusable, UI-agnostic GymBuddy client core (confide transport + identity)"
+
+[dependencies]
+anyhow = { workspace = true }
+bytes = { workspace = true }
+confide = { workspace = true }
+dirs = { workspace = true }
+futures = { workspace = true }
+gymbuddy-proto = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
