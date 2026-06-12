@@ -101,6 +101,10 @@ mod tests {
             make(5, "Barbell Curl", "bb curl,barbell curls", "Arms"),
             make(6, "Dumbbell Curl", "db curl,dumbbell curls", "Arms"),
             make(7, "Hammer Curl", "hammer curls", "Arms"),
+            make(8, "Bent Over Barbell Row", "barbell row,bent over row,bent-over row,bent-over barbell row,bb row", "Back"),
+            make(9, "Seated Row", "row", "Back"),
+            make(10, "Cable Seated Row", "", "Back"),
+            make(11, "Machine Seated Row", "", "Back"),
         ]
     }
 
@@ -156,6 +160,55 @@ mod tests {
     fn no_match() {
         let cat = fixture();
         assert!(find_exercise_type(&cat, "Underwater Basket Weaving").is_none());
+    }
+
+    #[test]
+    fn alias_match_barbell_row() {
+        let cat = fixture();
+        let found = find_exercise_type(&cat, "barbell row").unwrap();
+        assert_eq!(found.exercise_type.name, "Bent Over Barbell Row");
+    }
+
+    #[test]
+    fn alias_match_bent_over_row() {
+        let cat = fixture();
+        let found = find_exercise_type(&cat, "bent over row").unwrap();
+        assert_eq!(found.exercise_type.name, "Bent Over Barbell Row");
+    }
+
+    #[test]
+    fn alias_match_hyphenated_bent_over_barbell_row() {
+        let cat = fixture();
+        let found = find_exercise_type(&cat, "bent-over barbell row").unwrap();
+        assert_eq!(found.exercise_type.name, "Bent Over Barbell Row");
+    }
+
+    #[test]
+    fn exact_match_bent_over_barbell_row() {
+        let cat = fixture();
+        let found = find_exercise_type(&cat, "Bent Over Barbell Row").unwrap();
+        assert_eq!(found.exercise_type.name, "Bent Over Barbell Row");
+    }
+
+    #[test]
+    fn seated_row_alias_still_resolves() {
+        let cat = fixture();
+        let found = find_exercise_type(&cat, "row").unwrap();
+        assert_eq!(found.exercise_type.name, "Seated Row");
+    }
+
+    #[test]
+    fn cable_seated_row_exact_still_resolves() {
+        let cat = fixture();
+        let found = find_exercise_type(&cat, "Cable Seated Row").unwrap();
+        assert_eq!(found.exercise_type.name, "Cable Seated Row");
+    }
+
+    #[test]
+    fn machine_seated_row_exact_still_resolves() {
+        let cat = fixture();
+        let found = find_exercise_type(&cat, "Machine Seated Row").unwrap();
+        assert_eq!(found.exercise_type.name, "Machine Seated Row");
     }
 
     #[test]
