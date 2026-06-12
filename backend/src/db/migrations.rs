@@ -24,7 +24,7 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         MIGRATIONS.to_latest(&mut conn).expect("up to latest failed");
         let after_up: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(after_up, 3);
+        assert_eq!(after_up, 4);
 
         MIGRATIONS.to_version(&mut conn, 0).expect("down to 0 failed");
         let after_down: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
@@ -36,7 +36,7 @@ mod tests {
 
         MIGRATIONS.to_latest(&mut conn).expect("re-apply up failed");
         let after_redo: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(after_redo, 3);
+        assert_eq!(after_redo, 4);
     }
 
     #[test]
@@ -55,5 +55,14 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM exercise_types WHERE name = 'Cardio' AND level = 'muscle_group'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(cardio, 1, "Cardio muscle_group must be present");
+
+        let bent_over: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM exercise_types WHERE name = 'Bent Over Barbell Row' AND parent_id = 200 AND level = 'exercise'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bent_over, 1, "Bent Over Barbell Row must be seeded under Latissimus Dorsi");
     }
 }
