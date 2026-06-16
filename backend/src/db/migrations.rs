@@ -24,7 +24,7 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         MIGRATIONS.to_latest(&mut conn).expect("up to latest failed");
         let after_up: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(after_up, 5);
+        assert_eq!(after_up, 6);
 
         MIGRATIONS.to_version(&mut conn, 0).expect("down to 0 failed");
         let after_down: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
@@ -36,7 +36,7 @@ mod tests {
 
         MIGRATIONS.to_latest(&mut conn).expect("re-apply up failed");
         let after_redo: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(after_redo, 5);
+        assert_eq!(after_redo, 6);
     }
 
     #[test]
@@ -64,5 +64,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(bent_over, 1, "Bent Over Barbell Row must be seeded under Latissimus Dorsi");
+
+        let one_arm: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM exercise_types WHERE name = 'One Arm Dumbbell Row' AND parent_id = 200 AND level = 'exercise'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(one_arm, 1, "One Arm Dumbbell Row must be seeded under Latissimus Dorsi");
     }
 }
