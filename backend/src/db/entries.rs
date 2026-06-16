@@ -556,9 +556,15 @@ impl Database {
     /// Most recently started `exercise_entry` for `user_id` whose sets reference
     /// `exercise_type_id`. When `include_descendants` is true the match is
     /// expanded to any descendant of `exercise_type_id` in the exercise taxonomy,
-    /// mirroring `list_sets_for_exercise_type` / `personal_record`. Entries with
-    /// no sets are skipped via the `EXISTS` predicate. Tie-break order matches
+    /// mirroring `list_sets_for_exercise_type` / `personal_record`, and the
+    /// shallowest matching descendant is preferred over a deeper one — i.e. an
+    /// entry against the queried node itself beats a child variation, a child
+    /// beats a grandchild — before recency is consulted. This matches the
+    /// "nearest match" contract the assistant promises when it falls back from
+    /// an exact lookup. Within a single depth, the tie-break order matches
     /// `most_recent_set_for_user`: start_timestamp DESC, then entry id DESC.
+    /// Entries with no sets are skipped because the join on matching sets
+    /// removes them.
     pub fn most_recent_entry_for_exercise(
         &self,
         user_id: i64,
@@ -566,18 +572,20 @@ impl Database {
         include_descendants: bool,
     ) -> anyhow::Result<Option<ExerciseEntry>> {
         let sql = if include_descendants {
-            "WITH RECURSIVE tree(id) AS ( \
-                 SELECT id FROM exercise_types WHERE id = ?2 \
+            "WITH RECURSIVE tree(id, depth) AS ( \
+                 SELECT id, 0 FROM exercise_types WHERE id = ?2 \
                  UNION ALL \
-                 SELECT et.id FROM exercise_types et JOIN tree t ON et.parent_id = t.id \
+                 SELECT et.id, t.depth + 1 FROM exercise_types et JOIN tree t ON et.parent_id = t.id \
              ) \
              SELECT ee.id, ee.user_id, ee.session_id, ee.start_timestamp, ee.end_timestamp, ee.comment \
              FROM exercise_entry ee \
+             JOIN ( \
+                 SELECT s.exercise_entry_id AS entry_id, MIN(t.depth) AS depth \
+                 FROM sets s JOIN tree t ON t.id = s.exercise_type_id \
+                 GROUP BY s.exercise_entry_id \
+             ) m ON m.entry_id = ee.id \
              WHERE ee.user_id = ?1 \
-               AND EXISTS (SELECT 1 FROM sets s \
-                           WHERE s.exercise_entry_id = ee.id \
-                             AND s.exercise_type_id IN (SELECT id FROM tree)) \
-             ORDER BY ee.start_timestamp DESC, ee.id DESC LIMIT 1"
+             ORDER BY m.depth ASC, ee.start_timestamp DESC, ee.id DESC LIMIT 1"
         } else {
             "SELECT ee.id, ee.user_id, ee.session_id, ee.start_timestamp, ee.end_timestamp, ee.comment \
              FROM exercise_entry ee \
@@ -1097,6 +1105,38 @@ mod tests {
         // The requesting user has nothing logged for this exercise.
         assert!(db.most_recent_entry_for_exercise(user_id, bp_id, false).unwrap().is_none());
         assert!(db.most_recent_entry_for_exercise(user_id, bp_id, true).unwrap().is_none());
+    }
+
+    #[test]
+    fn most_recent_entry_for_exercise_prefers_shallower_match_over_recency() {
+        // Nearest-match contract: when the seed node and a descendant both
+        // have entries, the shallower hit wins even if the descendant is
+        // newer. Without this, the "no direct entries — showing nearest
+        // match" fallback path could surface an arbitrary deep variation
+        // just because it happened to be logged most recently.
+        let (db, user_id, bp_id) = fixture();
+        let flat_id = db.get_exercise_type_by_name("Flat Barbell Bench Press").unwrap().unwrap().id;
+
+        // Older entry against the parent (depth 0 relative to the bp_id seed).
+        let older = db.insert_entry(&new_exercise_entry(user_id, None, None)).unwrap();
+        db.conn()
+            .execute("UPDATE exercise_entry SET start_timestamp = ?1 WHERE id = ?2", params!["2025-01-01 09:00:00", older])
+            .unwrap();
+        let mut s = new_exercise_set(older, bp_id, MeasurementType::WeightReps, 60.0);
+        s.count = Some(8);
+        db.insert_set(&s).unwrap();
+
+        // Newer entry against a child variation (depth 1).
+        let newer = db.insert_entry(&new_exercise_entry(user_id, None, None)).unwrap();
+        db.conn()
+            .execute("UPDATE exercise_entry SET start_timestamp = ?1 WHERE id = ?2", params!["2025-02-01 09:00:00", newer])
+            .unwrap();
+        let mut s = new_exercise_set(newer, flat_id, MeasurementType::WeightReps, 90.0);
+        s.count = Some(5);
+        db.insert_set(&s).unwrap();
+
+        let found = db.most_recent_entry_for_exercise(user_id, bp_id, true).unwrap().unwrap();
+        assert_eq!(found.id, older, "shallowest depth should win even when a descendant is more recent");
     }
 
     #[test]
