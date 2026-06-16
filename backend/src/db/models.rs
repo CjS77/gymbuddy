@@ -320,6 +320,9 @@ pub struct User {
     pub name: String,
     pub telegram_id: Option<String>,
     pub signal_id: Option<String>,
+    /// ed25519 public key (hex) of a confide client. NULL for Telegram-only users.
+    #[serde(default)]
+    pub pubkey: Option<String>,
     pub timezone: String,
     pub created_at: String,
     pub updated_at: String,
@@ -517,6 +520,24 @@ pub fn new_user(name: &str, telegram_id: Option<&str>, timezone: &str) -> User {
         name: name.to_string(),
         telegram_id: telegram_id.map(String::from),
         signal_id: None,
+        pubkey: None,
+        timezone: timezone.to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        beta_tester: false,
+    }
+}
+
+/// Construct a user identified by a confide ed25519 public key (hex), used by the
+/// confide transport at registration. Has no `telegram_id`/`signal_id`.
+pub fn new_user_with_pubkey(name: &str, pubkey: &str, timezone: &str) -> User {
+    let now = now_str();
+    User {
+        id: 0,
+        name: name.to_string(),
+        telegram_id: None,
+        signal_id: None,
+        pubkey: Some(pubkey.to_string()),
         timezone: timezone.to_string(),
         created_at: now.clone(),
         updated_at: now,

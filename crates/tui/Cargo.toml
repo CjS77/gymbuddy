@@ -1,0 +1,23 @@
+[package]
+name = "gymbuddy-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ratatui terminal client for GymBuddy"
+
+[[bin]]
+name = "gymbuddy-tui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+crossterm = { workspace = true }
+dirs = { workspace = true }
+futures = { workspace = true }
+gymbuddy-client = { workspace = true }
+gymbuddy-proto = { workspace = true }
+ratatui = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }

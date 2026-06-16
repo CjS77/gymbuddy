@@ -9,6 +9,7 @@ use crate::config::GymConfig;
 use crate::db::{
     ConversationRole, Database, Difficulty, ExerciseEntry, ExerciseSet, ExerciseTypeWithAncestry, MeasurementType, Session, SetEdit,
     SetEditError, User, new_conversation_message, new_exercise_entry_at, new_exercise_goal, new_exercise_set, new_health_entry, new_user,
+    new_user_with_pubkey,
 };
 use crate::github::IssueReporter;
 use crate::telegram::Message as TgMessage;
@@ -175,6 +176,25 @@ impl AssistantHandler {
         let user = db.get_user(user_id)?.context("user disappeared after insert")?;
         tracing::info!("Registered new user: {} (telegram_id: {telegram_id})", user.name);
         Ok((user, true))
+    }
+
+    /// Resolve a confide peer's public key (hex) to a registered user. Unlike
+    /// [`Self::ensure_user`], this does **not** auto-insert — registration over
+    /// confide is explicit (the client sends a `Register` request first).
+    pub async fn ensure_user_by_pubkey(&self, pubkey: &str) -> anyhow::Result<Option<User>> {
+        self.db.lock().await.get_user_by_pubkey(pubkey)
+    }
+
+    /// Register a new user identified by a confide public key (hex). Returns an
+    /// error if the pubkey is already registered.
+    pub async fn register_user(&self, pubkey: &str, name: &str, timezone: &str) -> anyhow::Result<User> {
+        let db = self.db.lock().await;
+        anyhow::ensure!(db.get_user_by_pubkey(pubkey)?.is_none(), "pubkey already registered");
+        let draft = new_user_with_pubkey(name, pubkey, timezone);
+        let user_id = db.insert_user(&draft)?;
+        let user = db.get_user(user_id)?.context("user disappeared after insert")?;
+        tracing::info!("Registered new user: {} (pubkey: {pubkey})", user.name);
+        Ok(user)
     }
 
     fn welcome_message(&self, user: &User) -> String {
@@ -1451,8 +1471,7 @@ mod tests {
 
     fn test_config() -> GymConfig {
         GymConfig {
-            bind: "127.0.0.1:5520".to_string(),
-            telegram_bot_token: "123456:ABC".to_string(),
+            telegram_bot_token: Some("123456:ABC".to_string()),
             telegram_allowed_ids: vec![],
             default_timezone: "UTC".to_string(),
             conversation_history_limit: 20,
@@ -1462,6 +1481,7 @@ mod tests {
             llm: None,
             voice: None,
             github: None,
+            confide: None,
         }
     }
 
@@ -2338,7 +2358,7 @@ mod tests {
     #[test]
     fn build_feedback_body_appends_reporter_footer() {
         let user =
-            User { id: 7, name: "Alice".into(), telegram_id: Some("999".into()), signal_id: None, timezone: "UTC".into(),
+            User { id: 7, name: "Alice".into(), telegram_id: Some("999".into()), signal_id: None, pubkey: None, timezone: "UTC".into(),
                 created_at: String::new(), updated_at: String::new(), beta_tester: true };
         let body = build_feedback_body(&user, "the squat rack is broken");
         assert!(body.starts_with("the squat rack is broken"));

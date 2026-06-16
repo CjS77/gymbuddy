@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use anyhow::Context as _;
@@ -7,9 +8,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct GymConfig {
-    #[serde(default = "default_bind")]
-    pub bind: String,
-    pub telegram_bot_token: String,
+    /// Telegram bot token. Absent = Telegram transport disabled (confide-only server).
+    #[serde(default)]
+    pub telegram_bot_token: Option<String>,
     /// Telegram user IDs allowed to use the bot. Empty = allow all (dev mode).
     #[serde(default)]
     pub telegram_allowed_ids: Vec<i64>,
@@ -29,6 +30,26 @@ pub struct GymConfig {
     pub voice: Option<VoiceConfig>,
     #[serde(default)]
     pub github: Option<GithubConfig>,
+    /// Encrypted p2p transport for the TUI/Android clients. Absent = disabled.
+    #[serde(default)]
+    pub confide: Option<ConfideConfig>,
+}
+
+/// Configuration for the confide (encrypted p2p) transport.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ConfideConfig {
+    /// File holding the server's ed25519 identity keypair. Created on first run;
+    /// its public key is what clients dial. Defaults next to the database.
+    #[serde(default = "default_keystore_path")]
+    pub keystore_path: PathBuf,
+    /// Hex public keys allowed to connect. Empty = allow all (dev mode), mirroring
+    /// `telegram_allowed_ids`.
+    #[serde(default)]
+    pub allowed_pubkeys: Vec<String>,
+    /// Use the public n0 relay + discovery (true) or direct/LAN connections only
+    /// (false, e.g. for tests). Defaults to true.
+    #[serde(default = "default_true")]
+    pub relay: bool,
 }
 
 /// Configuration for filing GitHub issues via the `/feedback` slash command.
@@ -132,12 +153,12 @@ fn default_max_voice_duration() -> u32 {
     60
 }
 
-fn default_bind() -> String {
-    "127.0.0.1:5520".into()
-}
-
 fn default_timezone() -> String {
     "Europe/London".into()
+}
+
+fn default_keystore_path() -> PathBuf {
+    PathBuf::from("confide-identity.key")
 }
 
 fn default_history_limit() -> usize {
@@ -164,8 +185,9 @@ impl GymConfig {
     /// Resolve `${VAR}` references in secret fields (the Telegram bot token,
     /// and the GitHub PAT used by `/feedback` when configured).
     pub fn resolve_secrets(&mut self) -> anyhow::Result<()> {
-        self.telegram_bot_token =
-            corre_core::secret::resolve_value(&self.telegram_bot_token).context("resolving TELEGRAM_GYM_BOT_TOKEN")?;
+        if let Some(token) = &self.telegram_bot_token {
+            self.telegram_bot_token = Some(corre_core::secret::resolve_value(token).context("resolving TELEGRAM_GYM_BOT_TOKEN")?);
+        }
         if let Some(ref mut github) = self.github {
             github.token = corre_core::secret::resolve_value(&github.token).context("resolving github.token")?;
             github.validate()?;
@@ -360,6 +382,43 @@ mod tests {
         let val = minimal_gym_toml("");
         let config: GymConfig = val.try_into().unwrap();
         assert!(config.github.is_none());
+    }
+
+    #[test]
+    fn telegram_only_config_parses() {
+        let val = minimal_gym_toml("");
+        let config: GymConfig = val.try_into().unwrap();
+        assert_eq!(config.telegram_bot_token.as_deref(), Some("123456:ABC"));
+        assert!(config.confide.is_none());
+    }
+
+    #[test]
+    fn confide_only_config_parses_without_telegram_token() {
+        let val: toml::Value = toml::from_str(
+            r#"
+            [confide]
+            keystore_path = "/tmp/gym-key"
+            allowed_pubkeys = ["abc123"]
+            relay = false
+            "#,
+        )
+        .unwrap();
+        let config: GymConfig = val.try_into().unwrap();
+        assert!(config.telegram_bot_token.is_none());
+        let confide = config.confide.unwrap();
+        assert_eq!(confide.keystore_path, std::path::PathBuf::from("/tmp/gym-key"));
+        assert_eq!(confide.allowed_pubkeys, vec!["abc123".to_string()]);
+        assert!(!confide.relay);
+    }
+
+    #[test]
+    fn confide_config_defaults() {
+        let val = minimal_gym_toml("[confide]");
+        let config: GymConfig = val.try_into().unwrap();
+        let confide = config.confide.unwrap();
+        assert!(confide.relay, "relay defaults to true");
+        assert!(confide.allowed_pubkeys.is_empty());
+        assert_eq!(confide.keystore_path, default_keystore_path());
     }
 
     #[test]

@@ -10,21 +10,22 @@ pub(super) fn row_to_user(row: &rusqlite::Row) -> rusqlite::Result<User> {
         name: row.get(1)?,
         telegram_id: row.get(2)?,
         signal_id: row.get(3)?,
-        timezone: row.get(4)?,
-        created_at: row.get(5)?,
-        updated_at: row.get(6)?,
-        beta_tester: row.get::<_, i64>(7)? != 0,
+        pubkey: row.get(4)?,
+        timezone: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+        beta_tester: row.get::<_, i64>(8)? != 0,
     })
 }
 
-const SELECT_USER: &str = "SELECT id, name, telegram_id, signal_id, timezone, created_at, updated_at, beta_tester FROM users";
+const SELECT_USER: &str = "SELECT id, name, telegram_id, signal_id, pubkey, timezone, created_at, updated_at, beta_tester FROM users";
 
 impl Database {
     /// Insert a user. Returns the generated id.
     pub fn insert_user(&self, user: &User) -> anyhow::Result<i64> {
         self.conn().execute(
-            "INSERT INTO users (name, telegram_id, signal_id, timezone, beta_tester) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![user.name, user.telegram_id, user.signal_id, user.timezone, user.beta_tester as i64],
+            "INSERT INTO users (name, telegram_id, signal_id, pubkey, timezone, beta_tester) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![user.name, user.telegram_id, user.signal_id, user.pubkey, user.timezone, user.beta_tester as i64],
         )?;
         let id = self.conn().last_insert_rowid();
         tracing::debug!(id, name = %user.name, telegram_id = ?user.telegram_id, "DB: inserted user");
@@ -52,11 +53,20 @@ impl Database {
         rows.next().transpose().context("Failed to read user row")
     }
 
+    /// Look up a user by their confide ed25519 public key (hex). Used by the
+    /// confide transport to resolve the connecting peer to a registered user.
+    pub fn get_user_by_pubkey(&self, pubkey: &str) -> anyhow::Result<Option<User>> {
+        let sql = format!("{SELECT_USER} WHERE pubkey = ?1");
+        let mut stmt = self.conn().prepare(&sql)?;
+        let mut rows = stmt.query_map(params![pubkey], row_to_user)?;
+        rows.next().transpose().context("Failed to read user row")
+    }
+
     pub fn update_user(&self, user: &User) -> anyhow::Result<()> {
         let rows = self.conn().execute(
-            "UPDATE users SET name = ?1, telegram_id = ?2, signal_id = ?3, timezone = ?4, beta_tester = ?5, \
-             updated_at = datetime('now') WHERE id = ?6",
-            params![user.name, user.telegram_id, user.signal_id, user.timezone, user.beta_tester as i64, user.id],
+            "UPDATE users SET name = ?1, telegram_id = ?2, signal_id = ?3, pubkey = ?4, timezone = ?5, beta_tester = ?6, \
+             updated_at = datetime('now') WHERE id = ?7",
+            params![user.name, user.telegram_id, user.signal_id, user.pubkey, user.timezone, user.beta_tester as i64, user.id],
         )?;
         anyhow::ensure!(rows > 0, "User with id {} not found", user.id);
         tracing::debug!(id = user.id, "DB: updated user");
@@ -92,7 +102,7 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use super::super::models::{MeasurementType, new_exercise_entry, new_exercise_set, new_user};
+    use super::super::models::{MeasurementType, new_exercise_entry, new_exercise_set, new_user, new_user_with_pubkey};
     use super::*;
 
     fn test_db() -> Database {
@@ -128,6 +138,37 @@ mod tests {
         let u2 = new_user("Bob", Some("same_tg"), "UTC");
         db.insert_user(&u1).unwrap();
         assert!(db.insert_user(&u2).is_err());
+    }
+
+    #[test]
+    fn get_by_pubkey() {
+        let db = test_db();
+        let user = new_user_with_pubkey("Bob", "abcd1234", "UTC");
+        let id = db.insert_user(&user).unwrap();
+
+        let fetched = db.get_user_by_pubkey("abcd1234").unwrap().unwrap();
+        assert_eq!(fetched.id, id);
+        assert_eq!(fetched.pubkey.as_deref(), Some("abcd1234"));
+        assert!(fetched.telegram_id.is_none());
+    }
+
+    #[test]
+    fn duplicate_pubkey_fails() {
+        let db = test_db();
+        let u1 = new_user_with_pubkey("Alice", "same_key", "UTC");
+        let u2 = new_user_with_pubkey("Bob", "same_key", "UTC");
+        db.insert_user(&u1).unwrap();
+        assert!(db.insert_user(&u2).is_err());
+    }
+
+    #[test]
+    fn null_pubkeys_coexist() {
+        // The unique index is partial (WHERE pubkey IS NOT NULL), so multiple
+        // Telegram-only users (NULL pubkey) must insert without conflict.
+        let db = test_db();
+        db.insert_user(&new_user("Alice", Some("alice_tg"), "UTC")).unwrap();
+        db.insert_user(&new_user("Bob", Some("bob_tg"), "UTC")).unwrap();
+        assert_eq!(db.list_users().unwrap().len(), 2);
     }
 
     #[test]
