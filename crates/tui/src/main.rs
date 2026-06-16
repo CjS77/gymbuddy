@@ -29,8 +29,21 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let ResolvedConfig { connect, name, timezone } = Cli::parse().resolve()?;
-    let (client, mut responses) = GymClient::connect(connect).await.context("connecting to server")?;
+    let ResolvedConfig { connect, name, timezone, connect_timeout } = Cli::parse().resolve()?;
+
+    // Connect before touching the terminal so this feedback (and any failure)
+    // is plain stdout, not swallowed by the alternate screen.
+    let server_id = connect.server_pubkey_hex.clone();
+    let short = server_id.get(..8).unwrap_or(&server_id);
+    println!("Connecting to {short}… (timeout {}s)", connect_timeout.as_secs());
+
+    let (client, mut responses) = match tokio::time::timeout(connect_timeout, GymClient::connect(connect)).await {
+        Ok(result) => result.context("connecting to server")?,
+        Err(_) => anyhow::bail!(
+            "timed out connecting to {short} after {}s — check the server is running and its key matches --server",
+            connect_timeout.as_secs()
+        ),
+    };
 
     install_panic_hook();
     let mut terminal = init_terminal()?;
