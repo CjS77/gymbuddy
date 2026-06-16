@@ -1,3 +1,4 @@
+pub mod chunk;
 pub mod client;
 pub mod types;
 

@@ -373,11 +373,25 @@ impl AssistantHandler {
 
         let mut result = String::new();
 
+        // Pre-sort the loggable rows by (muscle_group, name) so the linear
+        // grouping below produces one block per muscle group. The DB query
+        // returns rows ordered by (level, name), which would otherwise fragment
+        // each group into many tiny `<pre>` blocks.
+        let mut sorted: Vec<&ExerciseTypeWithAncestry> = self
+            .catalogue
+            .iter()
+            .filter(|e| matches!(e.exercise_type.level, crate::db::ExerciseLevel::Exercise | crate::db::ExerciseLevel::Variation))
+            .collect();
+        sorted.sort_by(|a, b| {
+            a.muscle_group
+                .as_deref()
+                .unwrap_or("Other")
+                .cmp(b.muscle_group.as_deref().unwrap_or("Other"))
+                .then_with(|| a.exercise_type.name.cmp(&b.exercise_type.name))
+        });
+
         let mut groups: Vec<(&str, Vec<(&str, &str, &str)>)> = Vec::new();
-        for et in &self.catalogue {
-            if !matches!(et.exercise_type.level, crate::db::ExerciseLevel::Exercise | crate::db::ExerciseLevel::Variation) {
-                continue;
-            }
+        for et in sorted {
             let group = et.muscle_group.as_deref().unwrap_or("Other");
             let aliases = et.exercise_type.aliases.as_deref().unwrap_or("");
             let mt = et.exercise_type.measurement_type.map(|m| m.as_str()).unwrap_or("weight_reps");
@@ -2401,5 +2415,80 @@ mod tests {
         );
         let reply = handler.handle_text_message(&msg, "what was my last bench press?").await.unwrap();
         assert!(reply.text.to_lowercase().contains("haven't logged"), "expected not-found phrasing, got: {}", reply.text);
+    }
+
+    // ─── /exercises rendering ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn cmd_exercises_emits_one_pre_block_per_muscle_group() {
+        let (handler, _) = setup_handler("").await;
+        let reply = handler.cmd_exercises();
+
+        // HTML mode is required for Telegram to render the <b> / <pre> markup.
+        assert_eq!(reply.parse_mode, Some("HTML"), "cmd_exercises must use HTML parse mode");
+
+        // <pre> open/close counts must match — Telegram rejects unbalanced tags.
+        let opens = reply.text.matches("<pre>").count();
+        let closes = reply.text.matches("</pre>").count();
+        assert_eq!(opens, closes, "<pre> tags must be balanced: open={opens} close={closes}");
+
+        // Group headings: each <b>...</b> heading begins a new block. The bug
+        // produced one heading per row (dozens); the fix groups so there are
+        // far fewer than rows, bounded by the seeded muscle groups (7).
+        let heading_count = reply.text.matches("<b>").count();
+        assert!(heading_count > 0, "must render at least one heading");
+        assert!(heading_count <= 10, "expected ≤10 muscle-group headings, got {heading_count}");
+        assert_eq!(heading_count, opens, "one <pre> block per heading");
+    }
+
+    #[tokio::test]
+    async fn cmd_exercises_groups_each_muscle_group_once() {
+        let (handler, _) = setup_handler("").await;
+        let reply = handler.cmd_exercises();
+
+        // Extract heading bodies and assert each is unique. The pre-fix code
+        // emitted a new heading every time the (level,name) order moved to a
+        // different group, producing duplicate "Chest", "Legs" headings.
+        let mut headings: Vec<&str> = reply
+            .text
+            .match_indices("<b>")
+            .filter_map(|(i, _)| {
+                let after = &reply.text[i + 3..];
+                after.find("</b>").map(|j| &after[..j])
+            })
+            .collect();
+        let total = headings.len();
+        headings.sort_unstable();
+        headings.dedup();
+        assert_eq!(headings.len(), total, "each muscle-group heading must appear exactly once");
+    }
+
+    #[tokio::test]
+    async fn cmd_exercises_includes_seeded_exercises() {
+        let (handler, _) = setup_handler("").await;
+        let reply = handler.cmd_exercises();
+
+        // Seeded fixtures from migrations/02-exercises: at least Bench Press
+        // (Chest) and Squat (Legs) must show up in the rendered table.
+        assert!(reply.text.contains("Bench Press"), "Bench Press missing from output");
+        assert!(reply.text.contains("Squat"), "Squat missing from output");
+    }
+
+    #[tokio::test]
+    async fn cmd_exercises_output_fits_chunker_without_breaking_pre() {
+        use crate::telegram::chunk::split_for_telegram;
+        let (handler, _) = setup_handler("").await;
+        let reply = handler.cmd_exercises();
+
+        // The whole point of the issue: feeding the long /exercises reply to
+        // the splitter must yield chunks Telegram will accept (balanced <pre>).
+        for chunk in split_for_telegram(&reply.text) {
+            assert!(chunk.len() <= 4096, "chunk over Telegram limit: {}", chunk.len());
+            assert_eq!(
+                chunk.matches("<pre>").count(),
+                chunk.matches("</pre>").count(),
+                "unbalanced <pre> in chunk: {chunk:?}",
+            );
+        }
     }
 }
