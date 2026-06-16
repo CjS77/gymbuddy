@@ -6,7 +6,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use crate::app::{App, Entry, Speaker};
+use crate::app::{App, Entry, EntryBody, Speaker};
+use crate::render::render_view;
 
 /// Render the whole screen.
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -54,28 +55,25 @@ fn draw_status(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     frame.render_widget(Paragraph::new(text).style(style), area);
 }
 
-/// Convert a transcript entry into one or more lines (split on embedded newlines,
-/// e.g. the multi-line `/status` reply), prefixing the first with the speaker tag.
+/// Convert a transcript entry into one or more lines, prefixing the first with
+/// the speaker tag. Assistant entries are rendered from their domain [`View`]
+/// (colours, bullets, aligned columns); the user's own lines and system notices
+/// are flat text.
 fn entry_to_lines(entry: &Entry) -> Vec<Line<'static>> {
     let (prefix, style) = match entry.speaker {
         Speaker::You => ("you ▸ ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Speaker::Buddy => ("buddy ▸ ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
         Speaker::System => ("· ", Style::default().fg(Color::DarkGray)),
     };
-    let mut lines: Vec<Line<'static>> = entry
-        .text
-        .split('\n')
-        .enumerate()
-        .map(|(i, raw)| {
-            if i == 0 {
-                Line::from(vec![Span::styled(prefix, style), Span::raw(raw.to_string())])
-            } else {
-                Line::from(Span::raw(raw.to_string()))
-            }
-        })
-        .collect();
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled(prefix, style)));
+
+    let mut lines: Vec<Line<'static>> = match &entry.body {
+        EntryBody::Text(text) => text.split('\n').map(|raw| Line::from(Span::raw(raw.to_string()))).collect(),
+        EntryBody::View(view) => render_view(view),
+    };
+
+    match lines.first_mut() {
+        Some(first) => first.spans.insert(0, Span::styled(prefix, style)),
+        None => lines.push(Line::from(Span::styled(prefix, style))),
     }
     lines
 }

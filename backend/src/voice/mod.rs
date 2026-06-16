@@ -32,7 +32,7 @@ impl VoicePipeline {
     pub async fn text_to_speech(&self, text: &str) -> anyhow::Result<Option<Vec<u8>>> {
         match &self.tts {
             Some(tts) => {
-                let clean = strip_markdown(text);
+                let clean = crate::text::strip_markdown(text);
                 Ok(Some(tts.synthesize(&clean).await?))
             }
             None => Ok(None),
@@ -61,73 +61,9 @@ impl VoicePipeline {
     }
 }
 
-/// Strip markdown formatting for cleaner TTS output.
-/// Removes *, _, `, #, list markers, and link syntax.
-fn strip_markdown(text: &str) -> String {
-    let link_re = regex::Regex::new(r"\[([^\]]+)\]\([^)]+\)").unwrap();
-    let text = link_re.replace_all(text, "$1");
-
-    text.lines()
-        .map(|line| {
-            let trimmed = line.trim_start();
-            // Strip list markers (- item, * item, 1. item, 10. item)
-            let line = if let Some(rest) = trimmed.strip_prefix("- ") {
-                rest
-            } else if let Some(rest) = trimmed.strip_prefix("* ") {
-                rest
-            } else if let Some(rest) = trimmed.strip_prefix(|c: char| c.is_ascii_digit()) {
-                // Handle multi-digit numbered lists (1. item, 10. item, 100. item)
-                let rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
-                if let Some(stripped) = rest.strip_prefix(". ") { stripped } else { trimmed }
-            } else {
-                trimmed
-            };
-            // Strip heading markers
-            line.trim_start_matches('#').trim_start()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        .replace("**", "")
-        .replace('*', "")
-        .replace('_', "")
-        .replace('`', "")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn strip_markdown_removes_bold_italic_code() {
-        assert_eq!(strip_markdown("**bold** and *italic* and `code`"), "bold and italic and code");
-    }
-
-    #[test]
-    fn strip_markdown_preserves_plain_text() {
-        assert_eq!(strip_markdown("hello world"), "hello world");
-    }
-
-    #[test]
-    fn strip_markdown_strips_links() {
-        assert_eq!(strip_markdown("[click here](https://example.com)"), "click here");
-    }
-
-    #[test]
-    fn strip_markdown_strips_headings() {
-        assert_eq!(strip_markdown("## Heading\nsome text"), "Heading\nsome text");
-    }
-
-    #[test]
-    fn strip_markdown_strips_list_markers() {
-        let input = "- first\n* second\n1. third";
-        assert_eq!(strip_markdown(input), "first\nsecond\nthird");
-    }
-
-    #[test]
-    fn strip_markdown_multi_digit_lists() {
-        assert_eq!(strip_markdown("10. tenth item"), "tenth item");
-        assert_eq!(strip_markdown("100. hundredth item"), "hundredth item");
-    }
 
     #[test]
     fn should_send_text_per_mode() {

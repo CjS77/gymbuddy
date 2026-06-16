@@ -2,6 +2,8 @@ pub mod assistant;
 pub mod config;
 pub mod db;
 pub mod github;
+pub mod render;
 pub mod telegram;
+pub(crate) mod text;
 pub mod transport;
 pub mod voice;

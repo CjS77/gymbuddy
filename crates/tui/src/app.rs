@@ -3,7 +3,7 @@
 //! Kept free of ratatui/crossterm types beyond the key event it interprets, so the
 //! state transitions are easy to follow and test.
 
-use gymbuddy_proto::{ClientRequest, ServerResponse};
+use gymbuddy_proto::{ClientRequest, ServerResponse, View};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Who produced a transcript line.
@@ -14,10 +14,17 @@ pub enum Speaker {
     System,
 }
 
-/// One rendered transcript line.
+/// The payload of a transcript entry: either flat text (the user's own input,
+/// system notices) or a domain [`View`] from the assistant, rendered at draw time.
+pub enum EntryBody {
+    Text(String),
+    View(View),
+}
+
+/// One transcript entry.
 pub struct Entry {
     pub speaker: Speaker,
-    pub text: String,
+    pub body: EntryBody,
 }
 
 /// What the client should do in response to an input event.
@@ -72,8 +79,14 @@ impl App {
     }
 
     fn push(&mut self, speaker: Speaker, text: impl Into<String>) {
-        self.transcript.push(Entry { speaker, text: text.into() });
+        self.transcript.push(Entry { speaker, body: EntryBody::Text(text.into()) });
         self.scroll_back = 0; // jump back to the latest on any new line
+    }
+
+    /// Append an assistant view to the transcript (rendered when drawn).
+    fn push_view(&mut self, view: View) {
+        self.transcript.push(Entry { speaker: Speaker::Buddy, body: EntryBody::View(view) });
+        self.scroll_back = 0;
     }
 
     /// Apply a key press and report what the client should do.
@@ -153,8 +166,8 @@ impl App {
                 None
             }
             ServerResponse::NeedsRegistration => self.begin_registration(),
-            ServerResponse::Reply { text } => {
-                self.push(Speaker::Buddy, text);
+            ServerResponse::Reply { view } => {
+                self.push_view(view);
                 None
             }
             ServerResponse::Error { message } => {
@@ -255,7 +268,11 @@ mod tests {
             _ => panic!("expected Chat send"),
         }
         // The user's line is echoed into the transcript.
-        assert!(app.transcript.iter().any(|e| e.speaker == Speaker::You && e.text == "hi there"));
+        assert!(
+            app.transcript
+                .iter()
+                .any(|e| e.speaker == Speaker::You && matches!(&e.body, EntryBody::Text(t) if t == "hi there"))
+        );
     }
 
     #[test]

@@ -20,21 +20,10 @@ use super::parser::parse_assistant_response;
 use super::prompts::{
     ActivePlanView, EntryView, PlanExerciseView, PromptContext, SESSION_CONTINUITY_ASK_HOURS, SESSION_CONTINUITY_HOURS, build_system_prompt,
 };
-
-pub struct Reply {
-    pub text: String,
-    pub parse_mode: Option<&'static str>,
-}
-
-impl Reply {
-    pub fn new(text: impl Into<String>) -> Self {
-        Self { text: text.into(), parse_mode: None }
-    }
-
-    pub fn as_html(&mut self) {
-        self.parse_mode = Some("HTML");
-    }
-}
+use gymbuddy_proto::{
+    CatalogEntry, CatalogGroup, CatalogView, ExerciseLog, HealthNote, HistoryView, Measurement, SessionSummaryView, SessionView, SetLine,
+    StatusView, View,
+};
 
 pub struct AssistantHandler {
     db: Arc<Mutex<Database>>,
@@ -71,15 +60,15 @@ impl AssistantHandler {
     }
 
     /// Process an incoming Telegram text message and return a reply.
-    pub async fn handle_text_message(&self, message: &TgMessage, text: &str) -> anyhow::Result<Reply> {
+    pub async fn handle_text_message(&self, message: &TgMessage, text: &str) -> anyhow::Result<View> {
         let (user, is_new) = self.ensure_user(message).await?;
         if is_new {
-            return Ok(Reply::new(self.welcome_message(&user)));
+            return Ok(View::notice(self.welcome_message(&user)));
         }
         self.handle_message_for_user(&user, text, "telegram").await
     }
 
-    pub async fn handle_message_for_user(&self, user: &User, text: &str, platform: &str) -> anyhow::Result<Reply> {
+    pub async fn handle_message_for_user(&self, user: &User, text: &str, platform: &str) -> anyhow::Result<View> {
         if let Some(reply) = self.handle_command(text, user, platform).await? {
             return Ok(reply);
         }
@@ -114,7 +103,7 @@ impl AssistantHandler {
                     "I had trouble processing that -- could you try again?"
                 };
                 self.store_excluded_conversation_on_platform(user.id, platform, text, error_reply).await?;
-                return Ok(Reply::new(error_reply));
+                return Ok(View::notice(error_reply));
             }
         };
 
@@ -138,15 +127,6 @@ impl AssistantHandler {
             }
         }
 
-        let mut reply = parsed.message.clone();
-        for s in &suffixes {
-            reply.push_str("\n\n");
-            reply.push_str(s);
-        }
-        if !failures.is_empty() {
-            reply.push_str(&format!("\n\n(Note: some actions failed: {})", failures.join("; ")));
-        }
-
         if is_refusal {
             self.store_excluded_conversation_on_platform(user.id, platform, text, &llm_response).await?;
         } else {
@@ -155,7 +135,10 @@ impl AssistantHandler {
 
         self.db.lock().await.prune_old_messages(user.id, self.config.conversation_history_limit * 2)?;
 
-        Ok(Reply::new(reply))
+        // The conversational follow-ups (`suffixes`) and any action `failures` ride
+        // alongside the prose as structured `notes`/`failures`; each client decides
+        // how to present them. `strip_markdown` keeps stray markup out of chat boxes.
+        Ok(View::Message { text: crate::text::strip_markdown(&parsed.message), notes: suffixes, failures })
     }
 
     async fn ensure_user(&self, message: &TgMessage) -> anyhow::Result<(User, bool)> {
@@ -213,15 +196,15 @@ impl AssistantHandler {
         )
     }
 
-    async fn handle_command(&self, text: &str, user: &User, platform: &str) -> anyhow::Result<Option<Reply>> {
+    async fn handle_command(&self, text: &str, user: &User, platform: &str) -> anyhow::Result<Option<View>> {
         let cmd = text.split_whitespace().next().unwrap_or("").to_lowercase();
         match cmd.as_str() {
-            "/start" => Ok(Some(Reply::new(self.cmd_start(user)))),
-            "/help" => Ok(Some(Reply::new(Self::cmd_help(user)))),
+            "/start" => Ok(Some(View::notice(self.cmd_start(user)))),
+            "/help" => Ok(Some(View::notice(Self::cmd_help(user)))),
             "/status" => Ok(Some(self.cmd_status(user).await?)),
-            "/history" => Ok(Some(Reply::new(self.cmd_history(user).await?))),
-            "/exercises" => Ok(Some(self.cmd_exercises())),
-            "/clear" => Ok(Some(Reply::new(self.cmd_clear(user, platform).await?))),
+            "/history" => Ok(Some(View::History(self.cmd_history(user).await?))),
+            "/exercises" => Ok(Some(View::Catalog(self.cmd_exercises()))),
+            "/clear" => Ok(Some(View::notice(self.cmd_clear(user, platform).await?))),
             "/feedback" => self.cmd_feedback(user, text).await,
             _ => Ok(None),
         }
@@ -267,116 +250,67 @@ impl AssistantHandler {
         msg
     }
 
-    async fn cmd_status(&self, user: &User) -> anyhow::Result<Reply> {
+    async fn cmd_status(&self, user: &User) -> anyhow::Result<View> {
         let db = self.db.lock().await;
-        let mut result = format!("<b>Status for {}</b>\n", escape_html(&user.name));
 
-        match db.get_active_session(user.id)? {
+        let session = match db.get_active_session(user.id)? {
             Some(session) => {
-                let entries = db.list_entries_for_session(session.id)?;
-                result.push_str(&format!("\n<b>Active session</b> (started {})\n", escape_html(&session.started_at)));
-
-                let mut completed: Vec<(String, Vec<ExerciseSet>)> = Vec::new();
-                let mut open: Vec<(String, Vec<ExerciseSet>)> = Vec::new();
-                for entry in &entries {
+                let mut completed: Vec<ExerciseLog> = Vec::new();
+                let mut in_progress: Vec<ExerciseLog> = Vec::new();
+                for entry in &db.list_entries_for_session(session.id)? {
                     let sets = db.list_sets_for_entry(entry.id)?;
                     let name = sets
                         .first()
                         .and_then(|s| self.catalogue.iter().find(|e| e.exercise_type.id == s.exercise_type_id))
                         .map(|e| e.exercise_type.name.clone())
                         .unwrap_or_else(|| "unknown".to_string());
+                    let log = ExerciseLog { name, sets: sets.iter().map(set_line).collect() };
                     if entry.end_timestamp.is_some() {
-                        completed.push((name, sets));
+                        completed.push(log);
                     } else {
-                        open.push((name, sets));
+                        in_progress.push(log);
                     }
                 }
-
-                if completed.is_empty() && open.is_empty() {
-                    result.push_str("No exercises logged yet\n");
-                }
-
-                if !completed.is_empty() {
-                    result.push_str("<b>Completed:</b>\n");
-                    for (name, sets) in &completed {
-                        result.push_str(&format!(
-                            "- <b>{}</b> ({} {}) — {}\n",
-                            escape_html(name),
-                            sets.len(),
-                            if sets.len() == 1 { "set" } else { "sets" },
-                            escape_html(&sets.iter().map(format_set_short).collect::<Vec<_>>().join(", ")),
-                        ));
-                    }
-                }
-
-                if open.len() > 1 {
-                    result.push_str("<b>Superset (in progress):</b>\n");
-                    for (i, (name, sets)) in open.iter().enumerate() {
-                        result.push_str(&format!(
-                            "  {}. <b>{}</b> ({} {}) — {}\n",
-                            i + 1,
-                            escape_html(name),
-                            sets.len(),
-                            if sets.len() == 1 { "set" } else { "sets" },
-                            escape_html(&sets.iter().map(format_set_short).collect::<Vec<_>>().join(", ")),
-                        ));
-                    }
-                } else if let Some((name, sets)) = open.first() {
-                    result.push_str("<b>Current exercise:</b>\n");
-                    result.push_str(&format!(
-                        "- <b>{}</b> ({} {}) — {}\n",
-                        escape_html(name),
-                        sets.len(),
-                        if sets.len() == 1 { "set" } else { "sets" },
-                        escape_html(&sets.iter().map(format_set_short).collect::<Vec<_>>().join(", ")),
-                    ));
-                }
+                Some(SessionView { started_at: session.started_at, completed, in_progress })
             }
-            None => result.push_str("No active session\n"),
-        }
+            None => None,
+        };
 
-        let health = db.list_active_health_entries(user.id)?;
-        if !health.is_empty() {
-            result.push_str("\n<b>Active health issues</b>\n");
-            for entry in &health {
-                let body = entry.body_part.as_deref().unwrap_or("general");
-                result
-                    .push_str(&format!("- {} ({}): {}\n", entry.entry_type.as_str(), escape_html(body), escape_html(&entry.description),));
-            }
-        }
+        let health = db
+            .list_active_health_entries(user.id)?
+            .iter()
+            .map(|entry| HealthNote {
+                kind: entry.entry_type.as_str().to_string(),
+                body_part: entry.body_part.as_deref().unwrap_or("general").to_string(),
+                description: entry.description.clone(),
+            })
+            .collect();
 
-        let mut reply = Reply::new(result);
-        reply.as_html();
-        Ok(reply)
+        Ok(View::Status(StatusView { user_name: user.name.clone(), session, health }))
     }
 
-    async fn cmd_history(&self, user: &User) -> anyhow::Result<String> {
+    async fn cmd_history(&self, user: &User) -> anyhow::Result<HistoryView> {
         let db = self.db.lock().await;
-        let summaries = db.list_session_summaries(user.id, None, None)?;
-
-        if summaries.is_empty() {
-            return Ok("No workout history yet. Start by telling me about an exercise!".to_string());
-        }
-
-        let mut parts = vec!["Recent workouts:".to_string()];
-        for summary in summaries.iter().take(5) {
-            let duration = summary.duration_mins.map(|d| format!(" ({d} min)")).unwrap_or_default();
-            let status = if summary.session.ended_at.is_some() { "done" } else { "active" };
-            parts.push(format!("- {} [{status}]: {} entries{duration}", summary.session.started_at, summary.exercise_count));
-        }
-
-        Ok(parts.join("\n"))
+        let sessions = db
+            .list_session_summaries(user.id, None, None)?
+            .iter()
+            .map(|summary| SessionSummaryView {
+                started_at: summary.session.started_at.clone(),
+                status: if summary.session.ended_at.is_some() { "done".into() } else { "active".into() },
+                entries: summary.exercise_count.max(0) as u32,
+                minutes: summary.duration_mins.map(|d| d.max(0) as u32),
+            })
+            .collect();
+        Ok(HistoryView { sessions })
     }
 
-    fn cmd_exercises(&self) -> Reply {
+    fn cmd_exercises(&self) -> CatalogView {
         use super::prompts::capitalize;
-
-        let mut result = String::new();
 
         // Pre-sort the loggable rows by (muscle_group, name) so the linear
         // grouping below produces one block per muscle group. The DB query
         // returns rows ordered by (level, name), which would otherwise fragment
-        // each group into many tiny `<pre>` blocks.
+        // each group into many tiny blocks.
         let mut sorted: Vec<&ExerciseTypeWithAncestry> = self
             .catalogue
             .iter()
@@ -390,33 +324,21 @@ impl AssistantHandler {
                 .then_with(|| a.exercise_type.name.cmp(&b.exercise_type.name))
         });
 
-        let mut groups: Vec<(&str, Vec<(&str, &str, &str)>)> = Vec::new();
+        let mut groups: Vec<(&str, CatalogGroup)> = Vec::new();
         for et in sorted {
             let group = et.muscle_group.as_deref().unwrap_or("Other");
-            let aliases = et.exercise_type.aliases.as_deref().unwrap_or("");
-            let mt = et.exercise_type.measurement_type.map(|m| m.as_str()).unwrap_or("weight_reps");
+            let entry = CatalogEntry {
+                name: et.exercise_type.name.clone(),
+                aliases: et.exercise_type.aliases.as_deref().unwrap_or("").to_string(),
+                kind: et.exercise_type.measurement_type.map(|m| m.as_str()).unwrap_or("weight_reps").to_string(),
+            };
             match groups.last_mut() {
-                Some((g, rows)) if *g == group => rows.push((&et.exercise_type.name, aliases, mt)),
-                _ => groups.push((group, vec![(&et.exercise_type.name, aliases, mt)])),
+                Some((raw, cg)) if *raw == group => cg.exercises.push(entry),
+                _ => groups.push((group, CatalogGroup { muscle_group: capitalize(group), exercises: vec![entry] })),
             }
         }
 
-        for (group, rows) in &groups {
-            let name_w = rows.iter().map(|(n, _, _)| n.len()).max().unwrap_or(4).max(4);
-            let alias_w = rows.iter().map(|(_, a, _)| a.len()).max().unwrap_or(7).max(7);
-
-            result.push_str(&format!("\n<b>{}</b>\n<pre>", escape_html(&capitalize(group))));
-            result.push_str(&format!("{:<name_w$} | {:<alias_w$} | Type\n", "Name", "Aliases"));
-            result.push_str(&format!("{:-<name_w$}-+-{:-<alias_w$}-+------\n", "", ""));
-            for (name, aliases, mt) in rows {
-                result.push_str(&format!("{:<name_w$} | {:<alias_w$} | {mt}\n", escape_html(name), escape_html(aliases),));
-            }
-            result.push_str("</pre>");
-        }
-
-        let mut reply = Reply::new(result);
-        reply.as_html();
-        reply
+        CatalogView { groups: groups.into_iter().map(|(_, cg)| cg).collect() }
     }
 
     async fn close_stale_session(&self, user: &User) -> anyhow::Result<()> {
@@ -1006,18 +928,18 @@ impl AssistantHandler {
     /// the command did not exist; the message then flows to the LLM path,
     /// preventing the existence of `/feedback` from leaking via a discriminating
     /// "permission denied" error.
-    async fn cmd_feedback(&self, user: &User, raw_text: &str) -> anyhow::Result<Option<Reply>> {
+    async fn cmd_feedback(&self, user: &User, raw_text: &str) -> anyhow::Result<Option<View>> {
         if !user.beta_tester {
             return Ok(None);
         }
         let Some(reporter) = self.issue_reporter.as_ref() else {
-            return Ok(Some(Reply::new("Feedback submission isn't configured on this server.")));
+            return Ok(Some(View::notice("Feedback submission isn't configured on this server.")));
         };
 
         let body_raw = raw_text.strip_prefix("/feedback").or_else(|| raw_text.strip_prefix("/FEEDBACK")).unwrap_or(raw_text);
         let body_raw = body_raw.trim();
         if body_raw.is_empty() {
-            return Ok(Some(Reply::new("Please include a description, e.g. \"/feedback the bench-press timer never stops\".")));
+            return Ok(Some(View::notice("Please include a description, e.g. \"/feedback the bench-press timer never stops\".")));
         }
 
         let max_len = self.config.max_message_length;
@@ -1037,11 +959,11 @@ impl AssistantHandler {
         match reporter.create_issue(&title, &body).await {
             Ok(url) => {
                 tracing::info!(user_id = user.id, %url, "feedback issue filed");
-                Ok(Some(Reply::new(format!("Filed: {url}"))))
+                Ok(Some(View::notice(format!("Filed: {url}"))))
             }
             Err(e) => {
                 tracing::error!(user_id = user.id, "feedback issue submission failed: {e:#}");
-                Ok(Some(Reply::new("Sorry, I couldn't file that right now. Please try again later.")))
+                Ok(Some(View::notice("Sorry, I couldn't file that right now. Please try again later.")))
             }
         }
     }
@@ -1053,7 +975,7 @@ impl AssistantHandler {
     /// Subsequent user replies (the "yes new" / "no same" answer) flow through
     /// the LLM normally because the gap-window flag flips on the assistant
     /// message we just stored.
-    async fn maybe_session_continuity_short_circuit(&self, user: &User, text: &str, platform: &str) -> anyhow::Result<Option<Reply>> {
+    async fn maybe_session_continuity_short_circuit(&self, user: &User, text: &str, platform: &str) -> anyhow::Result<Option<View>> {
         let (active_session, age_hours) = {
             let db = self.db.lock().await;
             let Some(session) = db.get_active_session(user.id)? else {
@@ -1088,7 +1010,7 @@ going in the existing session — and I'll log that set accordingly."
         );
         tracing::debug!(session_id = active_session.id, age_hours, "session continuity short-circuit: asking user");
         self.store_conversation_on_platform(user.id, platform, text, &canned).await?;
-        Ok(Some(Reply::new(canned)))
+        Ok(Some(View::message(canned)))
     }
 
     /// Server-side counterpart to `maybe_session_continuity_short_circuit`: after
@@ -1103,7 +1025,7 @@ going in the existing session — and I'll log that set accordingly."
     ///     short-circuit).
     ///   * For "same": bump the session's started_at to now (so the gap is 0),
     ///     then recurse with the original text.
-    async fn maybe_session_continuity_resume(&self, user: &User, text: &str, platform: &str) -> anyhow::Result<Option<Reply>> {
+    async fn maybe_session_continuity_resume(&self, user: &User, text: &str, platform: &str) -> anyhow::Result<Option<View>> {
         let lowered = text.to_lowercase();
         let is_new = ["new workout", "new session", "yes new", "yes, new"].iter().any(|n| lowered.contains(n))
             || lowered.trim() == "yes"
@@ -1234,8 +1156,16 @@ fn is_refusal_response(text: &str) -> bool {
     REFUSAL_PATTERNS.iter().any(|p| lower.contains(p))
 }
 
-fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+/// Map a DB [`ExerciseSet`] to the wire [`SetLine`] the clients render.
+fn set_line(set: &ExerciseSet) -> SetLine {
+    let measurement = match set.measurement_type {
+        MeasurementType::WeightReps => Measurement::WeightReps,
+        MeasurementType::TimeBased => Measurement::TimeBased,
+        MeasurementType::DistanceBased => Measurement::DistanceBased,
+        MeasurementType::LevelBased => Measurement::LevelBased,
+        MeasurementType::ScoreBased => Measurement::ScoreBased,
+    };
+    SetLine { measurement, count: set.count.map(|c| c.max(0) as u32), value: set.value }
 }
 
 const FEEDBACK_TITLE_MAX_CHARS: usize = 80;
@@ -1437,7 +1367,15 @@ fn build_leaked_view(
 mod tests {
     use super::*;
     use crate::db::Database;
+    use crate::render::Telegram;
     use corre_core::app::{LlmRequest, LlmResponse};
+    use gymbuddy_proto::Render as _;
+
+    /// The text a Telegram user would see for a view — lets these tests keep
+    /// asserting on rendered output after the move to the domain `View` model.
+    fn shown(view: &View) -> String {
+        Telegram.render(view).0
+    }
 
     struct MockLlm {
         response: std::sync::Mutex<String>,
@@ -1570,7 +1508,7 @@ mod tests {
         let (handler, _) = setup_handler(r#"{"message": "Hello!", "actions": []}"#).await;
         let msg = make_message(12345, "hello");
         let reply = handler.handle_text_message(&msg, "hello").await.unwrap();
-        assert!(reply.text.contains("Welcome"));
+        assert!(shown(&reply).contains("Welcome"));
     }
 
     #[tokio::test]
@@ -1579,7 +1517,7 @@ mod tests {
         let msg = make_message(12345, "hello");
         let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
         let reply = handler.handle_text_message(&msg, "how are you").await.unwrap();
-        assert_eq!(reply.text, "Got it!");
+        assert_eq!(shown(&reply), "Got it!");
     }
 
     #[tokio::test]
@@ -1593,8 +1531,8 @@ mod tests {
         let msg = make_message(12345, "hello");
         let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
         let reply = handler.handle_text_message(&msg, "3 sets bench 80kg 8 reps").await.unwrap();
-        assert!(reply.text.starts_with("Logged your bench press!"));
-        assert!(reply.text.contains("You've logged 3 sets of Bench Press. Want another set, or move to the next exercise?"));
+        assert!(shown(&reply).starts_with("Logged your bench press!"));
+        assert!(shown(&reply).contains("You've logged 3 sets of Bench Press. Want another set, or move to the next exercise?"));
 
         let db = handler.db.lock().await;
         let user = db.get_user_by_telegram_id("12345").unwrap().unwrap();
@@ -1631,7 +1569,7 @@ mod tests {
             ]}"#,
         );
         let reply = handler.handle_text_message(&msg, "bench press 80kg 8 reps medium").await.unwrap();
-        assert!(reply.text.contains("supersetting"), "expected a superset question, got: {}", reply.text);
+        assert!(shown(&reply).contains("supersetting"), "expected a superset question, got: {}", shown(&reply));
 
         let db = handler.db.lock().await;
         let user = db.get_user_by_telegram_id("12345").unwrap().unwrap();
@@ -1654,7 +1592,7 @@ mod tests {
             ]}"#,
         );
         let reply = handler.handle_text_message(&msg, "actually superset, log bench press").await.unwrap();
-        assert!(!reply.text.contains("supersetting"), "superset flag should suppress the question");
+        assert!(!shown(&reply).contains("supersetting"), "superset flag should suppress the question");
 
         let db = handler.db.lock().await;
         let user = db.get_user_by_telegram_id("12345").unwrap().unwrap();
@@ -1715,7 +1653,7 @@ mod tests {
             ]}"#,
         );
         let reply = handler.handle_text_message(&msg, "squat 100kg 5 reps hard").await.unwrap();
-        assert!(!reply.text.contains("supersetting"), "unrelated exercises must not trigger the prompt");
+        assert!(!shown(&reply).contains("supersetting"), "unrelated exercises must not trigger the prompt");
 
         let db = handler.db.lock().await;
         let user = db.get_user_by_telegram_id("12345").unwrap().unwrap();
@@ -1748,7 +1686,7 @@ mod tests {
         let msg = make_message(12345, "/help");
         let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
         let reply = handler.handle_text_message(&msg, "/help").await.unwrap();
-        assert!(reply.text.contains("Available commands"));
+        assert!(shown(&reply).contains("Available commands"));
     }
 
     #[tokio::test]
@@ -1757,7 +1695,7 @@ mod tests {
         let msg = make_message(12345, "/start");
         let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
         let reply = handler.handle_text_message(&msg, "/start").await.unwrap();
-        assert!(reply.text.contains("already registered"));
+        assert!(shown(&reply).contains("already registered"));
     }
 
     #[tokio::test]
@@ -1794,7 +1732,7 @@ mod tests {
         let msg = make_message(12345, "hello");
         let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
         let reply = handler.handle_text_message(&msg, "do stuff").await.unwrap();
-        assert!(reply.text.contains("some actions failed"));
+        assert!(shown(&reply).contains("some actions failed"));
     }
 
     #[tokio::test]
@@ -1806,7 +1744,7 @@ mod tests {
         let long_text = "a".repeat(3000);
         llm.set_response(r#"{"message": "received", "actions": []}"#);
         let reply = handler.handle_text_message(&msg, &long_text).await.unwrap();
-        assert_eq!(reply.text, "received");
+        assert_eq!(shown(&reply), "received");
 
         let db = handler.db.lock().await;
         let user = db.get_user_by_telegram_id("12345").unwrap().unwrap();
@@ -1831,7 +1769,7 @@ mod tests {
         drop(db);
 
         let reply = handler.handle_text_message(&msg, "/clear").await.unwrap();
-        assert!(reply.text.contains("cleared"));
+        assert!(shown(&reply).contains("cleared"));
 
         let db = handler.db.lock().await;
         let user = db.get_user_by_telegram_id("12345").unwrap().unwrap();
@@ -1845,7 +1783,7 @@ mod tests {
         let msg = make_message(12345, "hello");
         let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
         let reply = handler.handle_text_message(&msg, "/help").await.unwrap();
-        assert!(reply.text.contains("/clear"));
+        assert!(shown(&reply).contains("/clear"));
     }
 
     struct FailingMockLlm;
@@ -1871,7 +1809,7 @@ mod tests {
         let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
 
         let reply = handler.handle_text_message(&msg, "some bad request").await.unwrap();
-        assert!(reply.text.contains("trouble processing"));
+        assert!(shown(&reply).contains("trouble processing"));
 
         let db = handler.db.lock().await;
         let user = db.get_user_by_telegram_id("12345").unwrap().unwrap();
@@ -1891,7 +1829,7 @@ mod tests {
         let msg = make_message(12345, "hello");
         let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
         let reply = handler.handle_text_message(&msg, "off topic stuff").await.unwrap();
-        assert!(reply.text.contains("I cannot provide"));
+        assert!(shown(&reply).contains("I cannot provide"));
 
         let db = handler.db.lock().await;
         let user = db.get_user_by_telegram_id("12345").unwrap().unwrap();
@@ -2000,7 +1938,7 @@ mod tests {
         let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
 
         let reply = handler.handle_text_message(&msg, "3 sets bench 80kg 8").await.unwrap();
-        assert!(reply.text.contains("You've logged 3 sets of Bench Press. Want another set, or move to the next exercise?"));
+        assert!(shown(&reply).contains("You've logged 3 sets of Bench Press. Want another set, or move to the next exercise?"));
 
         // 4th set — checkpoint should fire again with n=4.
         llm.set_response(
@@ -2009,7 +1947,7 @@ mod tests {
             ]}"#,
         );
         let reply = handler.handle_text_message(&msg, "one more").await.unwrap();
-        assert!(reply.text.contains("You've logged 4 sets of Bench Press"));
+        assert!(shown(&reply).contains("You've logged 4 sets of Bench Press"));
     }
 
     #[tokio::test]
@@ -2029,7 +1967,7 @@ mod tests {
             ]}"#,
         );
         let reply = handler.handle_text_message(&msg, "close bench").await.unwrap();
-        assert!(reply.text.contains("You've only done 2 sets of Bench Press. You should really push for one more! Should we keep going?"));
+        assert!(shown(&reply).contains("You've only done 2 sets of Bench Press. You should really push for one more! Should we keep going?"));
 
         let db = handler.db.lock().await;
         let user = db.get_user_by_telegram_id("12345").unwrap().unwrap();
@@ -2126,8 +2064,8 @@ mod tests {
         // Step 2: try to start a new session — should be blocked.
         llm.set_response(r#"{"message": "Starting.", "actions": [{"type": "start_session"}]}"#);
         let reply = handler.handle_text_message(&msg, "start a new session").await.unwrap();
-        assert!(reply.text.contains("open exercise"));
-        assert!(reply.text.contains("close them or delete them"));
+        assert!(shown(&reply).contains("open exercise"));
+        assert!(shown(&reply).contains("close them or delete them"));
 
         // The original session is still the active one — no new session was created.
         let db = handler.db.lock().await;
@@ -2173,9 +2111,9 @@ mod tests {
         let _ = handler.handle_text_message(&msg, "pull-ups").await.unwrap();
 
         let reply = handler.handle_text_message(&msg, "/status").await.unwrap();
-        assert!(reply.text.contains("Superset (in progress)"));
-        assert!(reply.text.contains("Bench Press"));
-        assert!(reply.text.contains("Pull-Up"));
+        assert!(shown(&reply).contains("Superset (in progress)"));
+        assert!(shown(&reply).contains("Bench Press"));
+        assert!(shown(&reply).contains("Pull-Up"));
     }
 
     #[tokio::test]
@@ -2194,8 +2132,8 @@ mod tests {
         let _ = handler.handle_text_message(&msg, "done").await.unwrap();
 
         let reply = handler.handle_text_message(&msg, "/status").await.unwrap();
-        assert!(reply.text.contains("Completed:"));
-        assert!(reply.text.contains("Bench Press"));
+        assert!(shown(&reply).contains("Completed:"));
+        assert!(shown(&reply).contains("Bench Press"));
     }
 
     #[tokio::test]
@@ -2260,7 +2198,7 @@ mod tests {
         let msg = make_message(12345, "hello");
         let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
         let reply = handler.handle_text_message(&msg, "/help").await.unwrap();
-        assert!(!reply.text.contains("/feedback"), "non-beta /help must not advertise /feedback");
+        assert!(!shown(&reply).contains("/feedback"), "non-beta /help must not advertise /feedback");
     }
 
     #[tokio::test]
@@ -2270,7 +2208,7 @@ mod tests {
         let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
         promote_to_beta(&handler, "12345").await;
         let reply = handler.handle_text_message(&msg, "/help").await.unwrap();
-        assert!(reply.text.contains("/feedback"), "beta /help must advertise /feedback, got: {}", reply.text);
+        assert!(shown(&reply).contains("/feedback"), "beta /help must advertise /feedback, got: {}", shown(&reply));
     }
 
     #[tokio::test]
@@ -2304,11 +2242,11 @@ mod tests {
         promote_to_beta(&handler, "12345").await;
 
         let reply = handler.handle_text_message(&msg, "/feedback").await.unwrap();
-        assert!(reply.text.to_lowercase().contains("include a description"), "got: {}", reply.text);
+        assert!(shown(&reply).to_lowercase().contains("include a description"), "got: {}", shown(&reply));
         assert_eq!(reporter.call_count(), 0, "empty body must not reach the reporter");
 
         let reply = handler.handle_text_message(&msg, "/feedback    ").await.unwrap();
-        assert!(reply.text.to_lowercase().contains("include a description"));
+        assert!(shown(&reply).to_lowercase().contains("include a description"));
         assert_eq!(reporter.call_count(), 0);
     }
 
@@ -2322,7 +2260,7 @@ mod tests {
         promote_to_beta(&handler, "12345").await;
 
         let reply = handler.handle_text_message(&msg, "/feedback the bench-press timer never stops counting").await.unwrap();
-        assert!(reply.text.contains("https://github.com/x/y/issues/42"), "reply must echo issue URL, got: {}", reply.text);
+        assert!(shown(&reply).contains("https://github.com/x/y/issues/42"), "reply must echo issue URL, got: {}", shown(&reply));
         assert_eq!(reporter.call_count(), 1);
 
         let (title, body) = reporter.last_call().unwrap();
@@ -2341,7 +2279,7 @@ mod tests {
         promote_to_beta(&handler, "12345").await;
 
         let reply = handler.handle_text_message(&msg, "/feedback something broken").await.unwrap();
-        assert!(reply.text.to_lowercase().contains("isn't configured"), "got: {}", reply.text);
+        assert!(shown(&reply).to_lowercase().contains("isn't configured"), "got: {}", shown(&reply));
     }
 
     #[tokio::test]
@@ -2354,9 +2292,9 @@ mod tests {
         promote_to_beta(&handler, "12345").await;
 
         let reply = handler.handle_text_message(&msg, "/feedback whatever").await.unwrap();
-        assert!(reply.text.to_lowercase().contains("couldn't file"), "got: {}", reply.text);
-        assert!(!reply.text.contains("401"), "must not leak status code: {}", reply.text);
-        assert!(!reply.text.to_lowercase().contains("github"), "must not leak integration name: {}", reply.text);
+        assert!(shown(&reply).to_lowercase().contains("couldn't file"), "got: {}", shown(&reply));
+        assert!(!shown(&reply).contains("401"), "must not leak status code: {}", shown(&reply));
+        assert!(!shown(&reply).to_lowercase().contains("github"), "must not leak integration name: {}", shown(&reply));
         assert_eq!(reporter.call_count(), 1);
     }
 
@@ -2397,9 +2335,10 @@ mod tests {
                 {"type": "get_last_exercise", "exercise": "Bench Press"}
             ]}"#,
         );
-        let reply = handler.handle_text_message(&msg, "what was my last bench press?").await.unwrap();
-        assert!(reply.text.contains("Bench Press"), "reply must name the resolved exercise, got: {}", reply.text);
-        assert!(reply.text.contains("8×80.0kg"), "reply must include the set, got: {}", reply.text);
+        let view = handler.handle_text_message(&msg, "what was my last bench press?").await.unwrap();
+        let (reply, _) = Telegram.render(&view);
+        assert!(reply.contains("Bench Press"), "reply must name the resolved exercise, got: {reply}");
+        assert!(reply.contains("8×80.0kg"), "reply must include the set, got: {reply}");
     }
 
     #[tokio::test]
@@ -2413,8 +2352,9 @@ mod tests {
                 {"type": "get_last_exercise", "exercise": "Bench Press"}
             ]}"#,
         );
-        let reply = handler.handle_text_message(&msg, "what was my last bench press?").await.unwrap();
-        assert!(reply.text.to_lowercase().contains("haven't logged"), "expected not-found phrasing, got: {}", reply.text);
+        let view = handler.handle_text_message(&msg, "what was my last bench press?").await.unwrap();
+        let (reply, _) = Telegram.render(&view);
+        assert!(reply.to_lowercase().contains("haven't logged"), "expected not-found phrasing, got: {reply}");
     }
 
     // ─── /exercises rendering ────────────────────────────────────────────────
@@ -2422,20 +2362,20 @@ mod tests {
     #[tokio::test]
     async fn cmd_exercises_emits_one_pre_block_per_muscle_group() {
         let (handler, _) = setup_handler("").await;
-        let reply = handler.cmd_exercises();
+        let (text, parse_mode) = Telegram.render(&View::Catalog(handler.cmd_exercises()));
 
         // HTML mode is required for Telegram to render the <b> / <pre> markup.
-        assert_eq!(reply.parse_mode, Some("HTML"), "cmd_exercises must use HTML parse mode");
+        assert_eq!(parse_mode, Some("HTML"), "cmd_exercises must use HTML parse mode");
 
         // <pre> open/close counts must match — Telegram rejects unbalanced tags.
-        let opens = reply.text.matches("<pre>").count();
-        let closes = reply.text.matches("</pre>").count();
+        let opens = text.matches("<pre>").count();
+        let closes = text.matches("</pre>").count();
         assert_eq!(opens, closes, "<pre> tags must be balanced: open={opens} close={closes}");
 
         // Group headings: each <b>...</b> heading begins a new block. The bug
         // produced one heading per row (dozens); the fix groups so there are
         // far fewer than rows, bounded by the seeded muscle groups (7).
-        let heading_count = reply.text.matches("<b>").count();
+        let heading_count = text.matches("<b>").count();
         assert!(heading_count > 0, "must render at least one heading");
         assert!(heading_count <= 10, "expected ≤10 muscle-group headings, got {heading_count}");
         assert_eq!(heading_count, opens, "one <pre> block per heading");
@@ -2444,16 +2384,15 @@ mod tests {
     #[tokio::test]
     async fn cmd_exercises_groups_each_muscle_group_once() {
         let (handler, _) = setup_handler("").await;
-        let reply = handler.cmd_exercises();
+        let (text, _) = Telegram.render(&View::Catalog(handler.cmd_exercises()));
 
         // Extract heading bodies and assert each is unique. The pre-fix code
         // emitted a new heading every time the (level,name) order moved to a
         // different group, producing duplicate "Chest", "Legs" headings.
-        let mut headings: Vec<&str> = reply
-            .text
+        let mut headings: Vec<&str> = text
             .match_indices("<b>")
             .filter_map(|(i, _)| {
-                let after = &reply.text[i + 3..];
+                let after = &text[i + 3..];
                 after.find("</b>").map(|j| &after[..j])
             })
             .collect();
@@ -2466,23 +2405,23 @@ mod tests {
     #[tokio::test]
     async fn cmd_exercises_includes_seeded_exercises() {
         let (handler, _) = setup_handler("").await;
-        let reply = handler.cmd_exercises();
+        let (text, _) = Telegram.render(&View::Catalog(handler.cmd_exercises()));
 
         // Seeded fixtures from migrations/02-exercises: at least Bench Press
         // (Chest) and Squat (Legs) must show up in the rendered table.
-        assert!(reply.text.contains("Bench Press"), "Bench Press missing from output");
-        assert!(reply.text.contains("Squat"), "Squat missing from output");
+        assert!(text.contains("Bench Press"), "Bench Press missing from output");
+        assert!(text.contains("Squat"), "Squat missing from output");
     }
 
     #[tokio::test]
     async fn cmd_exercises_output_fits_chunker_without_breaking_pre() {
         use crate::telegram::chunk::split_for_telegram;
         let (handler, _) = setup_handler("").await;
-        let reply = handler.cmd_exercises();
+        let (text, _) = Telegram.render(&View::Catalog(handler.cmd_exercises()));
 
         // The whole point of the issue: feeding the long /exercises reply to
         // the splitter must yield chunks Telegram will accept (balanced <pre>).
-        for chunk in split_for_telegram(&reply.text) {
+        for chunk in split_for_telegram(&text) {
             assert!(chunk.len() <= 4096, "chunk over Telegram limit: {}", chunk.len());
             assert_eq!(
                 chunk.matches("<pre>").count(),

@@ -1,0 +1,229 @@
+//! Render a [`View`] to Telegram Bot API HTML (or plain text).
+//!
+//! Reproduces the exact output the handler emitted before the view refactor, so
+//! the Telegram bot is visually unchanged — locked down by golden tests below.
+
+use gymbuddy_proto::{CatalogView, HistoryView, Measurement, Render, SetLine, StatusView, View};
+
+/// The Telegram renderer. `Output` is `(text, parse_mode)` — `parse_mode` is
+/// `Some("HTML")` for the rich `/status` and `/exercises` views, `None` otherwise.
+pub struct Telegram;
+
+impl Render for Telegram {
+    type Output = (String, Option<&'static str>);
+
+    fn render(&self, view: &View) -> Self::Output {
+        match view {
+            View::Message { text, notes, failures } => (compose_message(text, notes, failures), None),
+            View::Notice { text } => (text.clone(), None),
+            View::History(history) => (render_history(history), None),
+            View::Status(status) => (render_status(status), Some("HTML")),
+            View::Catalog(catalog) => (render_catalog(catalog), Some("HTML")),
+            // `View` is `#[non_exhaustive]`; nothing to render for a variant this
+            // build does not know about.
+            _ => (String::new(), None),
+        }
+    }
+}
+
+/// Free-form reply text followed by conversational notes and any failure summary,
+/// joined exactly as the handler used to assemble them.
+fn compose_message(text: &str, notes: &[String], failures: &[String]) -> String {
+    let mut out = text.to_string();
+    for note in notes {
+        out.push_str("\n\n");
+        out.push_str(note);
+    }
+    if !failures.is_empty() {
+        out.push_str(&format!("\n\n(Note: some actions failed: {})", failures.join("; ")));
+    }
+    out
+}
+
+fn render_status(status: &StatusView) -> String {
+    let mut result = format!("<b>Status for {}</b>\n", escape_html(&status.user_name));
+
+    match &status.session {
+        Some(session) => {
+            result.push_str(&format!("\n<b>Active session</b> (started {})\n", escape_html(&session.started_at)));
+
+            if session.completed.is_empty() && session.in_progress.is_empty() {
+                result.push_str("No exercises logged yet\n");
+            }
+
+            if !session.completed.is_empty() {
+                result.push_str("<b>Completed:</b>\n");
+                for log in &session.completed {
+                    result.push_str(&format!("- <b>{}</b> ({}) — {}\n", escape_html(&log.name), set_count(log.sets.len()), escape_html(&joined_sets(&log.sets))));
+                }
+            }
+
+            if session.in_progress.len() > 1 {
+                result.push_str("<b>Superset (in progress):</b>\n");
+                for (i, log) in session.in_progress.iter().enumerate() {
+                    result.push_str(&format!(
+                        "  {}. <b>{}</b> ({}) — {}\n",
+                        i + 1,
+                        escape_html(&log.name),
+                        set_count(log.sets.len()),
+                        escape_html(&joined_sets(&log.sets)),
+                    ));
+                }
+            } else if let Some(log) = session.in_progress.first() {
+                result.push_str("<b>Current exercise:</b>\n");
+                result.push_str(&format!("- <b>{}</b> ({}) — {}\n", escape_html(&log.name), set_count(log.sets.len()), escape_html(&joined_sets(&log.sets))));
+            }
+        }
+        None => result.push_str("No active session\n"),
+    }
+
+    if !status.health.is_empty() {
+        result.push_str("\n<b>Active health issues</b>\n");
+        for note in &status.health {
+            result.push_str(&format!("- {} ({}): {}\n", note.kind, escape_html(&note.body_part), escape_html(&note.description)));
+        }
+    }
+
+    result
+}
+
+fn render_catalog(catalog: &CatalogView) -> String {
+    let mut result = String::new();
+    for group in &catalog.groups {
+        // Column widths are taken from the unescaped names/aliases, matching the
+        // pre-refactor behaviour.
+        let name_w = group.exercises.iter().map(|e| e.name.len()).max().unwrap_or(4).max(4);
+        let alias_w = group.exercises.iter().map(|e| e.aliases.len()).max().unwrap_or(7).max(7);
+
+        result.push_str(&format!("\n<b>{}</b>\n<pre>", escape_html(&group.muscle_group)));
+        result.push_str(&format!("{:<name_w$} | {:<alias_w$} | Type\n", "Name", "Aliases"));
+        result.push_str(&format!("{:-<name_w$}-+-{:-<alias_w$}-+------\n", "", ""));
+        for entry in &group.exercises {
+            result.push_str(&format!("{:<name_w$} | {:<alias_w$} | {}\n", escape_html(&entry.name), escape_html(&entry.aliases), entry.kind));
+        }
+        result.push_str("</pre>");
+    }
+    result
+}
+
+fn render_history(history: &HistoryView) -> String {
+    if history.sessions.is_empty() {
+        return "No workout history yet. Start by telling me about an exercise!".to_string();
+    }
+
+    let mut parts = vec!["Recent workouts:".to_string()];
+    for summary in history.sessions.iter().take(5) {
+        let duration = summary.minutes.map(|d| format!(" ({d} min)")).unwrap_or_default();
+        parts.push(format!("- {} [{}]: {} entries{duration}", summary.started_at, summary.status, summary.entries));
+    }
+    parts.join("\n")
+}
+
+fn joined_sets(sets: &[SetLine]) -> String {
+    sets.iter().map(format_set).collect::<Vec<_>>().join(", ")
+}
+
+fn set_count(n: usize) -> String {
+    format!("{n} {}", if n == 1 { "set" } else { "sets" })
+}
+
+/// Compact rendering of one set, e.g. "8×80.0kg", "30s", "5000m". Mirrors the
+/// backend's `format_set_short`, operating on the wire [`SetLine`].
+fn format_set(set: &SetLine) -> String {
+    match set.measurement {
+        Measurement::WeightReps => match set.count {
+            Some(c) => format!("{c}×{:.1}kg", set.value),
+            None => format!("{:.1}kg", set.value),
+        },
+        Measurement::TimeBased => format!("{:.0}s", set.value),
+        Measurement::DistanceBased => format!("{:.0}m", set.value),
+        Measurement::LevelBased => format!("L{:.0}", set.value),
+        Measurement::ScoreBased => format!("{:.1}pt", set.value),
+    }
+}
+
+/// Escape the three characters that are significant in Telegram HTML.
+pub(crate) fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gymbuddy_proto::{CatalogEntry, CatalogGroup, ExerciseLog, HealthNote, SessionView};
+
+    fn set(count: Option<u32>, value: f64) -> SetLine {
+        SetLine { measurement: Measurement::WeightReps, count, value }
+    }
+
+    #[test]
+    fn status_html_matches_legacy_layout() {
+        let status = StatusView {
+            user_name: "Alice".into(),
+            session: Some(SessionView {
+                started_at: "2026-06-16 10:00:00".into(),
+                completed: vec![ExerciseLog { name: "Bench Press".into(), sets: vec![set(Some(8), 80.0), set(Some(8), 80.0)] }],
+                in_progress: vec![ExerciseLog { name: "Squat".into(), sets: vec![set(Some(5), 100.0)] }],
+            }),
+            health: vec![HealthNote { kind: "injury".into(), body_part: "shoulder".into(), description: "sore".into() }],
+        };
+        let (html, mode) = Telegram.render(&View::Status(status));
+        assert_eq!(mode, Some("HTML"));
+        let expected = "<b>Status for Alice</b>\n\
+                        \n<b>Active session</b> (started 2026-06-16 10:00:00)\n\
+                        <b>Completed:</b>\n\
+                        - <b>Bench Press</b> (2 sets) — 8×80.0kg, 8×80.0kg\n\
+                        <b>Current exercise:</b>\n\
+                        - <b>Squat</b> (1 set) — 5×100.0kg\n\
+                        \n<b>Active health issues</b>\n\
+                        - injury (shoulder): sore\n";
+        assert_eq!(html, expected);
+    }
+
+    #[test]
+    fn status_no_session() {
+        let status = StatusView { user_name: "Bob".into(), session: None, health: vec![] };
+        let (html, _) = Telegram.render(&View::Status(status));
+        assert_eq!(html, "<b>Status for Bob</b>\nNo active session\n");
+    }
+
+    #[test]
+    fn catalog_html_matches_legacy_pre_table() {
+        let catalog = CatalogView {
+            groups: vec![CatalogGroup {
+                muscle_group: "Chest".into(),
+                exercises: vec![CatalogEntry { name: "Bench Press".into(), aliases: "bench".into(), kind: "weight_reps".into() }],
+            }],
+        };
+        let (html, mode) = Telegram.render(&View::Catalog(catalog));
+        assert_eq!(mode, Some("HTML"));
+        let expected = "\n<b>Chest</b>\n<pre>\
+                        Name        | Aliases | Type\n\
+                        ------------+---------+------\n\
+                        Bench Press | bench   | weight_reps\n\
+                        </pre>";
+        assert_eq!(html, expected);
+    }
+
+    #[test]
+    fn message_appends_notes_and_failures() {
+        let view = View::Message {
+            text: "Logged your bench press!".into(),
+            notes: vec!["You've logged 3 sets of Bench Press. Want another set, or move to the next exercise?".into()],
+            failures: vec!["Unknown exercise: foo".into()],
+        };
+        let (text, mode) = Telegram.render(&view);
+        assert_eq!(mode, None);
+        assert_eq!(
+            text,
+            "Logged your bench press!\n\n\
+             You've logged 3 sets of Bench Press. Want another set, or move to the next exercise?\n\n\
+             (Note: some actions failed: Unknown exercise: foo)"
+        );
+    }
+
+    #[test]
+    fn escape_html_escapes_amp_lt_gt() {
+        assert_eq!(escape_html("a & b < c > d"), "a &amp; b &lt; c &gt; d");
+    }
+}

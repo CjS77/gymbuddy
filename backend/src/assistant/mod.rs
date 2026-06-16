@@ -4,4 +4,4 @@ pub mod matching;
 pub mod parser;
 pub mod prompts;
 
-pub use handler::{AssistantHandler, Reply};
+pub use handler::AssistantHandler;

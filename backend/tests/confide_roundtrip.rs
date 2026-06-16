@@ -17,7 +17,7 @@ use gymbuddy_backend::config::{ConfideConfig, GymConfig};
 use gymbuddy_backend::db::Database;
 use gymbuddy_backend::transport::confide::ConfideServer;
 use gymbuddy_client::{ConnectOptions, GymClient};
-use gymbuddy_proto::{ClientRequest, ServerResponse};
+use gymbuddy_proto::{ClientRequest, ServerResponse, View};
 use tokio::sync::Mutex;
 
 /// LLM stub that always logs three bench-press sets (action shape copied from the
@@ -95,8 +95,13 @@ async fn register_then_chat_logs_sets_over_confide() {
         .request(&mut responses, &ClientRequest::Chat { text: "I did 3 sets of bench press at 80kg, 8 reps".into() })
         .await
         .unwrap();
-    let ServerResponse::Reply { text } = resp else { panic!("expected Reply, got {resp:?}") };
+    // The server sends a domain view; the client renders it. Here we assert the
+    // wire payload is a `Message` carrying the assistant prose and the set-count
+    // checkpoint note produced by logging the third set.
+    let ServerResponse::Reply { view } = resp else { panic!("expected Reply, got {resp:?}") };
+    let View::Message { text, notes, .. } = view else { panic!("expected Message, got {view:?}") };
     assert!(text.starts_with("Logged your bench press!"), "unexpected reply: {text}");
+    assert!(notes.iter().any(|n| n.contains("You've logged 3 sets of Bench Press")), "expected checkpoint note, got {notes:?}");
 
     // 7. The sets are persisted in the server's DB, owned by the pubkey user.
     let db = db.lock().await;

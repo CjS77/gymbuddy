@@ -12,11 +12,13 @@ use gymbuddy_backend::assistant::AssistantHandler;
 use gymbuddy_backend::config::GymConfig;
 use gymbuddy_backend::db::Database;
 use gymbuddy_backend::github::{GithubIssueReporter, IssueReporter};
+use gymbuddy_backend::render::{Telegram, to_plain};
 use gymbuddy_backend::telegram::chunk::split_for_telegram;
 use gymbuddy_backend::telegram::{Message, TelegramClient, Voice};
 use gymbuddy_backend::transport;
 use gymbuddy_backend::voice::VoicePipeline;
 use corre_llm::OpenAiCompatProvider;
+use gymbuddy_proto::Render;
 
 #[derive(Parser)]
 #[command(name = "gymbuddy", about = "You friendly AI personal trainer")]
@@ -234,7 +236,7 @@ async fn process_text_message(telegram: &TelegramClient, handler: &Arc<Assistant
     let _ = telegram.send_chat_action(message.chat.id, "typing").await;
 
     let (reply_text, parse_mode) = match handler.handle_text_message(message, text).await {
-        Ok(reply) => (reply.text, reply.parse_mode),
+        Ok(view) => Telegram.render(&view),
         Err(e) => {
             tracing::error!("Handler error: {e:#}");
             ("Something went wrong -- please try again later.".to_string(), None)
@@ -331,7 +333,7 @@ async fn process_voice_message(
 
     // 6. Process transcript through handler (identical to text messages)
     let reply = match handler.handle_text_message(message, &transcript).await {
-        Ok(r) => r.text,
+        Ok(view) => to_plain(&view),
         Err(e) => {
             tracing::error!("Handler error: {e:#}");
             "I had trouble processing that -- could you try again?".to_string()

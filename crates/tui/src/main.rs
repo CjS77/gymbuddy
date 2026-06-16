@@ -6,6 +6,7 @@
 
 mod app;
 mod config;
+mod render;
 mod ui;
 
 use std::io::Stdout;

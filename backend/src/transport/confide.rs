@@ -14,7 +14,7 @@ use confide::{Config, FileKeyStore, Identity, Message, Node, Relay, Session, pee
 use futures::StreamExt as _;
 use gymbuddy_proto::{ClientRequest, ServerResponse, decode_request, encode_response};
 
-use crate::assistant::{AssistantHandler, Reply};
+use crate::assistant::AssistantHandler;
 use crate::config::ConfideConfig;
 
 /// A bound confide endpoint, ready to accept sessions.
@@ -118,7 +118,8 @@ async fn dispatch(handler: &AssistantHandler, pubkey: &str, req: ClientRequest) 
         },
         ClientRequest::Chat { text } => match handler.ensure_user_by_pubkey(pubkey).await {
             Ok(Some(user)) => match handler.handle_message_for_user(&user, &text, "confide").await {
-                Ok(reply) => ServerResponse::Reply { text: reply_to_plain(&reply) },
+                // Send the domain view straight over the wire; the client renders it.
+                Ok(view) => ServerResponse::Reply { view },
                 Err(e) => error_response(e),
             },
             Ok(None) => ServerResponse::NeedsRegistration,
@@ -138,61 +139,3 @@ async fn send_response(session: &Session, resp: &ServerResponse) -> anyhow::Resu
     Ok(())
 }
 
-/// Render a [`Reply`] as plain text for confide clients.
-///
-/// `/status` and `/exercises` build their replies with `<b>`/`<pre>` HTML and set
-/// `parse_mode = Some("HTML")` for Telegram. The TUI/Android clients cannot render
-/// that, so strip the markup when the reply is HTML. Kept local to this transport
-/// so the Telegram path is untouched.
-fn reply_to_plain(reply: &Reply) -> String {
-    match reply.parse_mode {
-        Some("HTML") => html_to_plain(&reply.text),
-        _ => reply.text.clone(),
-    }
-}
-
-/// Strip HTML tags and unescape the entities `escape_html` produces (`&amp;`,
-/// `&lt;`, `&gt;`). `&amp;` is reversed last so an escaped literal entity such as
-/// `&amp;lt;` decodes back to `&lt;` rather than `<`.
-fn html_to_plain(html: &str) -> String {
-    strip_tags(html).replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
-}
-
-/// Remove `<...>` tags, keeping the text between them.
-fn strip_tags(s: &str) -> String {
-    s.chars()
-        .fold((String::with_capacity(s.len()), false), |(mut out, in_tag), c| match c {
-            '<' => (out, true),
-            '>' => (out, false),
-            _ if in_tag => (out, in_tag),
-            _ => {
-                out.push(c);
-                (out, in_tag)
-            }
-        })
-        .0
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn html_reply_is_stripped_and_unescaped() {
-        let mut reply = Reply::new("<b>Status for A &amp; B</b>\n<pre>1 &lt; 2</pre>");
-        reply.as_html();
-        assert_eq!(reply_to_plain(&reply), "Status for A & B\n1 < 2");
-    }
-
-    #[test]
-    fn plain_reply_is_passed_through() {
-        let reply = Reply::new("logged 3 sets of bench press");
-        assert_eq!(reply_to_plain(&reply), "logged 3 sets of bench press");
-    }
-
-    #[test]
-    fn escaped_literal_entity_round_trips() {
-        // escape_html("&lt;") == "&amp;lt;"; stripping must yield the literal back.
-        assert_eq!(html_to_plain("&amp;lt;"), "&lt;");
-    }
-}

@@ -7,6 +7,12 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod view;
+pub use view::{
+    CatalogEntry, CatalogGroup, CatalogView, ExerciseLog, HealthNote, HistoryView, Measurement, Render, SessionSummaryView, SessionView,
+    SetLine, StatusView, View,
+};
+
 /// Discriminator placed in confide's `Message::Custom { kind, .. }` so the peer
 /// knows the payload is a GymBuddy v1 envelope.
 pub const KIND: &str = "gymbuddy/v1";
@@ -28,15 +34,17 @@ pub enum ClientRequest {
 }
 
 /// A response sent from the server to a client.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Not `Eq`: [`View`] carries floating-point set values.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ServerResponse {
     /// The pubkey is a known, registered user.
     Welcome { name: String },
     /// The pubkey is unknown; the client should collect a name/timezone and send
     /// [`ClientRequest::Register`].
     NeedsRegistration,
-    /// Plain-text assistant reply (mirrors the server's `handler::Reply` text).
-    Reply { text: String },
+    /// An assistant reply as a domain [`View`]; the client renders it natively.
+    Reply { view: View },
     /// The server could not process the request.
     Error { message: String },
 }
@@ -88,8 +96,39 @@ mod tests {
     fn server_response_variants_roundtrip() {
         roundtrip_response(ServerResponse::Welcome { name: "Alice".into() });
         roundtrip_response(ServerResponse::NeedsRegistration);
-        roundtrip_response(ServerResponse::Reply { text: "Logged 3 sets of bench press.".into() });
+        roundtrip_response(ServerResponse::Reply { view: View::message("Logged 3 sets of bench press.") });
         roundtrip_response(ServerResponse::Error { message: "unknown user".into() });
+    }
+
+    #[test]
+    fn view_variants_roundtrip() {
+        for view in [
+            View::Message { text: "Nice work!".into(), notes: vec!["3 sets logged".into()], failures: vec!["oops".into()] },
+            View::notice("Conversation cleared."),
+            View::Status(view::StatusView {
+                user_name: "Alice".into(),
+                session: Some(view::SessionView {
+                    started_at: "2026-06-16 10:00:00".into(),
+                    completed: vec![view::ExerciseLog {
+                        name: "Bench Press".into(),
+                        sets: vec![view::SetLine { measurement: view::Measurement::WeightReps, count: Some(8), value: 80.0 }],
+                    }],
+                    in_progress: vec![],
+                }),
+                health: vec![view::HealthNote { kind: "injury".into(), body_part: "shoulder".into(), description: "sore".into() }],
+            }),
+            View::Catalog(view::CatalogView {
+                groups: vec![view::CatalogGroup {
+                    muscle_group: "Chest".into(),
+                    exercises: vec![view::CatalogEntry { name: "Bench Press".into(), aliases: "bench".into(), kind: "weight_reps".into() }],
+                }],
+            }),
+            View::History(view::HistoryView {
+                sessions: vec![view::SessionSummaryView { started_at: "2026-06-16 10:00:00".into(), status: "done".into(), entries: 3, minutes: Some(45) }],
+            }),
+        ] {
+            roundtrip_response(ServerResponse::Reply { view });
+        }
     }
 
     #[test]

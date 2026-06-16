@@ -14,3 +14,4 @@ plans/
 data/
 .minesweeper/
 gymbuddy.toml
+*.key
