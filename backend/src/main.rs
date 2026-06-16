@@ -12,6 +12,7 @@ use gymbuddy_backend::assistant::AssistantHandler;
 use gymbuddy_backend::config::GymConfig;
 use gymbuddy_backend::db::Database;
 use gymbuddy_backend::github::{GithubIssueReporter, IssueReporter};
+use gymbuddy_backend::telegram::chunk::split_for_telegram;
 use gymbuddy_backend::telegram::{Message, TelegramClient, Voice};
 use gymbuddy_backend::transport;
 use gymbuddy_backend::voice::VoicePipeline;
@@ -404,29 +405,12 @@ fn spawn_chat_action_loop(telegram: &TelegramClient, chat_id: i64, action: &str)
     tx
 }
 
-/// Splits messages exceeding Telegram's 4096 character limit.
+/// Splits messages exceeding Telegram's 4096 character limit, taking care to
+/// keep `<pre>` blocks balanced when `parse_mode` is `HTML` so Telegram doesn't
+/// reject the chunk with "Can't find end of the entity starting at byte offset".
 async fn send_long_message(telegram: &TelegramClient, chat_id: i64, text: &str, parse_mode: Option<&str>) -> anyhow::Result<()> {
-    const MAX_LEN: usize = 4096;
-
-    if text.len() <= MAX_LEN {
-        telegram.send_message(chat_id, text, parse_mode, None).await?;
-        return Ok(());
+    for chunk in split_for_telegram(text) {
+        telegram.send_message(chat_id, &chunk, parse_mode, None).await?;
     }
-
-    let mut remaining = text;
-    while !remaining.is_empty() {
-        if remaining.len() <= MAX_LEN {
-            telegram.send_message(chat_id, remaining, parse_mode, None).await?;
-            break;
-        }
-
-        let chunk = &remaining[..MAX_LEN];
-        // Try splitting at the last newline
-        let split_at = chunk.rfind('\n').or_else(|| chunk.rfind(' ')).unwrap_or(MAX_LEN);
-
-        telegram.send_message(chat_id, &remaining[..split_at], parse_mode, None).await?;
-        remaining = remaining[split_at..].trim_start();
-    }
-
     Ok(())
 }
