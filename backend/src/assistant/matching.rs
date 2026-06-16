@@ -105,6 +105,7 @@ mod tests {
             make(9, "Seated Row", "row", "Back"),
             make(10, "Cable Seated Row", "", "Back"),
             make(11, "Machine Seated Row", "", "Back"),
+            make(12, "One Arm Dumbbell Row", "one arm row,single arm row,single arm dumbbell row,db row,one arm dumbell row", "Back"),
         ]
     }
 
@@ -209,6 +210,48 @@ mod tests {
         let cat = fixture();
         let found = find_exercise_type(&cat, "Machine Seated Row").unwrap();
         assert_eq!(found.exercise_type.name, "Machine Seated Row");
+    }
+
+    #[test]
+    fn exact_match_one_arm_dumbbell_row() {
+        let cat = fixture();
+        let found = find_exercise_type(&cat, "one arm dumbbell row").unwrap();
+        assert_eq!(found.exercise_type.name, "One Arm Dumbbell Row");
+    }
+
+    #[test]
+    fn alias_match_one_arm_row() {
+        let cat = fixture();
+        let found = find_exercise_type(&cat, "one arm row").unwrap();
+        assert_eq!(found.exercise_type.name, "One Arm Dumbbell Row");
+    }
+
+    #[test]
+    fn alias_match_single_arm_row() {
+        let cat = fixture();
+        let found = find_exercise_type(&cat, "single arm row").unwrap();
+        assert_eq!(found.exercise_type.name, "One Arm Dumbbell Row");
+    }
+
+    #[test]
+    fn alias_match_single_arm_dumbbell_row() {
+        let cat = fixture();
+        let found = find_exercise_type(&cat, "single arm dumbbell row").unwrap();
+        assert_eq!(found.exercise_type.name, "One Arm Dumbbell Row");
+    }
+
+    #[test]
+    fn alias_match_db_row() {
+        let cat = fixture();
+        let found = find_exercise_type(&cat, "db row").unwrap();
+        assert_eq!(found.exercise_type.name, "One Arm Dumbbell Row");
+    }
+
+    #[test]
+    fn alias_match_one_arm_dumbell_misspelling() {
+        let cat = fixture();
+        let found = find_exercise_type(&cat, "one arm dumbell row").unwrap();
+        assert_eq!(found.exercise_type.name, "One Arm Dumbbell Row");
     }
 
     #[test]
