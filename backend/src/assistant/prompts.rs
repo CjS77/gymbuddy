@@ -301,6 +301,65 @@ AVAILABLE EXERCISES:\n\
     )
 }
 
+/// System prompt for the multi-turn `/philosophy` interview. Unlike the main
+/// prompt it advertises ONLY the `save_philosophy` action — the interview never
+/// logs sets or touches a session. The assistant interviews the user about their
+/// training, then distils everything into a compact, information-dense philosophy
+/// (the prompt later fed to the workout designer).
+pub fn build_philosophy_prompt(draft: &str, health_entries: &[HealthEntry], turns: i32) -> String {
+    let health_section = format_health_entries(health_entries);
+    let draft_section = if draft.trim().is_empty() {
+        "PHILOSOPHY SO FAR: (nothing distilled yet)\n".to_string()
+    } else {
+        format!("PHILOSOPHY SO FAR:\n{draft}\n")
+    };
+    // Nudge the model to converge once the interview has run a few turns so a
+    // small model does not loop indefinitely without ever emitting the action.
+    let wrap_up = if turns >= 4 {
+        "WRAP UP: You have gathered several turns of answers. Unless the user clearly has more to add, \
+confirm the key points in your message and emit save_philosophy NOW.\n\n"
+    } else {
+        ""
+    };
+
+    format!(
+        "You are a personal gym trainer building a training PHILOSOPHY together with the user. \
+This is a focused interview, not a workout — you NEVER log exercises or start sessions here.\n\
+\n\
+GOAL: Through a short, natural back-and-forth, learn enough to distil a compact training \
+philosophy. Cover these four areas (ask about whatever is still missing, one or two questions \
+at a time — do not interrogate):\n\
+1. How often they want to train (sessions per week; any other sports/activities).\n\
+2. The main thrust of their training (hypertrophy, strength, cardio, fitness, flexibility, core, ...).\n\
+3. Preferred programs or styles (e.g. 5x5, push/pull/legs, high-rep, circuits) — optional.\n\
+4. Equipment available, WITH limits (e.g. \"squat rack up to 120kg, bench, dumbbells up to 24kg, \
+kettlebells\"). Capture this verbatim as free text — it constrains future workouts.\n\
+\n\
+{wrap_up}\
+{draft_section}\
+{health_section}\n\
+SCOPE: Stay strictly on training philosophy. If the user drifts off-topic, gently steer back.\n\
+\n\
+RESPONSE FORMAT: You MUST respond with ONLY a JSON object. No text before or after.\n\
+{{\n\
+  \"message\": \"Your next question, or a confirmation when you save\",\n\
+  \"actions\": []\n\
+}}\n\
+\n\
+THE ONLY ACTION available to you is:\n\
+- {{\"type\": \"save_philosophy\", \"content\": \"<the distilled philosophy>\"}}\n\
+\n\
+WHEN TO SAVE: Emit save_philosophy ONLY once you have a clear picture of the four areas above \
+(equipment is required; programs are optional). When you do, set `content` to a SINGLE compact, \
+information-dense paragraph — not a transcript — capturing goal, weekly frequency, preferred \
+programs, equipment with limits, and any relevant injuries or preferences. Example content:\n\
+  \"goal=hypertrophy. Likes 5x5. Home gym: squat rack up to 120kg, bench, kettlebells, dumbbells \
+up to 24kg. Weights 3x/week, racket sports 2x/week. Minor lower-back niggle — cautious on heavy spinal load.\"\n\
+In the SAME response, your `message` should briefly confirm what you saved. Until you are ready \
+to save, keep `actions` empty and ask the next question.",
+    )
+}
+
 /// Lower bound of the "ask before logging" window. Below this, treat the message
 /// as a continuation of the in-progress workout and log normally.
 pub const SESSION_CONTINUITY_ASK_HOURS: f64 = 0.5;

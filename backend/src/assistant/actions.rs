@@ -124,6 +124,14 @@ pub enum AssistantAction {
         #[serde(alias = "exercise_entry", alias = "name")]
         exercise: String,
     },
+    /// Emitted by the `/philosophy` interview prompt once enough has been gathered.
+    /// `content` is the fully distilled training philosophy (goals, programs,
+    /// schedule, and equipment captured as free text). The host appends it to the
+    /// append-only philosophy log and exits the interview.
+    SavePhilosophy {
+        #[serde(alias = "philosophy")]
+        content: String,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -326,6 +334,26 @@ mod tests {
         match action {
             AssistantAction::GetLastExercise { exercise } => assert_eq!(exercise, "Squat"),
             _ => panic!("expected GetLastExercise"),
+        }
+    }
+
+    #[test]
+    fn parse_save_philosophy() {
+        let json = r#"{"type": "save_philosophy", "content": "goal=hypertrophy; 5x5; home gym squat rack 120kg, dumbbells 24kg; 3x/week"}"#;
+        let action: AssistantAction = serde_json::from_str(json).unwrap();
+        match action {
+            AssistantAction::SavePhilosophy { content } => assert!(content.contains("hypertrophy")),
+            _ => panic!("expected SavePhilosophy"),
+        }
+    }
+
+    #[test]
+    fn parse_save_philosophy_alias() {
+        let json = r#"{"type": "save_philosophy", "philosophy": "cardio focus, 2x/week"}"#;
+        let action: AssistantAction = serde_json::from_str(json).unwrap();
+        match action {
+            AssistantAction::SavePhilosophy { content } => assert_eq!(content, "cardio focus, 2x/week"),
+            _ => panic!("expected SavePhilosophy"),
         }
     }
 

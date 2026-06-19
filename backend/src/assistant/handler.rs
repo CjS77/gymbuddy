@@ -7,9 +7,9 @@ use tokio::sync::Mutex;
 
 use crate::config::GymConfig;
 use crate::db::{
-    ConversationRole, Database, Difficulty, ExerciseEntry, ExerciseSet, ExerciseTypeWithAncestry, MeasurementType, Session, SetEdit,
-    SetEditError, User, new_conversation_message, new_exercise_entry_at, new_exercise_goal, new_exercise_set, new_health_entry, new_user,
-    new_user_with_pubkey,
+    ConversationRole, Database, Difficulty, ExerciseEntry, ExerciseSet, ExerciseTypeWithAncestry, InterviewState, MeasurementType, Session,
+    SetEdit, SetEditError, User, new_conversation_message, new_exercise_entry_at, new_exercise_goal, new_exercise_set, new_health_entry,
+    new_user, new_user_with_pubkey,
 };
 use crate::github::IssueReporter;
 use crate::telegram::Message as TgMessage;
@@ -18,7 +18,8 @@ use super::actions::AssistantAction;
 use super::matching::find_exercise_type;
 use super::parser::parse_assistant_response;
 use super::prompts::{
-    ActivePlanView, EntryView, PlanExerciseView, PromptContext, SESSION_CONTINUITY_ASK_HOURS, SESSION_CONTINUITY_HOURS, build_system_prompt,
+    ActivePlanView, EntryView, PlanExerciseView, PromptContext, SESSION_CONTINUITY_ASK_HOURS, SESSION_CONTINUITY_HOURS,
+    build_philosophy_prompt, build_system_prompt,
 };
 use gymbuddy_proto::{
     CatalogEntry, CatalogGroup, CatalogView, ExerciseLog, HealthNote, HistoryView, Measurement, SessionSummaryView, SessionView, SetLine,
@@ -139,6 +140,13 @@ impl AssistantHandler {
     pub async fn handle_message_for_user(&self, user: &User, text: &str, platform: &str) -> anyhow::Result<Reply> {
         if let Some(reply) = self.handle_command(text, user, platform).await? {
             return Ok(reply);
+        }
+
+        // A `/philosophy` interview in progress consumes free text through the
+        // interviewer prompt. Slash commands above (including `/cancel`) still
+        // work; this returns `None` when the user is not interviewing.
+        if let Some(reply) = self.maybe_handle_interview_mode(user, text, platform).await? {
+            return Ok(reply.into());
         }
 
         self.close_stale_session(user).await?;
@@ -288,6 +296,8 @@ impl AssistantHandler {
             "/exercises" => Ok(Some(View::Catalog(self.cmd_exercises()).into())),
             "/clear" => Ok(Some(View::notice(self.cmd_clear(user, platform).await?).into())),
             "/timers" => Ok(Some(self.cmd_timers(user).await?)),
+            "/philosophy" => Ok(Some(self.cmd_philosophy_start(user, platform).await?.into())),
+            "/cancel" => Ok(Some(self.cmd_cancel(user, platform).await?.into())),
             "/feedback" => Ok(self.cmd_feedback(user, text).await?.map(Into::into)),
             _ => Ok(None),
         }
@@ -303,6 +313,108 @@ impl AssistantHandler {
         Ok(Reply { view: View::Timers { enabled }, timer })
     }
 
+    /// Enter the multi-turn `/philosophy` interview and return the opening question.
+    /// Turn 0 is a fixed prompt (no LLM call); subsequent free-text turns are routed
+    /// through [`Self::philosophy_interview_turn`]. The opener is stored as
+    /// conversation so the interview thread stays coherent.
+    async fn cmd_philosophy_start(&self, user: &User, platform: &str) -> anyhow::Result<View> {
+        let existing = {
+            let db = self.db.lock().await;
+            db.set_interview_state(user.id, platform, "philosophy", "", 0)?;
+            db.latest_philosophy(user.id)?
+        };
+
+        let opener = match existing {
+            Some(p) => format!(
+                "Let's refine your training philosophy. Here's what I have on file:\n\n\
+                 \"{}\"\n\n\
+                 What would you like to change or add? (or /cancel to keep it as is)",
+                p.content
+            ),
+            None => "Let's build your training philosophy together -- it'll guide every workout I design for you.\n\n\
+                 To start: how often do you want to train each week, and what's your main goal \
+                 (building muscle, strength, cardio, general fitness, something else)?"
+                .to_string(),
+        };
+
+        self.store_conversation_on_platform(user.id, platform, "/philosophy", &opener).await?;
+        Ok(View::message(opener))
+    }
+
+    /// Cancel an in-progress interview (e.g. `/philosophy`). A no-op notice when the
+    /// user is not interviewing.
+    async fn cmd_cancel(&self, user: &User, platform: &str) -> anyhow::Result<View> {
+        let db = self.db.lock().await;
+        match db.get_interview_state(user.id, platform)? {
+            Some(_) => {
+                db.clear_interview_state(user.id, platform)?;
+                Ok(View::notice("Cancelled -- your workout philosophy is unchanged."))
+            }
+            None => Ok(View::notice("Nothing to cancel.")),
+        }
+    }
+
+    /// Route free text through the interviewer prompt while a `/philosophy`
+    /// interview is in progress. Returns `None` when the user is not interviewing,
+    /// so normal log/coach handling proceeds.
+    async fn maybe_handle_interview_mode(&self, user: &User, text: &str, platform: &str) -> anyhow::Result<Option<View>> {
+        let state = self.db.lock().await.get_interview_state(user.id, platform)?;
+        let Some(state) = state else { return Ok(None) };
+        match state.mode.as_str() {
+            "philosophy" => Ok(Some(self.philosophy_interview_turn(user, text, platform, &state).await?)),
+            other => {
+                tracing::warn!("Clearing unknown interview mode {other:?} for user {}", user.id);
+                self.db.lock().await.clear_interview_state(user.id, platform)?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// One turn of the `/philosophy` interview: build the interviewer prompt from
+    /// the draft + active injuries, call the LLM, and either save the distilled
+    /// philosophy (on `save_philosophy`) and exit, or ask the next question.
+    async fn philosophy_interview_turn(&self, user: &User, text: &str, platform: &str, state: &InterviewState) -> anyhow::Result<View> {
+        let (system_prompt, history) = {
+            let db = self.db.lock().await;
+            let injuries = db.list_active_health_entries(user.id)?;
+            let history = db.get_recent_messages_for_platform(user.id, platform, self.config.conversation_history_limit)?;
+            (build_philosophy_prompt(&state.draft, &injuries, state.turns), history)
+        };
+
+        let llm_response = match self.call_llm(&system_prompt, &history, text).await {
+            Ok(response) => response,
+            Err(e) => {
+                tracing::error!("Philosophy interview LLM call failed: {e:#}");
+                self.store_excluded_conversation_on_platform(user.id, platform, text, "interview error").await?;
+                return Ok(View::notice("I had trouble with that -- could you say it again? (or /cancel to stop)"));
+            }
+        };
+
+        let parsed = parse_assistant_response(&llm_response);
+        let saved = parsed.actions.iter().find_map(|action| match action {
+            AssistantAction::SavePhilosophy { content } => Some(content.clone()),
+            _ => None,
+        });
+
+        self.store_conversation_on_platform(user.id, platform, text, &llm_response).await?;
+
+        let db = self.db.lock().await;
+        if let Some(content) = saved {
+            db.insert_philosophy(user.id, &content, "interview")?;
+            db.clear_interview_state(user.id, platform)?;
+            let message = crate::text::strip_markdown(&parsed.message);
+            let confirm = if message.trim().is_empty() {
+                "Saved your training philosophy. Try /nextworkout to put it to work.".to_string()
+            } else {
+                format!("{message}\n\n(Saved -- try /nextworkout to put it to work.)")
+            };
+            return Ok(View::message(confirm));
+        }
+
+        db.set_interview_state(user.id, platform, "philosophy", &state.draft, state.turns + 1)?;
+        Ok(View::message(crate::text::strip_markdown(&parsed.message)))
+    }
+
     fn cmd_start(&self, user: &User) -> String {
         let mut msg = format!(
             "You're already registered, {}! Here's what I can help with:\n\
@@ -310,6 +422,7 @@ impl AssistantHandler {
              - /status -- see your current session\n\
              - /history -- recent workout summaries\n\
              - /exercises -- available exercises\n\
+             - /philosophy -- build or refine your training philosophy\n\
              - /clear -- clear conversation context\n\
              - /timers -- toggle rest timers between sets\n",
             user.name
@@ -327,6 +440,8 @@ impl AssistantHandler {
          /status -- Current session and today's stats\n\
          /history -- Last 5 workout summaries\n\
          /exercises -- List available exercises by muscle group\n\
+         /philosophy -- Build or refine your training philosophy (multi-turn)\n\
+         /cancel -- Cancel an in-progress interview (e.g. /philosophy)\n\
          /clear -- Clear conversation context (fresh start)\n\
          /timers -- Toggle the rest timer between sets (on by default)\n"
             .to_string();
@@ -749,6 +864,12 @@ impl AssistantHandler {
                 .await?
                 .into()),
             AssistantAction::GetLastExercise { exercise } => Ok(self.get_last_exercise_action(user, exercise).await?.into()),
+            AssistantAction::SavePhilosophy { .. } => {
+                // Only meaningful inside the `/philosophy` interview, which applies it
+                // directly. Ignore it if the model emits it during normal chat.
+                tracing::debug!("Ignoring save_philosophy outside the philosophy interview");
+                Ok(ActionOutcome::none())
+            }
             AssistantAction::Unknown => {
                 tracing::debug!("Ignoring unknown action type from LLM");
                 Ok(ActionOutcome::none())
@@ -2569,5 +2690,58 @@ mod tests {
                 "unbalanced <pre> in chunk: {chunk:?}",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn philosophy_interview_saves_and_exits() {
+        let (handler, llm) = setup_handler("").await;
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
+
+        // /philosophy opens the interview with a fixed opener and arms the mode.
+        let opener = handler.handle_text_message(&msg, "/philosophy").await.unwrap();
+        assert!(shown(&opener).to_lowercase().contains("philosophy"));
+        let user = { handler.db.lock().await.get_user_by_telegram_id("12345").unwrap().unwrap() };
+        assert!(handler.db.lock().await.get_interview_state(user.id, "telegram").unwrap().is_some());
+
+        // A first answer keeps the interview going (no save action).
+        llm.set_response(r#"{"message": "Great. What equipment do you have?", "actions": []}"#);
+        let q2 = handler.handle_text_message(&msg, "3x a week, hypertrophy, I like 5x5").await.unwrap();
+        assert!(shown(&q2).contains("equipment"));
+        let state = handler.db.lock().await.get_interview_state(user.id, "telegram").unwrap().unwrap();
+        assert_eq!(state.turns, 1, "turn counter should advance");
+
+        // The next answer triggers save_philosophy: it is stored and the mode clears.
+        llm.set_response(
+            r#"{"message": "Locked in.", "actions": [
+                {"type": "save_philosophy", "content": "goal=hypertrophy. Likes 5x5. Home gym: squat rack 120kg, dumbbells 24kg. 3x/week."}
+            ]}"#,
+        );
+        let done = handler.handle_text_message(&msg, "squat rack to 120kg and dumbbells to 24kg").await.unwrap();
+        assert!(shown(&done).contains("/nextworkout"), "confirmation should point at /nextworkout");
+
+        let db = handler.db.lock().await;
+        assert!(db.get_interview_state(user.id, "telegram").unwrap().is_none(), "mode should be cleared");
+        let saved = db.latest_philosophy(user.id).unwrap().unwrap();
+        assert!(saved.content.contains("hypertrophy") && saved.content.contains("120kg"));
+        assert_eq!(saved.source, "interview");
+    }
+
+    #[tokio::test]
+    async fn cancel_aborts_interview_without_saving() {
+        let (handler, _llm) = setup_handler("").await;
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
+
+        let _ = handler.handle_text_message(&msg, "/philosophy").await.unwrap();
+        let user = { handler.db.lock().await.get_user_by_telegram_id("12345").unwrap().unwrap() };
+        assert!(handler.db.lock().await.get_interview_state(user.id, "telegram").unwrap().is_some());
+
+        let cancelled = handler.handle_text_message(&msg, "/cancel").await.unwrap();
+        assert!(shown(&cancelled).to_lowercase().contains("cancel"));
+
+        let db = handler.db.lock().await;
+        assert!(db.get_interview_state(user.id, "telegram").unwrap().is_none());
+        assert!(db.latest_philosophy(user.id).unwrap().is_none(), "nothing should be saved");
     }
 }
