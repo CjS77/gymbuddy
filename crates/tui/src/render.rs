@@ -4,7 +4,7 @@
 //! headings, bullets, and space-aligned columns (no bordered `Table` widget,
 //! which clashes with the flowing transcript).
 
-use gymbuddy_proto::{CatalogView, ExerciseLog, HistoryView, Measurement, SetLine, StatusView, View};
+use gymbuddy_proto::{CatalogView, ExerciseLog, HistoryView, SetLine, StatusView, View, WorkoutView};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -23,6 +23,7 @@ pub fn render_view(view: &View) -> Vec<Line<'static>> {
         View::Status(status) => render_status(status),
         View::Catalog(catalog) => render_catalog(catalog),
         View::History(history) => render_history(history),
+        View::Workout(workout) => render_workout(workout),
         View::Timers { enabled } => vec![Line::from(Span::styled(
             format!("Rest timers {}", if *enabled { "on" } else { "off" }),
             Style::default().fg(if *enabled { SUCCESS } else { MUTED }).add_modifier(Modifier::BOLD),
@@ -129,37 +130,58 @@ fn render_history(history: &HistoryView) -> Vec<Line<'static>> {
     lines
 }
 
+fn render_workout(workout: &WorkoutView) -> Vec<Line<'static>> {
+    let mut lines = vec![heading(workout.title.clone())];
+
+    if let Some(rationale) = &workout.rationale
+        && !rationale.trim().is_empty()
+    {
+        lines.extend(rationale.split('\n').map(|l| muted(l.to_string())));
+    }
+
+    if !workout.exercises.is_empty() {
+        lines.push(Line::from(""));
+        for (i, exercise) in workout.exercises.iter().enumerate() {
+            let target = exercise.target_line();
+            let target_part = if target.is_empty() { String::new() } else { format!(" — {target}") };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {}. ", i + 1), Style::default().fg(MUTED)),
+                Span::styled(exercise.name.clone(), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                Span::raw(target_part),
+            ]));
+            if let Some(cue) = &exercise.cue
+                && !cue.trim().is_empty()
+            {
+                lines.push(muted(format!("     {cue}")));
+            }
+        }
+    }
+
+    if !workout.notes.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(bold("Notes"));
+        for note in &workout.notes {
+            lines.push(Line::from(vec![Span::styled("  • ", Style::default().fg(MUTED)), Span::raw(note.clone())]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(muted("This is just a plan — log your sets as you go and I'll adjust.".into()));
+    lines
+}
+
 fn exercise_bullet(log: &ExerciseLog, index: Option<usize>) -> Line<'static> {
     let bullet = match index {
         Some(i) => format!("  {i}. "),
         None => "  • ".to_string(),
     };
     let n = log.sets.len();
-    let sets = log.sets.iter().map(format_set).collect::<Vec<_>>().join(", ");
+    let sets = log.sets.iter().map(SetLine::compact).collect::<Vec<_>>().join(", ");
     Line::from(vec![
         Span::styled(bullet, Style::default().fg(MUTED)),
         Span::styled(log.name.clone(), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
         Span::raw(format!(" ({n} {}) — {sets}", if n == 1 { "set" } else { "sets" })),
     ])
-}
-
-/// Compact, human-friendly set rendering, e.g. "8×80kg", "82.5kg", "30s".
-fn format_set(set: &SetLine) -> String {
-    match set.measurement {
-        Measurement::WeightReps => match set.count {
-            Some(c) => format!("{c}×{}kg", trim(set.value)),
-            None => format!("{}kg", trim(set.value)),
-        },
-        Measurement::TimeBased => format!("{}s", trim(set.value)),
-        Measurement::DistanceBased => format!("{}m", trim(set.value)),
-        Measurement::LevelBased => format!("L{}", trim(set.value)),
-        Measurement::ScoreBased => format!("{}pt", trim(set.value)),
-    }
-}
-
-/// Drop a trailing ".0" so whole numbers read cleanly (80.0 → "80", 82.5 → "82.5").
-fn trim(v: f64) -> String {
-    if v.fract() == 0.0 { format!("{v:.0}") } else { format!("{v}") }
 }
 
 fn plain_lines(text: &str) -> Vec<Line<'static>> {
@@ -181,7 +203,7 @@ fn muted(text: String) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gymbuddy_proto::{CatalogEntry, CatalogGroup, ExerciseLog, HealthNote, SessionView};
+    use gymbuddy_proto::{CatalogEntry, CatalogGroup, ExerciseLog, HealthNote, Measurement, SessionView};
 
     fn flat(lines: &[Line]) -> String {
         lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect::<Vec<_>>().join("\n")
@@ -215,6 +237,31 @@ mod tests {
         assert!(text.contains("Bench Press"));
         assert!(text.contains("8×80kg"));
         assert!(text.contains("injury (shoulder): sore"));
+        assert!(!text.contains('<'), "no HTML markup should appear: {text}");
+    }
+
+    #[test]
+    fn workout_renders_plan_without_markup() {
+        use gymbuddy_proto::{PlannedExerciseView, WorkoutView};
+        let view = View::Workout(WorkoutView {
+            title: "Push focus".into(),
+            rationale: Some("Bench was easy last time.".into()),
+            exercises: vec![PlannedExerciseView {
+                name: "Bench Press".into(),
+                target_sets: Some(3),
+                target_reps: Some(6),
+                target_weight_kg: Some(65.0),
+                target_secs: None,
+                cue: Some("Push the weight.".into()),
+            }],
+            notes: vec!["Skipped deadlift for your back.".into()],
+        });
+        let text = flat(&render_view(&view));
+        assert!(text.contains("Push focus"));
+        assert!(text.contains("Bench was easy last time."));
+        assert!(text.contains("1. Bench Press — 3 sets × 6 reps @ 65kg"));
+        assert!(text.contains("Push the weight."));
+        assert!(text.contains("Skipped deadlift for your back."));
         assert!(!text.contains('<'), "no HTML markup should appear: {text}");
     }
 

@@ -36,6 +36,10 @@ pub enum View {
     /// Clients show it however they like — Telegram as a one-line notice, the TUI by
     /// updating its sidebar switch.
     Timers { enabled: bool },
+    /// A designed-but-unlogged workout ( `/nextworkout` ): the rationale plus the
+    /// prescribed exercises and target sets. Nothing here is logged — the user still
+    /// logs sets the normal way.
+    Workout(WorkoutView),
 }
 
 impl View {
@@ -66,6 +70,7 @@ impl View {
             View::Status(_) => "Here's your current session.".to_string(),
             View::Catalog(_) => "Here's the exercise catalogue.".to_string(),
             View::History(_) => "Here's your recent workout history.".to_string(),
+            View::Workout(w) => format!("Here's a workout: {}.", w.title),
         }
     }
 }
@@ -110,6 +115,30 @@ pub struct SetLine {
     pub measurement: Measurement,
     pub count: Option<u32>,
     pub value: f64,
+}
+
+impl SetLine {
+    /// Compact, human-friendly rendering of one set, e.g. "8×80kg", "82.5kg", "30s".
+    /// Shared by every client renderer so a wire value displays identically across
+    /// Telegram, the TUI and a future Android client.
+    pub fn compact(&self) -> String {
+        let v = trim_decimal(self.value);
+        match self.measurement {
+            Measurement::WeightReps => match self.count {
+                Some(c) => format!("{c}×{v}kg"),
+                None => format!("{v}kg"),
+            },
+            Measurement::TimeBased => format!("{v}s"),
+            Measurement::DistanceBased => format!("{v}m"),
+            Measurement::LevelBased => format!("L{v}"),
+            Measurement::ScoreBased => format!("{v}pt"),
+        }
+    }
+}
+
+/// Drop a trailing ".0" so whole numbers read cleanly (80.0 → "80", 82.5 → "82.5").
+fn trim_decimal(v: f64) -> String {
+    if v.fract() == 0.0 { format!("{v:.0}") } else { format!("{v}") }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,6 +198,64 @@ pub struct SessionSummaryView {
     pub minutes: Option<u32>,
 }
 
+// ── /nextworkout ─────────────────────────────────────────────────────────────────
+
+/// A designed workout: a title, the coach's reasoning, and the prescribed
+/// exercises. Purely a proposal — logging still happens the normal way.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkoutView {
+    pub title: String,
+    /// The coach's reasoning for this session (why these exercises today).
+    pub rationale: Option<String>,
+    pub exercises: Vec<PlannedExerciseView>,
+    /// Free-text caveats the coach attached (e.g. a dropped exercise, equipment note).
+    pub notes: Vec<String>,
+}
+
+/// One prescribed exercise in a [`WorkoutView`]. The target fields are
+/// presentation hints; `(target_reps, target_weight_kg)` cover the weight_reps
+/// case and `target_secs` covers timed work.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlannedExerciseView {
+    pub name: String,
+    pub target_sets: Option<u32>,
+    pub target_reps: Option<u32>,
+    pub target_weight_kg: Option<f64>,
+    pub target_secs: Option<u32>,
+    /// A short coaching cue or substitution note for this exercise.
+    pub cue: Option<String>,
+}
+
+impl PlannedExerciseView {
+    /// The prescription line for this exercise, e.g. "3 sets × 6 reps @ 65kg" or
+    /// "3 sets × 60s". Empty when no targets are set. Shared by all client renderers
+    /// (the value is plain text — escaping/styling stays at the renderer).
+    pub fn target_line(&self) -> String {
+        let mut parts = String::new();
+        if let Some(sets) = self.target_sets {
+            parts.push_str(&format!("{sets} sets"));
+        }
+        if let Some(secs) = self.target_secs {
+            if !parts.is_empty() {
+                parts.push_str(" × ");
+            }
+            parts.push_str(&format!("{secs}s"));
+        } else if let Some(reps) = self.target_reps {
+            if !parts.is_empty() {
+                parts.push_str(" × ");
+            }
+            parts.push_str(&format!("{reps} reps"));
+        }
+        if let Some(weight) = self.target_weight_kg {
+            if !parts.is_empty() {
+                parts.push(' ');
+            }
+            parts.push_str(&format!("@ {}kg", trim_decimal(weight)));
+        }
+        parts
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,9 +273,58 @@ mod tests {
             View::Status(StatusView { user_name: "Al".into(), session: None, health: vec![] }),
             View::Catalog(CatalogView { groups: vec![] }),
             View::History(HistoryView { sessions: vec![] }),
+            View::Workout(WorkoutView { title: "Push focus".into(), rationale: None, exercises: vec![], notes: vec![] }),
         ];
         for view in &views {
             assert!(!view.fallback_text().is_empty(), "empty fallback for {view:?}");
         }
+    }
+
+    fn set(measurement: Measurement, count: Option<u32>, value: f64) -> SetLine {
+        SetLine { measurement, count, value }
+    }
+
+    #[test]
+    fn set_line_compact_per_measurement() {
+        assert_eq!(set(Measurement::WeightReps, Some(8), 80.0).compact(), "8×80kg");
+        assert_eq!(set(Measurement::WeightReps, Some(8), 82.5).compact(), "8×82.5kg");
+        assert_eq!(set(Measurement::WeightReps, None, 80.0).compact(), "80kg");
+        assert_eq!(set(Measurement::TimeBased, None, 30.0).compact(), "30s");
+        assert_eq!(set(Measurement::DistanceBased, None, 5000.0).compact(), "5000m");
+        assert_eq!(set(Measurement::LevelBased, None, 3.0).compact(), "L3");
+        assert_eq!(set(Measurement::ScoreBased, None, 9.5).compact(), "9.5pt");
+    }
+
+    #[test]
+    fn planned_exercise_target_line() {
+        let weighted = PlannedExerciseView {
+            name: "Bench Press".into(),
+            target_sets: Some(3),
+            target_reps: Some(6),
+            target_weight_kg: Some(65.0),
+            target_secs: None,
+            cue: None,
+        };
+        assert_eq!(weighted.target_line(), "3 sets × 6 reps @ 65kg");
+
+        let timed = PlannedExerciseView {
+            name: "Plank".into(),
+            target_sets: Some(3),
+            target_reps: None,
+            target_weight_kg: None,
+            target_secs: Some(60),
+            cue: None,
+        };
+        assert_eq!(timed.target_line(), "3 sets × 60s");
+
+        let bare = PlannedExerciseView {
+            name: "Mystery".into(),
+            target_sets: None,
+            target_reps: None,
+            target_weight_kg: None,
+            target_secs: None,
+            cue: None,
+        };
+        assert_eq!(bare.target_line(), "");
     }
 }

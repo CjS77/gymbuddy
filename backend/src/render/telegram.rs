@@ -3,7 +3,7 @@
 //! Reproduces the exact output the handler emitted before the view refactor, so
 //! the Telegram bot is visually unchanged — locked down by golden tests below.
 
-use gymbuddy_proto::{CatalogView, HistoryView, Measurement, Render, SetLine, StatusView, View};
+use gymbuddy_proto::{CatalogView, HistoryView, Render, SetLine, StatusView, View, WorkoutView};
 
 /// The Telegram renderer. `Output` is `(text, parse_mode)` — `parse_mode` is
 /// `Some("HTML")` for the rich `/status` and `/exercises` views, `None` otherwise.
@@ -19,6 +19,7 @@ impl Render for Telegram {
             View::History(history) => (render_history(history), None),
             View::Status(status) => (render_status(status), Some("HTML")),
             View::Catalog(catalog) => (render_catalog(catalog), Some("HTML")),
+            View::Workout(workout) => (render_workout(workout), Some("HTML")),
             View::Timers { enabled } => (format!("Rest timers are now {}.", if *enabled { "on" } else { "off" }), None),
             // `View` is `#[non_exhaustive]`: a variant from a newer server lands here.
             // Degrade to plain text rather than sending Telegram an empty message
@@ -121,27 +122,48 @@ fn render_history(history: &HistoryView) -> String {
     parts.join("\n")
 }
 
+fn render_workout(workout: &WorkoutView) -> String {
+    let mut result = format!("<b>{}</b>\n", escape_html(&workout.title));
+
+    if let Some(rationale) = &workout.rationale
+        && !rationale.trim().is_empty()
+    {
+        result.push_str(&format!("\n{}\n", escape_html(rationale)));
+    }
+
+    if !workout.exercises.is_empty() {
+        result.push('\n');
+        for (i, exercise) in workout.exercises.iter().enumerate() {
+            let target = exercise.target_line();
+            let target_part = if target.is_empty() { String::new() } else { format!(" — {target}") };
+            result.push_str(&format!("{}. <b>{}</b>{target_part}\n", i + 1, escape_html(&exercise.name)));
+            if let Some(cue) = &exercise.cue
+                && !cue.trim().is_empty()
+            {
+                result.push_str(&format!("   <i>{}</i>\n", escape_html(cue)));
+            }
+        }
+    }
+
+    if !workout.notes.is_empty() {
+        result.push_str("\n<b>Notes:</b>\n");
+        for note in &workout.notes {
+            result.push_str(&format!("- {}\n", escape_html(note)));
+        }
+    }
+
+    result.push_str("\nThis is just a plan -- log your sets as you go and I'll adjust.");
+    result
+}
+
+/// Compact rendering of one set ("8×80kg", "30s", …) shared with every client via
+/// [`SetLine::compact`](gymbuddy_proto::SetLine::compact).
 fn joined_sets(sets: &[SetLine]) -> String {
-    sets.iter().map(format_set).collect::<Vec<_>>().join(", ")
+    sets.iter().map(SetLine::compact).collect::<Vec<_>>().join(", ")
 }
 
 fn set_count(n: usize) -> String {
     format!("{n} {}", if n == 1 { "set" } else { "sets" })
-}
-
-/// Compact rendering of one set, e.g. "8×80.0kg", "30s", "5000m". Mirrors the
-/// backend's `format_set_short`, operating on the wire [`SetLine`].
-fn format_set(set: &SetLine) -> String {
-    match set.measurement {
-        Measurement::WeightReps => match set.count {
-            Some(c) => format!("{c}×{:.1}kg", set.value),
-            None => format!("{:.1}kg", set.value),
-        },
-        Measurement::TimeBased => format!("{:.0}s", set.value),
-        Measurement::DistanceBased => format!("{:.0}m", set.value),
-        Measurement::LevelBased => format!("L{:.0}", set.value),
-        Measurement::ScoreBased => format!("{:.1}pt", set.value),
-    }
 }
 
 /// Escape the three characters that are significant in Telegram HTML.
@@ -152,7 +174,7 @@ pub(crate) fn escape_html(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gymbuddy_proto::{CatalogEntry, CatalogGroup, ExerciseLog, HealthNote, SessionView};
+    use gymbuddy_proto::{CatalogEntry, CatalogGroup, ExerciseLog, HealthNote, Measurement, SessionView};
 
     fn set(count: Option<u32>, value: f64) -> SetLine {
         SetLine { measurement: Measurement::WeightReps, count, value }
@@ -174,9 +196,9 @@ mod tests {
         let expected = "<b>Status for Alice</b>\n\
                         \n<b>Active session</b> (started 2026-06-16 10:00:00)\n\
                         <b>Completed:</b>\n\
-                        - <b>Bench Press</b> (2 sets) — 8×80.0kg, 8×80.0kg\n\
+                        - <b>Bench Press</b> (2 sets) — 8×80kg, 8×80kg\n\
                         <b>Current exercise:</b>\n\
-                        - <b>Squat</b> (1 set) — 5×100.0kg\n\
+                        - <b>Squat</b> (1 set) — 5×100kg\n\
                         \n<b>Active health issues</b>\n\
                         - injury (shoulder): sore\n";
         assert_eq!(html, expected);
@@ -227,5 +249,54 @@ mod tests {
     #[test]
     fn escape_html_escapes_amp_lt_gt() {
         assert_eq!(escape_html("a & b < c > d"), "a &amp; b &lt; c &gt; d");
+    }
+
+    #[test]
+    fn workout_html_renders_plan() {
+        use gymbuddy_proto::PlannedExerciseView;
+        let workout = WorkoutView {
+            title: "Upper push + lat focus".into(),
+            rationale: Some("2 days rest on bench and your last session was easy, so we push the weight.".into()),
+            exercises: vec![
+                PlannedExerciseView {
+                    name: "Bench Press".into(),
+                    target_sets: Some(3),
+                    target_reps: Some(6),
+                    target_weight_kg: Some(65.0),
+                    target_secs: None,
+                    cue: Some("Last time 55kg felt easy.".into()),
+                },
+                PlannedExerciseView {
+                    name: "One Arm Dumbbell Row".into(),
+                    target_sets: Some(3),
+                    target_reps: Some(8),
+                    target_weight_kg: Some(24.0),
+                    target_secs: None,
+                    cue: None,
+                },
+                PlannedExerciseView {
+                    name: "Plank".into(),
+                    target_sets: Some(3),
+                    target_reps: None,
+                    target_weight_kg: None,
+                    target_secs: Some(60),
+                    cue: None,
+                },
+            ],
+            notes: vec!["Skipped deadlift to protect your lower back.".into()],
+        };
+        let (html, mode) = Telegram.render(&View::Workout(workout));
+        assert_eq!(mode, Some("HTML"));
+        let expected = "<b>Upper push + lat focus</b>\n\
+                        \n2 days rest on bench and your last session was easy, so we push the weight.\n\
+                        \n\
+                        1. <b>Bench Press</b> — 3 sets × 6 reps @ 65kg\n\
+                        \u{20}  <i>Last time 55kg felt easy.</i>\n\
+                        2. <b>One Arm Dumbbell Row</b> — 3 sets × 8 reps @ 24kg\n\
+                        3. <b>Plank</b> — 3 sets × 60s\n\
+                        \n<b>Notes:</b>\n\
+                        - Skipped deadlift to protect your lower back.\n\
+                        \nThis is just a plan -- log your sets as you go and I'll adjust.";
+        assert_eq!(html, expected);
     }
 }

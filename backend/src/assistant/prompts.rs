@@ -9,6 +9,7 @@ pub struct PromptContext {
     pub session_entries: Vec<EntryView>,          // closed + open entries in the active session, in insertion order
     pub leaked_open_entries: Vec<EntryView>,      // open entries belonging to ENDED prior sessions or the active session
     pub active_plan: Option<ActivePlanView>,      // populated when the active session was started with a `plan:` sentinel
+    pub active_workout_plan: Option<WorkoutPlanProgress>, // a `/nextworkout` design that is ready or under guided execution
     pub health_entries: Vec<HealthEntry>,
     pub recent_summaries: Vec<SessionSummary>,
     pub recent_sets: Vec<ExerciseSet>,
@@ -49,6 +50,31 @@ pub struct PlanExerciseView {
     pub target_weight_kg: Option<f64>,
 }
 
+/// Progress of a `/nextworkout` design: either freshly designed and ready to start
+/// (`started == false`) or bound to the active session and under guided execution
+/// (`started == true`). Drives the proactive set-by-set coaching.
+#[derive(Debug, Clone)]
+pub struct WorkoutPlanProgress {
+    pub title: String,
+    pub started: bool,
+    /// Names of prescribed exercises the user has already logged sets for this session.
+    pub done: Vec<String>,
+    /// The next prescribed exercise still to do.
+    pub next: Option<PrescribedExercise>,
+    /// How many prescribed exercises remain.
+    pub remaining: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrescribedExercise {
+    pub exercise_name: String,
+    pub target_sets: Option<i32>,
+    pub target_reps: Option<i32>,
+    pub target_weight_kg: Option<f64>,
+    pub target_secs: Option<i32>,
+    pub notes: Option<String>,
+}
+
 pub fn build_system_prompt(ctx: &PromptContext) -> String {
     let session_status = match &ctx.active_session {
         Some(s) => format!("Active (started {})", s.started_at),
@@ -58,6 +84,7 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
     let entries_section = format_session_entries(&ctx.session_entries);
     let leaked_section = format_leaked_entries(&ctx.leaked_open_entries);
     let plan_section = format_active_plan(&ctx.active_plan);
+    let workout_plan_section = format_active_workout_plan(&ctx.active_workout_plan);
     let continuity_section = format_session_continuity(ctx.last_activity_age_hours);
     let continuity_banner = format_session_continuity_banner(ctx.last_activity_age_hours);
     let health_section = format_health_entries(&ctx.health_entries);
@@ -117,6 +144,11 @@ re-labels the whole exercise block; `new_value` is the new weight_kg (or duratio
 / distance_m for timed / distance exercises). Include ONLY the fields the user wants \
 changed. Never send an id — the host finds the set by recency and appends the exact \
 before→after summary to your reply.\n\
+- {{\"type\": \"append_philosophy_note\", \"note\": \"<durable preference or constraint>\"}}\n\
+  Appends a lasting preference the user voices mid-workout (e.g. \"always prefer \
+goblet squats to barbell\", \"keep deadlifts light, my back is fragile\") to their \
+training philosophy so FUTURE /nextworkout designs respect it. Use it only for \
+durable preferences — not one-off changes to today's set.\n\
 - {{\"type\": \"get_last_exercise\", \"exercise\": \"<EXACT or fuzzy name>\"}}\n\
   Looks up the user's most recent exercise_entry for the named exercise and \
 appends a summary (resolved exercise name, start time, every set) to your reply. \
@@ -215,6 +247,16 @@ go on deadlift?\"), emit a get_last_exercise action with the exercise name. Do \
 NOT make up numbers from RECENT HISTORY — the host fetches the authoritative \
 entry and appends the summary to your reply.\n\
 - If the user mentions pain, injury, or illness, log it with log_health\n\
+- GUIDED WORKOUT: When a PRESCRIBED WORKOUT or DESIGNED WORKOUT section is present, \
+you are coaching the user through a pre-designed session like a personal trainer. \
+After you log or confirm the set the user just reported, PROACTIVELY tell them the \
+NEXT prescribed set — name, target weight and reps — with a short motivating reason \
+drawn from their history (e.g. \"last time 55kg felt easy, so let's go 60kg\"). State \
+the prescription; do not ask \"what next?\". If the user reports pain, log_health and \
+offer a lighter or substitute movement that hits the same muscles within their \
+equipment. When they voice a durable preference (\"I always prefer goblet squats\"), \
+emit append_philosophy_note so future designs honour it. The user still reports what \
+they ACTUALLY did — adjust like a real trainer if it differs from the prescription.\n\
 - Keep responses concise -- this is a chat interface\n\
 - Be encouraging but not patronizing\n\
 - All action fields use metric units (weight_kg, distance_m). If the user specifies \
@@ -289,6 +331,7 @@ Active session: {session_status}\n\
 {entries_section}\
 {leaked_section}\
 {plan_section}\
+{workout_plan_section}\
 {continuity_section}\
 {health_section}\n\
 {history_section}\n\
@@ -299,6 +342,139 @@ AVAILABLE EXERCISES:\n\
         current_time = ctx.current_time,
         timezone = ctx.timezone,
     )
+}
+
+/// System prompt for the multi-turn `/philosophy` interview. Unlike the main
+/// prompt it advertises ONLY the `save_philosophy` action — the interview never
+/// logs sets or touches a session. The assistant interviews the user about their
+/// training, then distils everything into a compact, information-dense philosophy
+/// (the prompt later fed to the workout designer).
+pub fn build_philosophy_prompt(draft: &str, health_entries: &[HealthEntry], turns: i32) -> String {
+    let health_section = format_health_entries(health_entries);
+    let draft_section = if draft.trim().is_empty() {
+        "PHILOSOPHY SO FAR: (nothing distilled yet)\n".to_string()
+    } else {
+        format!("PHILOSOPHY SO FAR:\n{draft}\n")
+    };
+    // Nudge the model to converge once the interview has run a few turns so a
+    // small model does not loop indefinitely without ever emitting the action.
+    let wrap_up = if turns >= 4 {
+        "WRAP UP: You have gathered several turns of answers. Unless the user clearly has more to add, \
+confirm the key points in your message and emit save_philosophy NOW.\n\n"
+    } else {
+        ""
+    };
+
+    format!(
+        "You are a personal gym trainer building a training PHILOSOPHY together with the user. \
+This is a focused interview, not a workout — you NEVER log exercises or start sessions here.\n\
+\n\
+GOAL: Through a short, natural back-and-forth, learn enough to distil a compact training \
+philosophy. Cover these four areas (ask about whatever is still missing, one or two questions \
+at a time — do not interrogate):\n\
+1. How often they want to train (sessions per week; any other sports/activities).\n\
+2. The main thrust of their training (hypertrophy, strength, cardio, fitness, flexibility, core, ...).\n\
+3. Preferred programs or styles (e.g. 5x5, push/pull/legs, high-rep, circuits) — optional.\n\
+4. Equipment available, WITH limits (e.g. \"squat rack up to 120kg, bench, dumbbells up to 24kg, \
+kettlebells\"). Capture this verbatim as free text — it constrains future workouts.\n\
+\n\
+{wrap_up}\
+{draft_section}\
+{health_section}\n\
+SCOPE: Stay strictly on training philosophy. If the user drifts off-topic, gently steer back.\n\
+\n\
+RESPONSE FORMAT: You MUST respond with ONLY a JSON object. No text before or after.\n\
+{{\n\
+  \"message\": \"Your next question, or a confirmation when you save\",\n\
+  \"actions\": []\n\
+}}\n\
+\n\
+THE ONLY ACTION available to you is:\n\
+- {{\"type\": \"save_philosophy\", \"content\": \"<the distilled philosophy>\"}}\n\
+\n\
+WHEN TO SAVE: Emit save_philosophy ONLY once you have a clear picture of the four areas above \
+(equipment is required; programs are optional). When you do, set `content` to a SINGLE compact, \
+information-dense paragraph — not a transcript — capturing goal, weekly frequency, preferred \
+programs, equipment with limits, and any relevant injuries or preferences. Example content:\n\
+  \"goal=hypertrophy. Likes 5x5. Home gym: squat rack up to 120kg, bench, kettlebells, dumbbells \
+up to 24kg. Weights 3x/week, racket sports 2x/week. Minor lower-back niggle — cautious on heavy spinal load.\"\n\
+In the SAME response, your `message` should briefly confirm what you saved. Until you are ready \
+to save, keep `actions` empty and ask the next question.",
+    )
+}
+
+/// System prompt for `/nextworkout`: design ONE tailored training session from the
+/// user's philosophy, recent history, goals, and injuries. It advertises ONLY the
+/// `propose_workout` action — the design is a proposal and logs nothing. `history`
+/// is a pre-formatted block (the caller has the catalogue to resolve names);
+/// `philosophy` is the distilled philosophy text or a short placeholder.
+pub fn build_designer_prompt(
+    philosophy: &str,
+    history: &str,
+    goals: &[GoalProgress],
+    health_entries: &[HealthEntry],
+    catalogue: &[ExerciseTypeWithAncestry],
+) -> String {
+    let goals_section = format_active_goals(goals);
+    let health_section = format_health_entries(health_entries);
+    let exercise_list = format_exercise_list(catalogue);
+
+    format!(
+        "You are a personal gym trainer DESIGNING one training session for the user right now. \
+Draw on your own expertise PLUS the user-specific information below to produce a highly tailored, \
+specific session that pushes the user toward their goals. You are only designing a plan — you do \
+NOT log any sets and do NOT start a session.\n\
+\n\
+HOW TO DESIGN (reason like a real trainer):\n\
+- Follow the PHILOSOPHY: honour the goal, preferred programs/rotation, weekly frequency, and \
+especially the EQUIPMENT and its weight limits — never prescribe a weight the user cannot load, \
+or equipment they do not have.\n\
+- Use RECENT HISTORY to pick what to train today (rotate muscle groups, respect recovery, avoid \
+repeating yesterday's heavy work) and to set weights: if the last sets of an exercise were easy, \
+progress the load; if they were hard or to failure, hold or back off.\n\
+- Respect ACTIVE HEALTH ISSUES: substitute away from movements that load an injured area (e.g. \
+swap heavy spinal-loading deadlifts/squats for a focused one-arm row when the lower back is \
+flaring), and say why in the rationale.\n\
+- Pick 3-6 exercises. For each, prescribe target sets and target reps (or seconds for timed work) \
+and a target weight within the user's equipment limits. Add a short per-exercise cue when useful.\n\
+\n\
+{philosophy_section}\n\
+{history}\n\
+{goals_section}\n\
+{health_section}\n\
+RESPONSE FORMAT: You MUST respond with ONLY a JSON object. No text before or after.\n\
+{{\n\
+  \"message\": \"<one or two sentences introducing the session>\",\n\
+  \"actions\": [{{\"type\": \"propose_workout\", ...}}]\n\
+}}\n\
+\n\
+You MUST emit EXACTLY ONE action, of type propose_workout:\n\
+- {{\"type\": \"propose_workout\", \"title\": \"<short session title>\", \
+\"rationale\": \"<2-4 sentences explaining today's choices and any substitutions>\", \
+\"exercises\": [{{\"exercise\": \"<EXACT NAME>\", \"target_sets\": N, \"target_reps\": N, \
+\"target_weight_kg\": N.N, \"target_secs\": N, \"notes\": \"<short cue, optional>\"}}, ...]}}\n\
+  Use `target_secs` instead of reps/weight for timed exercises. Omit fields that do not apply.\n\
+\n\
+EXERCISE NAME RULE: every `exercise` MUST be a name shown in double quotes in AVAILABLE EXERCISES \
+below, copied EXACTLY. Do not invent or abbreviate. If you want a movement that is not listed, \
+choose the closest available exercise and note the substitution in the rationale.\n\
+\n\
+AVAILABLE EXERCISES:\n\
+{exercise_list}",
+        philosophy_section = format_philosophy_section(philosophy),
+    )
+}
+
+/// The philosophy block for the designer prompt, with a clear placeholder when the
+/// user has none on file yet.
+fn format_philosophy_section(philosophy: &str) -> String {
+    if philosophy.trim().is_empty() {
+        "TRAINING PHILOSOPHY: (none on file — design a balanced, general-fitness session and keep \
+loads conservative)\n"
+            .to_string()
+    } else {
+        format!("TRAINING PHILOSOPHY:\n{philosophy}\n")
+    }
 }
 
 /// Lower bound of the "ask before logging" window. Below this, treat the message
@@ -402,20 +578,65 @@ fn format_active_plan(plan: &Option<ActivePlanView>) -> String {
     s
 }
 
+/// Render the `/nextworkout` design for the system prompt: a "ready to start" hint
+/// before the workout begins, or live progress with the NEXT prescribed set once it
+/// is under way. Distinct from the schedule-based ACTIVE PLAN section above.
+fn format_active_workout_plan(plan: &Option<WorkoutPlanProgress>) -> String {
+    let Some(plan) = plan else {
+        return String::new();
+    };
+
+    let mut s = String::new();
+    if plan.started {
+        s.push_str(&format!("PRESCRIBED WORKOUT (guided, in progress): {}\n", plan.title));
+        if !plan.done.is_empty() {
+            s.push_str(&format!("- done so far: {}\n", plan.done.join(", ")));
+        }
+        match &plan.next {
+            Some(next) => s.push_str(&format!("- NEXT SET: {} ({} to go)\n", format_prescription(next), plan.remaining)),
+            None => s.push_str("- all prescribed exercises done — congratulate the user and offer to end the session\n"),
+        }
+    } else {
+        s.push_str(&format!("DESIGNED WORKOUT READY: {}\n", plan.title));
+        if let Some(next) = &plan.next {
+            s.push_str(&format!("- first up when they start: {}\n", format_prescription(next)));
+        }
+        s.push_str("- when the user starts their workout, walk them through it set by set\n");
+    }
+    s.push('\n');
+    s
+}
+
+/// A prescribed exercise as one compact line, e.g. "Bench Press — 3 sets 6 reps @ 65kg (push it)".
+fn format_prescription(p: &PrescribedExercise) -> String {
+    let mut parts = Vec::new();
+    if let Some(sets) = p.target_sets {
+        parts.push(format!("{sets} sets"));
+    }
+    if let Some(secs) = p.target_secs {
+        parts.push(format!("{secs}s"));
+    } else if let Some(reps) = p.target_reps {
+        parts.push(format!("{reps} reps"));
+    }
+    if let Some(w) = p.target_weight_kg {
+        parts.push(format!("@ {w:.0}kg"));
+    }
+    let mut s = p.exercise_name.clone();
+    if !parts.is_empty() {
+        s.push_str(&format!(" — {}", parts.join(" ")));
+    }
+    if let Some(notes) = p.notes.as_deref().filter(|n| !n.trim().is_empty()) {
+        s.push_str(&format!(" ({notes})"));
+    }
+    s
+}
+
 fn format_set_entry(set: &ExerciseSet, exercise_name: &str) -> String {
     let mut parts = vec![exercise_name.to_string()];
-    match set.measurement_type {
-        MeasurementType::WeightReps => {
-            if let Some(c) = set.count {
-                parts.push(format!("{c} reps"));
-            }
-            parts.push(format!("{:.1}kg", set.value));
-        }
-        MeasurementType::TimeBased => parts.push(format!("{:.0}s", set.value)),
-        MeasurementType::DistanceBased => parts.push(format!("{:.0}m", set.value)),
-        MeasurementType::LevelBased => parts.push(format!("level {:.0}", set.value)),
-        MeasurementType::ScoreBased => parts.push(format!("score {:.1}", set.value)),
+    if let (MeasurementType::WeightReps, Some(c)) = (set.measurement_type, set.count) {
+        parts.push(format!("{c} reps"));
     }
+    parts.push(set.measurement_type.describe_value(set.value));
     parts.join(" ")
 }
 
@@ -556,6 +777,7 @@ mod tests {
             session_entries: vec![],
             leaked_open_entries: vec![],
             active_plan: None,
+            active_workout_plan: None,
             health_entries: vec![],
             recent_summaries: vec![],
             recent_sets: vec![],

@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 pub mod view;
 pub use view::{
-    CatalogEntry, CatalogGroup, CatalogView, ExerciseLog, HealthNote, HistoryView, Measurement, Render, SessionSummaryView, SessionView,
-    SetLine, StatusView, View,
+    CatalogEntry, CatalogGroup, CatalogView, ExerciseLog, HealthNote, HistoryView, Measurement, PlannedExerciseView, Render,
+    SessionSummaryView, SessionView, SetLine, StatusView, View, WorkoutView,
 };
 
 /// Discriminator placed in confide's `Message::Custom { kind, .. }` so the peer

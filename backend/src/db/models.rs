@@ -57,6 +57,41 @@ impl MeasurementType {
             _ => Self::WeightReps,
         }
     }
+
+    /// Noun for the measured quantity: "weight", "duration", "distance", "level",
+    /// "score". Pair with [`Self::format_value`] when a labelled value is wanted.
+    pub fn value_label(self) -> &'static str {
+        match self {
+            Self::WeightReps => "weight",
+            Self::TimeBased => "duration",
+            Self::DistanceBased => "distance",
+            Self::LevelBased => "level",
+            Self::ScoreBased => "score",
+        }
+    }
+
+    /// The measured value with its unit but no leading noun, e.g. "80.0kg", "60s",
+    /// "5000m", "3", "9.5". The single source of truth for prompt-side value
+    /// rendering (client display uses [`SetLine::compact`](gymbuddy_proto::SetLine::compact)).
+    pub fn format_value(self, value: f64) -> String {
+        match self {
+            Self::WeightReps => format!("{value:.1}kg"),
+            Self::TimeBased => format!("{value:.0}s"),
+            Self::DistanceBased => format!("{value:.0}m"),
+            Self::LevelBased => format!("{value:.0}"),
+            Self::ScoreBased => format!("{value:.1}"),
+        }
+    }
+
+    /// A self-describing value for standalone prompt text: "80.0kg", "60s", "5000m",
+    /// "level 3", "score 9.5". (Weight/time/distance carry their own unit; level and
+    /// score get the noun prefixed.)
+    pub fn describe_value(self, value: f64) -> String {
+        match self {
+            Self::WeightReps | Self::TimeBased | Self::DistanceBased => self.format_value(value),
+            Self::LevelBased | Self::ScoreBased => format!("{} {}", self.value_label(), self.format_value(value)),
+        }
+    }
 }
 
 impl fmt::Display for MeasurementType {
@@ -632,4 +667,97 @@ pub fn new_conversation_message(user_id: i64, platform: &str, role: Conversation
         timestamp: now_str(),
         exclude_from_context: false,
     }
+}
+
+// ── Workout planner ────────────────────────────────────────────────────────────
+
+/// One append-only entry in a user's distilled training philosophy. The most
+/// recent row is the active philosophy; equipment lives as free text in `content`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkoutPhilosophy {
+    pub id: i64,
+    pub user_id: i64,
+    pub content: String,
+    /// 'interview' | 'note' | 'import'.
+    pub source: String,
+    pub created_at: String,
+}
+
+/// The interview state for a `(user, platform)` pair. Presence means an
+/// interview is in progress; `draft` accumulates the philosophy-so-far.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterviewState {
+    pub user_id: i64,
+    pub platform: String,
+    pub mode: String,
+    pub draft: String,
+    pub turns: i32,
+    pub started_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStatus {
+    Proposed,
+    Active,
+    Completed,
+    Abandoned,
+}
+
+impl PlanStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Proposed => "proposed",
+            Self::Active => "active",
+            Self::Completed => "completed",
+            Self::Abandoned => "abandoned",
+        }
+    }
+
+    pub fn from_str_loose(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "active" => Self::Active,
+            "completed" => Self::Completed,
+            "abandoned" => Self::Abandoned,
+            _ => Self::Proposed,
+        }
+    }
+}
+
+impl fmt::Display for PlanStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A generated workout plan. Designed by `/nextworkout` (status `Proposed`),
+/// bound to a session and marked `Active` during guided execution, then
+/// `Completed` when the session ends. A plan never logs sets itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkoutPlan {
+    pub id: i64,
+    pub user_id: i64,
+    pub title: String,
+    pub rationale: Option<String>,
+    pub philosophy_id: Option<i64>,
+    pub status: PlanStatus,
+    pub session_id: Option<i64>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A single prescribed exercise within a [`WorkoutPlan`]. `(target_reps,
+/// target_weight_kg)` cover the weight_reps case; `target_secs` covers timed
+/// work. `target_sets` is the prescribed number of sets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkoutPlanExercise {
+    pub id: i64,
+    pub plan_id: i64,
+    pub exercise_type_id: i64,
+    pub order_idx: i32,
+    pub target_sets: Option<i32>,
+    pub target_reps: Option<i32>,
+    pub target_weight_kg: Option<f64>,
+    pub target_secs: Option<i32>,
+    pub notes: Option<String>,
 }
