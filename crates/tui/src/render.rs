@@ -23,6 +23,10 @@ pub fn render_view(view: &View) -> Vec<Line<'static>> {
         View::Status(status) => render_status(status),
         View::Catalog(catalog) => render_catalog(catalog),
         View::History(history) => render_history(history),
+        View::Timers { enabled } => vec![Line::from(Span::styled(
+            format!("Rest timers {}", if *enabled { "on" } else { "off" }),
+            Style::default().fg(if *enabled { SUCCESS } else { MUTED }).add_modifier(Modifier::BOLD),
+        ))],
         // `View` is `#[non_exhaustive]`: degrade gracefully on an unknown variant.
         _ => vec![Line::from(Span::styled("[unsupported message]", Style::default().fg(MUTED)))],
     }

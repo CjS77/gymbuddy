@@ -231,6 +231,18 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().context("Failed to list open entries for session")
     }
 
+    /// Whether the session is mid-superset: ≥2 exercise_entries open at once. The
+    /// one place the superset rule is defined, so callers don't re-derive the
+    /// threshold.
+    pub fn is_supersetting(&self, session_id: i64) -> anyhow::Result<bool> {
+        let open: i64 = self.conn().query_row(
+            "SELECT COUNT(*) FROM exercise_entry WHERE session_id = ?1 AND end_timestamp IS NULL",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        Ok(open >= 2)
+    }
+
     /// All open exercise_entries for a user, across sessions. Used to detect leaks
     /// from previously-ended sessions and from older code paths that did not close
     /// entries.

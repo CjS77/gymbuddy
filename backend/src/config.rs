@@ -33,6 +33,65 @@ pub struct GymConfig {
     /// Encrypted p2p transport for the TUI/Android clients. Absent = disabled.
     #[serde(default)]
     pub confide: Option<ConfideConfig>,
+    /// Inter-set rest timer. Always present (defaults applied when the block is
+    /// omitted) so the feature is on out of the box.
+    #[serde(default)]
+    pub rest_timer: RestTimerConfig,
+}
+
+/// Rest-timer durations (seconds) keyed by the perceived difficulty of the last
+/// set, plus a flat override for supersets and the default toggle for new users.
+///
+/// Defaults mirror the corre rest-timer PR: easy 120 / medium 180 / hard &
+/// failure 300, supersets a flat 60.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct RestTimerConfig {
+    /// Rest-timer preference seeded onto each newly-registered user. Existing users
+    /// keep their stored choice; `/timers` flips it per user thereafter.
+    #[serde(default = "default_true")]
+    pub default_enabled: bool,
+    #[serde(default = "default_easy_secs")]
+    pub easy_secs: u32,
+    #[serde(default = "default_medium_secs")]
+    pub medium_secs: u32,
+    #[serde(default = "default_hard_secs")]
+    pub hard_secs: u32,
+    #[serde(default = "default_failure_secs")]
+    pub failure_secs: u32,
+    /// Flat rest while supersetting (≥2 open entries), overriding difficulty.
+    #[serde(default = "default_superset_secs")]
+    pub superset_secs: u32,
+}
+
+impl Default for RestTimerConfig {
+    fn default() -> Self {
+        Self {
+            default_enabled: true,
+            easy_secs: default_easy_secs(),
+            medium_secs: default_medium_secs(),
+            hard_secs: default_hard_secs(),
+            failure_secs: default_failure_secs(),
+            superset_secs: default_superset_secs(),
+        }
+    }
+}
+
+impl RestTimerConfig {
+    /// Rest duration after a set: supersets get the flat `superset_secs` override
+    /// regardless of difficulty; otherwise the difficulty-keyed duration applies.
+    /// A set logged without a perceived difficulty is treated as `Medium`.
+    pub fn rest_secs_for(&self, difficulty: Option<crate::db::Difficulty>, is_superset: bool) -> u32 {
+        use crate::db::Difficulty;
+        if is_superset {
+            return self.superset_secs;
+        }
+        match difficulty.unwrap_or(Difficulty::Medium) {
+            Difficulty::Easy => self.easy_secs,
+            Difficulty::Medium => self.medium_secs,
+            Difficulty::Hard => self.hard_secs,
+            Difficulty::Failure => self.failure_secs,
+        }
+    }
 }
 
 /// Configuration for the confide (encrypted p2p) transport.
@@ -175,6 +234,26 @@ fn default_max_message_length() -> usize {
 
 fn default_session_timeout_hours() -> u32 {
     4
+}
+
+fn default_easy_secs() -> u32 {
+    120
+}
+
+fn default_medium_secs() -> u32 {
+    180
+}
+
+fn default_hard_secs() -> u32 {
+    300
+}
+
+fn default_failure_secs() -> u32 {
+    300
+}
+
+fn default_superset_secs() -> u32 {
+    60
 }
 
 impl GymConfig {
@@ -419,6 +498,48 @@ mod tests {
         assert!(confide.relay, "relay defaults to true");
         assert!(confide.allowed_pubkeys.is_empty());
         assert_eq!(confide.keystore_path, default_keystore_path());
+    }
+
+    #[test]
+    fn rest_timer_defaults_when_absent() {
+        let val = minimal_gym_toml("");
+        let config: GymConfig = val.try_into().unwrap();
+        assert_eq!(config.rest_timer, RestTimerConfig::default());
+        assert!(config.rest_timer.default_enabled);
+    }
+
+    #[test]
+    fn rest_timer_custom_values_parse() {
+        let val = minimal_gym_toml(
+            r#"
+            [rest_timer]
+            default_enabled = false
+            easy_secs = 90
+            superset_secs = 45
+            "#,
+        );
+        let config: GymConfig = val.try_into().unwrap();
+        assert!(!config.rest_timer.default_enabled);
+        assert_eq!(config.rest_timer.easy_secs, 90);
+        assert_eq!(config.rest_timer.superset_secs, 45);
+        // Unspecified fields keep their defaults.
+        assert_eq!(config.rest_timer.medium_secs, 180);
+        assert_eq!(config.rest_timer.hard_secs, 300);
+    }
+
+    #[test]
+    fn rest_secs_maps_difficulty_and_superset() {
+        use crate::db::Difficulty;
+        let cfg = RestTimerConfig::default();
+        assert_eq!(cfg.rest_secs_for(Some(Difficulty::Easy), false), 120);
+        assert_eq!(cfg.rest_secs_for(Some(Difficulty::Medium), false), 180);
+        assert_eq!(cfg.rest_secs_for(Some(Difficulty::Hard), false), 300);
+        assert_eq!(cfg.rest_secs_for(Some(Difficulty::Failure), false), 300);
+        // No difficulty given => treated as Medium.
+        assert_eq!(cfg.rest_secs_for(None, false), 180);
+        // Superset overrides difficulty entirely.
+        assert_eq!(cfg.rest_secs_for(Some(Difficulty::Hard), true), 60);
+        assert_eq!(cfg.rest_secs_for(None, true), 60);
     }
 
     #[test]

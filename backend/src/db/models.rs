@@ -328,6 +328,11 @@ pub struct User {
     pub updated_at: String,
     #[serde(default)]
     pub beta_tester: bool,
+    /// Whether the inter-set rest timer arms after each logged set. A user
+    /// preference (persists across sessions), seeded from `[rest_timer]
+    /// default_enabled` at registration and toggled with `/timers`.
+    #[serde(default = "default_true")]
+    pub timers_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -513,6 +518,10 @@ fn now_str() -> String {
     Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 pub fn new_user(name: &str, telegram_id: Option<&str>, timezone: &str) -> User {
     let now = now_str();
     User {
@@ -525,6 +534,7 @@ pub fn new_user(name: &str, telegram_id: Option<&str>, timezone: &str) -> User {
         created_at: now.clone(),
         updated_at: now,
         beta_tester: false,
+        timers_enabled: true,
     }
 }
 
@@ -542,6 +552,7 @@ pub fn new_user_with_pubkey(name: &str, pubkey: &str, timezone: &str) -> User {
         created_at: now.clone(),
         updated_at: now,
         beta_tester: false,
+        timers_enabled: true,
     }
 }
 

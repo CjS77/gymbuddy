@@ -3,6 +3,7 @@ members = [
     "backend",
     "crates/proto",
     "crates/client",
+    "crates/timer",
     "crates/tui",
 ]
 resolver = "2"
@@ -16,6 +17,7 @@ license = "MPL-2"
 # GymBuddy crates
 gymbuddy-proto = { path = "crates/proto" }
 gymbuddy-client = { path = "crates/client" }
+gymbuddy-timer-core = { path = "crates/timer" }
 
 # Encrypted p2p transport (iroh-based, E2E-encrypted, ed25519 PeerId = identity)
 confide = { path = "../confide" }

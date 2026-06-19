@@ -119,7 +119,9 @@ async fn dispatch(handler: &AssistantHandler, pubkey: &str, req: ClientRequest) 
         ClientRequest::Chat { text } => match handler.ensure_user_by_pubkey(pubkey).await {
             Ok(Some(user)) => match handler.handle_message_for_user(&user, &text, "confide").await {
                 // Send the domain view straight over the wire; the client renders it.
-                Ok(view) => ServerResponse::Reply { view },
+                // The optional rest-timer directive rides along — the client runs the
+                // countdown locally.
+                Ok(reply) => ServerResponse::Reply { view: reply.view, timer: reply.timer },
                 Err(e) => error_response(e),
             },
             Ok(None) => ServerResponse::NeedsRegistration,

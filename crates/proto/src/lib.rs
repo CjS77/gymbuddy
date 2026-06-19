@@ -44,9 +44,30 @@ pub enum ServerResponse {
     /// [`ClientRequest::Register`].
     NeedsRegistration,
     /// An assistant reply as a domain [`View`]; the client renders it natively.
-    Reply { view: View },
+    ///
+    /// `timer` optionally carries a rest-timer directive that rides along with the
+    /// reply: the client (TUI/Android) runs the countdown locally, rendering cues
+    /// however it likes (the Telegram path arms its timer server-side instead, so it
+    /// never reads this field). Defaults to `None` for replies that don't touch the
+    /// timer.
+    Reply { view: View, timer: Option<TimerSignal> },
     /// The server could not process the request.
     Error { message: String },
+}
+
+/// A rest-timer directive attached to a [`ServerResponse::Reply`].
+///
+/// The server decides the rest *duration* (from the perceived difficulty of the
+/// last set and whether the user is supersetting); the client runs the countdown
+/// and renders the cues. UI-agnostic: the same directive drives the TUI, a future
+/// Android client, and (server-side) Telegram.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TimerSignal {
+    /// Start (or restart) a rest countdown of `duration_secs`, after which the user
+    /// does another set of `exercise`.
+    Arm { duration_secs: u32, exercise: String },
+    /// Cancel any in-flight rest countdown (session ended, entry closed, …).
+    Cancel,
 }
 
 /// Serialize a [`ClientRequest`] to postcard bytes for a `Message::Custom` payload.
@@ -96,7 +117,11 @@ mod tests {
     fn server_response_variants_roundtrip() {
         roundtrip_response(ServerResponse::Welcome { name: "Alice".into() });
         roundtrip_response(ServerResponse::NeedsRegistration);
-        roundtrip_response(ServerResponse::Reply { view: View::message("Logged 3 sets of bench press.") });
+        roundtrip_response(ServerResponse::Reply { view: View::message("Logged 3 sets of bench press."), timer: None });
+        roundtrip_response(ServerResponse::Reply {
+            view: View::message("Hard set logged."),
+            timer: Some(TimerSignal::Arm { duration_secs: 300, exercise: "Bench Press".into() }),
+        });
         roundtrip_response(ServerResponse::Error { message: "unknown user".into() });
     }
 
@@ -127,7 +152,7 @@ mod tests {
                 sessions: vec![view::SessionSummaryView { started_at: "2026-06-16 10:00:00".into(), status: "done".into(), entries: 3, minutes: Some(45) }],
             }),
         ] {
-            roundtrip_response(ServerResponse::Reply { view });
+            roundtrip_response(ServerResponse::Reply { view, timer: None });
         }
     }
 

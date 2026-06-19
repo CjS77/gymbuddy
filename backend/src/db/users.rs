@@ -15,17 +15,20 @@ pub(super) fn row_to_user(row: &rusqlite::Row) -> rusqlite::Result<User> {
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
         beta_tester: row.get::<_, i64>(8)? != 0,
+        timers_enabled: row.get::<_, i64>(9)? != 0,
     })
 }
 
-const SELECT_USER: &str = "SELECT id, name, telegram_id, signal_id, pubkey, timezone, created_at, updated_at, beta_tester FROM users";
+const SELECT_USER: &str =
+    "SELECT id, name, telegram_id, signal_id, pubkey, timezone, created_at, updated_at, beta_tester, timers_enabled FROM users";
 
 impl Database {
     /// Insert a user. Returns the generated id.
     pub fn insert_user(&self, user: &User) -> anyhow::Result<i64> {
         self.conn().execute(
-            "INSERT INTO users (name, telegram_id, signal_id, pubkey, timezone, beta_tester) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![user.name, user.telegram_id, user.signal_id, user.pubkey, user.timezone, user.beta_tester as i64],
+            "INSERT INTO users (name, telegram_id, signal_id, pubkey, timezone, beta_tester, timers_enabled) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![user.name, user.telegram_id, user.signal_id, user.pubkey, user.timezone, user.beta_tester as i64, user.timers_enabled as i64],
         )?;
         let id = self.conn().last_insert_rowid();
         tracing::debug!(id, name = %user.name, telegram_id = ?user.telegram_id, "DB: inserted user");
@@ -83,6 +86,18 @@ impl Database {
         anyhow::ensure!(rows > 0, "User with id {user_id} not found");
         tracing::debug!(user_id, is_beta, "DB: set beta_tester");
         Ok(())
+    }
+
+    /// Set the user's rest-timer preference. Returns the new state so callers can
+    /// report it without a re-read.
+    pub fn set_user_timers(&self, user_id: i64, enabled: bool) -> anyhow::Result<bool> {
+        let rows = self.conn().execute(
+            "UPDATE users SET timers_enabled = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![enabled as i64, user_id],
+        )?;
+        anyhow::ensure!(rows > 0, "User with id {user_id} not found");
+        tracing::debug!(user_id, enabled, "DB: set timers_enabled");
+        Ok(enabled)
     }
 
     pub fn delete_user(&self, id: i64) -> anyhow::Result<()> {
