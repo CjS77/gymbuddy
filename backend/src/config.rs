@@ -40,13 +40,14 @@ pub struct GymConfig {
 }
 
 /// Rest-timer durations (seconds) keyed by the perceived difficulty of the last
-/// set, plus a flat override for supersets and the per-session default toggle.
+/// set, plus a flat override for supersets and the default toggle for new users.
 ///
 /// Defaults mirror the corre rest-timer PR: easy 120 / medium 180 / hard &
 /// failure 300, supersets a flat 60.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct RestTimerConfig {
-    /// Default state of the per-session timer toggle for new sessions.
+    /// Rest-timer preference seeded onto each newly-registered user. Existing users
+    /// keep their stored choice; `/timers` flips it per user thereafter.
     #[serde(default = "default_true")]
     pub default_enabled: bool,
     #[serde(default = "default_easy_secs")]

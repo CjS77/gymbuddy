@@ -580,7 +580,7 @@ mod tests {
     fn prompt_includes_active_session_with_entries() {
         let mut ctx = base_context();
         ctx.active_session =
-            Some(Session { id: 1, user_id: 1, started_at: "2026-03-23 09:00:00".to_string(), ended_at: None, notes: None, timers_enabled: true });
+            Some(Session { id: 1, user_id: 1, started_at: "2026-03-23 09:00:00".to_string(), ended_at: None, notes: None });
         ctx.session_entries = vec![EntryView {
             id: 7,
             exercise_name: "Bench Press".to_string(),

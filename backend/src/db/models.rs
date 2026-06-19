@@ -328,6 +328,11 @@ pub struct User {
     pub updated_at: String,
     #[serde(default)]
     pub beta_tester: bool,
+    /// Whether the inter-set rest timer arms after each logged set. A user
+    /// preference (persists across sessions), seeded from `[rest_timer]
+    /// default_enabled` at registration and toggled with `/timers`.
+    #[serde(default = "default_true")]
+    pub timers_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,8 +372,6 @@ pub struct Session {
     pub started_at: String,
     pub ended_at: Option<String>,
     pub notes: Option<String>,
-    /// Whether the inter-set rest timer arms after each logged set. Defaults to on.
-    pub timers_enabled: bool,
 }
 
 /// A block of related sets within a session (or standalone).
@@ -515,6 +518,10 @@ fn now_str() -> String {
     Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 pub fn new_user(name: &str, telegram_id: Option<&str>, timezone: &str) -> User {
     let now = now_str();
     User {
@@ -527,6 +534,7 @@ pub fn new_user(name: &str, telegram_id: Option<&str>, timezone: &str) -> User {
         created_at: now.clone(),
         updated_at: now,
         beta_tester: false,
+        timers_enabled: true,
     }
 }
 
@@ -544,11 +552,12 @@ pub fn new_user_with_pubkey(name: &str, pubkey: &str, timezone: &str) -> User {
         created_at: now.clone(),
         updated_at: now,
         beta_tester: false,
+        timers_enabled: true,
     }
 }
 
 pub fn new_session(user_id: i64, notes: Option<&str>) -> Session {
-    Session { id: 0, user_id, started_at: now_str(), ended_at: None, notes: notes.map(String::from), timers_enabled: true }
+    Session { id: 0, user_id, started_at: now_str(), ended_at: None, notes: notes.map(String::from) }
 }
 
 pub fn new_exercise_entry(user_id: i64, session_id: Option<i64>, comment: Option<&str>) -> ExerciseEntry {

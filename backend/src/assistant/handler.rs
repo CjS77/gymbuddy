@@ -209,7 +209,8 @@ impl AssistantHandler {
             Some(last) => format!("{} {last}", from.first_name),
             None => from.first_name.clone(),
         };
-        let draft = new_user(&name, Some(&telegram_id), &self.config.default_timezone);
+        let mut draft = new_user(&name, Some(&telegram_id), &self.config.default_timezone);
+        draft.timers_enabled = self.config.rest_timer.default_enabled;
         let user_id = db.insert_user(&draft)?;
         let user = db.get_user(user_id)?.context("user disappeared after insert")?;
         tracing::info!("Registered new user: {} (telegram_id: {telegram_id})", user.name);
@@ -228,7 +229,8 @@ impl AssistantHandler {
     pub async fn register_user(&self, pubkey: &str, name: &str, timezone: &str) -> anyhow::Result<User> {
         let db = self.db.lock().await;
         anyhow::ensure!(db.get_user_by_pubkey(pubkey)?.is_none(), "pubkey already registered");
-        let draft = new_user_with_pubkey(name, pubkey, timezone);
+        let mut draft = new_user_with_pubkey(name, pubkey, timezone);
+        draft.timers_enabled = self.config.rest_timer.default_enabled;
         let user_id = db.insert_user(&draft)?;
         let user = db.get_user(user_id)?.context("user disappeared after insert")?;
         tracing::info!("Registered new user: {} (pubkey: {pubkey})", user.name);
@@ -266,16 +268,12 @@ impl AssistantHandler {
         }
     }
 
-    /// Toggle the active session's rest-timer flag and report the new state.
+    /// Toggle the user's rest-timer preference and report the new state. As a user
+    /// preference it persists across sessions, so it works with or without an active
+    /// workout and survives ending one and starting the next.
     async fn cmd_timers(&self, user: &User) -> anyhow::Result<View> {
-        let db = self.db.lock().await;
-        match db.get_active_session(user.id)? {
-            Some(session) => {
-                let enabled = db.set_session_timers(session.id, !session.timers_enabled)?;
-                Ok(View::Timers { enabled })
-            }
-            None => Ok(View::notice("No active workout session — start one and I'll arm rest timers between your sets.")),
-        }
+        let enabled = self.db.lock().await.set_user_timers(user.id, !user.timers_enabled)?;
+        Ok(View::Timers { enabled })
     }
 
     fn cmd_start(&self, user: &User) -> String {
@@ -595,7 +593,7 @@ impl AssistantHandler {
                     db.insert_set(&s)?;
                 }
                 let suffix = self.set_count_checkpoint_suffix(entry_id, &et.exercise_type.name).await?;
-                let timer = self.arm_rest_timer(&session, &et.exercise_type.name, pd).await?;
+                let timer = self.arm_rest_timer(user, &session, &et.exercise_type.name, pd).await?;
                 Ok(ActionOutcome { suffix, timer })
             }
             AssistantAction::LogExerciseTimed { exercise, duration_secs, perceived_difficulty, comment, superset } => {
@@ -613,7 +611,7 @@ impl AssistantHandler {
                 s.comment = comment.clone();
                 self.db.lock().await.insert_set(&s)?;
                 let suffix = self.set_count_checkpoint_suffix(entry_id, &et.exercise_type.name).await?;
-                let timer = self.arm_rest_timer(&session, &et.exercise_type.name, pd).await?;
+                let timer = self.arm_rest_timer(user, &session, &et.exercise_type.name, pd).await?;
                 Ok(ActionOutcome { suffix, timer })
             }
             AssistantAction::LogExerciseDistance { exercise, distance_m, duration_secs, perceived_difficulty, comment, superset } => {
@@ -633,7 +631,7 @@ impl AssistantHandler {
                 s.comment = comment.clone();
                 self.db.lock().await.insert_set(&s)?;
                 let suffix = self.set_count_checkpoint_suffix(entry_id, &et.exercise_type.name).await?;
-                let timer = self.arm_rest_timer(&session, &et.exercise_type.name, pd).await?;
+                let timer = self.arm_rest_timer(user, &session, &et.exercise_type.name, pd).await?;
                 Ok(ActionOutcome { suffix, timer })
             }
             AssistantAction::StartSession { notes, plan } => {
@@ -740,11 +738,11 @@ impl AssistantHandler {
     }
 
     /// Build the rest-timer arm directive for a just-logged set, or `None` when the
-    /// session has timers disabled. Superset detection mirrors the rest of the
+    /// user has timers disabled. Superset detection mirrors the rest of the
     /// codebase: ≥2 simultaneously-open entries means a superset (flat shorter rest),
     /// otherwise the perceived difficulty sets the duration.
-    async fn arm_rest_timer(&self, session: &Session, exercise: &str, difficulty: Difficulty) -> anyhow::Result<Option<TimerSignal>> {
-        if !session.timers_enabled {
+    async fn arm_rest_timer(&self, user: &User, session: &Session, exercise: &str, difficulty: Difficulty) -> anyhow::Result<Option<TimerSignal>> {
+        if !user.timers_enabled {
             return Ok(None);
         }
         let is_superset = self.db.lock().await.list_open_entries_for_session(session.id)?.len() >= 2;
@@ -2408,7 +2406,7 @@ mod tests {
     fn build_feedback_body_appends_reporter_footer() {
         let user =
             User { id: 7, name: "Alice".into(), telegram_id: Some("999".into()), signal_id: None, pubkey: None, timezone: "UTC".into(),
-                created_at: String::new(), updated_at: String::new(), beta_tester: true };
+                created_at: String::new(), updated_at: String::new(), beta_tester: true, timers_enabled: true };
         let body = build_feedback_body(&user, "the squat rack is broken");
         assert!(body.starts_with("the squat rack is broken"));
         assert!(body.contains("Reported by: Alice"));
