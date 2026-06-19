@@ -20,9 +20,10 @@ impl Render for Telegram {
             View::Status(status) => (render_status(status), Some("HTML")),
             View::Catalog(catalog) => (render_catalog(catalog), Some("HTML")),
             View::Timers { enabled } => (format!("Rest timers are now {}.", if *enabled { "on" } else { "off" }), None),
-            // `View` is `#[non_exhaustive]`; nothing to render for a variant this
-            // build does not know about.
-            _ => (String::new(), None),
+            // `View` is `#[non_exhaustive]`: a variant from a newer server lands here.
+            // Degrade to plain text rather than sending Telegram an empty message
+            // (which the Bot API rejects).
+            _ => (view.fallback_text(), None),
         }
     }
 }

@@ -48,6 +48,26 @@ impl View {
     pub fn notice(text: impl Into<String>) -> Self {
         Self::Notice { text: text.into() }
     }
+
+    /// A plain-text rendering every client can fall back to when it has no bespoke
+    /// rendering for a variant. Renderers use this for their catch-all arm so an
+    /// unhandled view degrades to a readable line rather than an empty message.
+    ///
+    /// The match is deliberately exhaustive (no wildcard): adding a `View` variant
+    /// forces a line here, which is what keeps the fallback honest. `#[non_exhaustive]`
+    /// only obliges *other* crates to add a wildcard, so a future variant arriving
+    /// from a newer server still lands on a renderer's own catch-all — covered by
+    /// the generic text below once recompiled against it.
+    pub fn fallback_text(&self) -> String {
+        match self {
+            View::Message { text, .. } => text.clone(),
+            View::Notice { text } => text.clone(),
+            View::Timers { enabled } => format!("Rest timers are now {}.", if *enabled { "on" } else { "off" }),
+            View::Status(_) => "Here's your current session.".to_string(),
+            View::Catalog(_) => "Here's the exercise catalogue.".to_string(),
+            View::History(_) => "Here's your recent workout history.".to_string(),
+        }
+    }
 }
 
 /// A renderer turns a [`View`] into a client-native representation (HTML for
@@ -147,4 +167,28 @@ pub struct SessionSummaryView {
     pub status: String,
     pub entries: u32,
     pub minutes: Option<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every variant must yield non-empty fallback text — that is the whole point of
+    /// the helper (renderers send it instead of an empty message). Constructed via
+    /// the same `View` values the server emits.
+    #[test]
+    fn fallback_text_is_never_empty() {
+        let views = [
+            View::message("logged"),
+            View::notice("ok"),
+            View::Timers { enabled: true },
+            View::Timers { enabled: false },
+            View::Status(StatusView { user_name: "Al".into(), session: None, health: vec![] }),
+            View::Catalog(CatalogView { groups: vec![] }),
+            View::History(HistoryView { sessions: vec![] }),
+        ];
+        for view in &views {
+            assert!(!view.fallback_text().is_empty(), "empty fallback for {view:?}");
+        }
+    }
 }
