@@ -121,7 +121,7 @@ impl AssistantHandler {
 
         self.close_stale_session(user).await?;
 
-        let text = if text.len() > self.config.max_message_length { &text[..self.config.max_message_length] } else { text };
+        let text = crate::text::truncate_on_char_boundary(text, self.config.max_message_length);
 
         if let Some(reply) = self.maybe_session_continuity_short_circuit(user, text, platform).await? {
             return Ok(reply.into());
@@ -1044,16 +1044,7 @@ impl AssistantHandler {
             return Ok(Some(View::notice("Please include a description, e.g. \"/feedback the bench-press timer never stops\".")));
         }
 
-        let max_len = self.config.max_message_length;
-        let body_capped = if body_raw.len() > max_len {
-            let mut end = max_len;
-            while end > 0 && !body_raw.is_char_boundary(end) {
-                end -= 1;
-            }
-            &body_raw[..end]
-        } else {
-            body_raw
-        };
+        let body_capped = crate::text::truncate_on_char_boundary(body_raw, self.config.max_message_length);
 
         let title = build_feedback_title(body_capped);
         let body = build_feedback_body(user, body_capped);
