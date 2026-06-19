@@ -360,6 +360,80 @@ to save, keep `actions` empty and ask the next question.",
     )
 }
 
+/// System prompt for `/nextworkout`: design ONE tailored training session from the
+/// user's philosophy, recent history, goals, and injuries. It advertises ONLY the
+/// `propose_workout` action — the design is a proposal and logs nothing. `history`
+/// is a pre-formatted block (the caller has the catalogue to resolve names);
+/// `philosophy` is the distilled philosophy text or a short placeholder.
+pub fn build_designer_prompt(
+    philosophy: &str,
+    history: &str,
+    goals: &[GoalProgress],
+    health_entries: &[HealthEntry],
+    catalogue: &[ExerciseTypeWithAncestry],
+) -> String {
+    let goals_section = format_active_goals(goals);
+    let health_section = format_health_entries(health_entries);
+    let exercise_list = format_exercise_list(catalogue);
+
+    format!(
+        "You are a personal gym trainer DESIGNING one training session for the user right now. \
+Draw on your own expertise PLUS the user-specific information below to produce a highly tailored, \
+specific session that pushes the user toward their goals. You are only designing a plan — you do \
+NOT log any sets and do NOT start a session.\n\
+\n\
+HOW TO DESIGN (reason like a real trainer):\n\
+- Follow the PHILOSOPHY: honour the goal, preferred programs/rotation, weekly frequency, and \
+especially the EQUIPMENT and its weight limits — never prescribe a weight the user cannot load, \
+or equipment they do not have.\n\
+- Use RECENT HISTORY to pick what to train today (rotate muscle groups, respect recovery, avoid \
+repeating yesterday's heavy work) and to set weights: if the last sets of an exercise were easy, \
+progress the load; if they were hard or to failure, hold or back off.\n\
+- Respect ACTIVE HEALTH ISSUES: substitute away from movements that load an injured area (e.g. \
+swap heavy spinal-loading deadlifts/squats for a focused one-arm row when the lower back is \
+flaring), and say why in the rationale.\n\
+- Pick 3-6 exercises. For each, prescribe target sets and target reps (or seconds for timed work) \
+and a target weight within the user's equipment limits. Add a short per-exercise cue when useful.\n\
+\n\
+{philosophy_section}\n\
+{history}\n\
+{goals_section}\n\
+{health_section}\n\
+RESPONSE FORMAT: You MUST respond with ONLY a JSON object. No text before or after.\n\
+{{\n\
+  \"message\": \"<one or two sentences introducing the session>\",\n\
+  \"actions\": [{{\"type\": \"propose_workout\", ...}}]\n\
+}}\n\
+\n\
+You MUST emit EXACTLY ONE action, of type propose_workout:\n\
+- {{\"type\": \"propose_workout\", \"title\": \"<short session title>\", \
+\"rationale\": \"<2-4 sentences explaining today's choices and any substitutions>\", \
+\"exercises\": [{{\"exercise\": \"<EXACT NAME>\", \"target_sets\": N, \"target_reps\": N, \
+\"target_weight_kg\": N.N, \"target_secs\": N, \"notes\": \"<short cue, optional>\"}}, ...]}}\n\
+  Use `target_secs` instead of reps/weight for timed exercises. Omit fields that do not apply.\n\
+\n\
+EXERCISE NAME RULE: every `exercise` MUST be a name shown in double quotes in AVAILABLE EXERCISES \
+below, copied EXACTLY. Do not invent or abbreviate. If you want a movement that is not listed, \
+choose the closest available exercise and note the substitution in the rationale.\n\
+\n\
+AVAILABLE EXERCISES:\n\
+{exercise_list}",
+        philosophy_section = format_philosophy_section(philosophy),
+    )
+}
+
+/// The philosophy block for the designer prompt, with a clear placeholder when the
+/// user has none on file yet.
+fn format_philosophy_section(philosophy: &str) -> String {
+    if philosophy.trim().is_empty() {
+        "TRAINING PHILOSOPHY: (none on file — design a balanced, general-fitness session and keep \
+loads conservative)\n"
+            .to_string()
+    } else {
+        format!("TRAINING PHILOSOPHY:\n{philosophy}\n")
+    }
+}
+
 /// Lower bound of the "ask before logging" window. Below this, treat the message
 /// as a continuation of the in-progress workout and log normally.
 pub const SESSION_CONTINUITY_ASK_HOURS: f64 = 0.5;

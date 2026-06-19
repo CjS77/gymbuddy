@@ -36,6 +36,10 @@ pub enum View {
     /// Clients show it however they like — Telegram as a one-line notice, the TUI by
     /// updating its sidebar switch.
     Timers { enabled: bool },
+    /// A designed-but-unlogged workout ( `/nextworkout` ): the rationale plus the
+    /// prescribed exercises and target sets. Nothing here is logged — the user still
+    /// logs sets the normal way.
+    Workout(WorkoutView),
 }
 
 impl View {
@@ -66,6 +70,7 @@ impl View {
             View::Status(_) => "Here's your current session.".to_string(),
             View::Catalog(_) => "Here's the exercise catalogue.".to_string(),
             View::History(_) => "Here's your recent workout history.".to_string(),
+            View::Workout(w) => format!("Here's a workout: {}.", w.title),
         }
     }
 }
@@ -169,6 +174,34 @@ pub struct SessionSummaryView {
     pub minutes: Option<u32>,
 }
 
+// ── /nextworkout ─────────────────────────────────────────────────────────────────
+
+/// A designed workout: a title, the coach's reasoning, and the prescribed
+/// exercises. Purely a proposal — logging still happens the normal way.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkoutView {
+    pub title: String,
+    /// The coach's reasoning for this session (why these exercises today).
+    pub rationale: Option<String>,
+    pub exercises: Vec<PlannedExerciseView>,
+    /// Free-text caveats the coach attached (e.g. a dropped exercise, equipment note).
+    pub notes: Vec<String>,
+}
+
+/// One prescribed exercise in a [`WorkoutView`]. The target fields are
+/// presentation hints; `(target_reps, target_weight_kg)` cover the weight_reps
+/// case and `target_secs` covers timed work.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlannedExerciseView {
+    pub name: String,
+    pub target_sets: Option<u32>,
+    pub target_reps: Option<u32>,
+    pub target_weight_kg: Option<f64>,
+    pub target_secs: Option<u32>,
+    /// A short coaching cue or substitution note for this exercise.
+    pub cue: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +219,7 @@ mod tests {
             View::Status(StatusView { user_name: "Al".into(), session: None, health: vec![] }),
             View::Catalog(CatalogView { groups: vec![] }),
             View::History(HistoryView { sessions: vec![] }),
+            View::Workout(WorkoutView { title: "Push focus".into(), rationale: None, exercises: vec![], notes: vec![] }),
         ];
         for view in &views {
             assert!(!view.fallback_text().is_empty(), "empty fallback for {view:?}");

@@ -132,8 +132,36 @@ pub enum AssistantAction {
         #[serde(alias = "philosophy")]
         content: String,
     },
+    /// Emitted by the `/nextworkout` designer prompt. The host persists a
+    /// `proposed` workout plan from it and shows it to the user; it NEVER logs
+    /// sets or starts a session.
+    ProposeWorkout {
+        title: String,
+        #[serde(default)]
+        rationale: Option<String>,
+        #[serde(default)]
+        exercises: Vec<ProposedExercise>,
+    },
     #[serde(other)]
     Unknown,
+}
+
+/// One prescribed exercise inside a [`AssistantAction::ProposeWorkout`]. The
+/// target fields mirror the plan storage: `(target_reps, target_weight_kg)` for
+/// the weight_reps case, `target_secs` for timed work.
+#[derive(Debug, Deserialize)]
+pub struct ProposedExercise {
+    pub exercise: String,
+    #[serde(default)]
+    pub target_sets: Option<i32>,
+    #[serde(default)]
+    pub target_reps: Option<i32>,
+    #[serde(default, alias = "target_weight")]
+    pub target_weight_kg: Option<f64>,
+    #[serde(default)]
+    pub target_secs: Option<i32>,
+    #[serde(default, alias = "cue")]
+    pub notes: Option<String>,
 }
 
 #[cfg(test)]
@@ -354,6 +382,47 @@ mod tests {
         match action {
             AssistantAction::SavePhilosophy { content } => assert_eq!(content, "cardio focus, 2x/week"),
             _ => panic!("expected SavePhilosophy"),
+        }
+    }
+
+    #[test]
+    fn parse_propose_workout() {
+        let json = r#"{
+            "type": "propose_workout",
+            "title": "Upper push + lat focus",
+            "rationale": "2 days rest on bench; sub one-arm rows for the back niggle.",
+            "exercises": [
+                {"exercise": "Bench Press", "target_sets": 3, "target_reps": 6, "target_weight_kg": 65.0, "notes": "push the weight"},
+                {"exercise": "Plank", "target_sets": 3, "target_secs": 60}
+            ]
+        }"#;
+        let action: AssistantAction = serde_json::from_str(json).unwrap();
+        match action {
+            AssistantAction::ProposeWorkout { title, rationale, exercises } => {
+                assert_eq!(title, "Upper push + lat focus");
+                assert!(rationale.unwrap().contains("2 days rest"));
+                assert_eq!(exercises.len(), 2);
+                assert_eq!(exercises[0].exercise, "Bench Press");
+                assert_eq!(exercises[0].target_weight_kg, Some(65.0));
+                assert_eq!(exercises[0].notes.as_deref(), Some("push the weight"));
+                assert_eq!(exercises[1].target_secs, Some(60));
+            }
+            _ => panic!("expected ProposeWorkout"),
+        }
+    }
+
+    #[test]
+    fn parse_propose_workout_weight_and_cue_aliases() {
+        let json = r#"{"type": "propose_workout", "title": "Quick", "exercises": [
+            {"exercise": "Squat", "target_weight": 100.0, "cue": "brace hard"}
+        ]}"#;
+        let action: AssistantAction = serde_json::from_str(json).unwrap();
+        match action {
+            AssistantAction::ProposeWorkout { exercises, .. } => {
+                assert_eq!(exercises[0].target_weight_kg, Some(100.0));
+                assert_eq!(exercises[0].notes.as_deref(), Some("brace hard"));
+            }
+            _ => panic!("expected ProposeWorkout"),
         }
     }
 

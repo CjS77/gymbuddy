@@ -8,22 +8,22 @@ use tokio::sync::Mutex;
 use crate::config::GymConfig;
 use crate::db::{
     ConversationRole, Database, Difficulty, ExerciseEntry, ExerciseSet, ExerciseTypeWithAncestry, InterviewState, MeasurementType, Session,
-    SetEdit, SetEditError, User, new_conversation_message, new_exercise_entry_at, new_exercise_goal, new_exercise_set, new_health_entry,
-    new_user, new_user_with_pubkey,
+    SessionWithSets, SetEdit, SetEditError, User, WorkoutPhilosophy, WorkoutPlanExercise, new_conversation_message, new_exercise_entry_at,
+    new_exercise_goal, new_exercise_set, new_health_entry, new_user, new_user_with_pubkey,
 };
 use crate::github::IssueReporter;
 use crate::telegram::Message as TgMessage;
 
-use super::actions::AssistantAction;
+use super::actions::{AssistantAction, ProposedExercise};
 use super::matching::find_exercise_type;
 use super::parser::parse_assistant_response;
 use super::prompts::{
     ActivePlanView, EntryView, PlanExerciseView, PromptContext, SESSION_CONTINUITY_ASK_HOURS, SESSION_CONTINUITY_HOURS,
-    build_philosophy_prompt, build_system_prompt,
+    build_designer_prompt, build_philosophy_prompt, build_system_prompt,
 };
 use gymbuddy_proto::{
-    CatalogEntry, CatalogGroup, CatalogView, ExerciseLog, HealthNote, HistoryView, Measurement, SessionSummaryView, SessionView, SetLine,
-    StatusView, TimerSignal, View,
+    CatalogEntry, CatalogGroup, CatalogView, ExerciseLog, HealthNote, HistoryView, Measurement, PlannedExerciseView, SessionSummaryView,
+    SessionView, SetLine, StatusView, TimerSignal, View, WorkoutView,
 };
 
 pub struct AssistantHandler {
@@ -297,6 +297,7 @@ impl AssistantHandler {
             "/clear" => Ok(Some(View::notice(self.cmd_clear(user, platform).await?).into())),
             "/timers" => Ok(Some(self.cmd_timers(user).await?)),
             "/philosophy" => Ok(Some(self.cmd_philosophy_start(user, platform).await?.into())),
+            "/nextworkout" => Ok(Some(self.cmd_next_workout(user, text).await?.into())),
             "/cancel" => Ok(Some(self.cmd_cancel(user, platform).await?.into())),
             "/feedback" => Ok(self.cmd_feedback(user, text).await?.map(Into::into)),
             _ => Ok(None),
@@ -415,6 +416,126 @@ impl AssistantHandler {
         Ok(View::message(crate::text::strip_markdown(&parsed.message)))
     }
 
+    /// Design a tailored workout from the user's philosophy, recent history, goals,
+    /// and injuries, and present it as a [`View::Workout`]. Persists a `proposed`
+    /// plan but logs NOTHING and starts no session. Any text after the command
+    /// ("/nextworkout but something lighter") is passed to the designer as guidance.
+    async fn cmd_next_workout(&self, user: &User, text: &str) -> anyhow::Result<View> {
+        let guidance = text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
+
+        let (philosophy, sessions, goals, injuries) = {
+            let db = self.db.lock().await;
+            (
+                db.latest_philosophy(user.id)?,
+                db.recent_sessions_with_sets(user.id, 3)?,
+                db.goal_progress_report(user.id, None, None)?,
+                db.list_active_health_entries(user.id)?,
+            )
+        };
+
+        // Per spec: with no philosophy on file, offer to build one rather than guess.
+        let Some(philosophy) = philosophy else {
+            return Ok(View::notice(
+                "I don't have a training philosophy for you yet, so I can't tailor a workout. \
+                 Run /philosophy and we'll build one together first.",
+            ));
+        };
+
+        let history_block = self.format_designer_history(&sessions);
+        let prompt = build_designer_prompt(&philosophy.content, &history_block, &goals, &injuries, &self.catalogue);
+        let user_text = if guidance.trim().is_empty() { "Design my next workout.".to_string() } else { guidance };
+
+        // The design overruns the default token cap; logging is impossible here
+        // because this path never calls execute_action / ensure_session.
+        let llm_response = self
+            .call_llm_with(&prompt, &[], &user_text, 2048, 0.2)
+            .await
+            .context("workout designer LLM call failed")?;
+        let parsed = parse_assistant_response(&llm_response);
+
+        let proposal = parsed.actions.into_iter().find_map(|action| match action {
+            AssistantAction::ProposeWorkout { title, rationale, exercises } => Some((title, rationale, exercises)),
+            _ => None,
+        });
+
+        let Some((title, rationale, exercises)) = proposal else {
+            // No structured plan came back — surface the prose so the turn is not a dead end.
+            return Ok(View::message(crate::text::strip_markdown(&parsed.message)));
+        };
+
+        self.persist_and_view_workout(user, &philosophy, title, rationale, exercises).await
+    }
+
+    /// Persist a designed workout as a `proposed` plan and build its [`View::Workout`].
+    /// Exercise names are resolved against the catalogue; unresolved ones are dropped
+    /// with a note rather than failing the whole design.
+    async fn persist_and_view_workout(
+        &self,
+        user: &User,
+        philosophy: &WorkoutPhilosophy,
+        title: String,
+        rationale: Option<String>,
+        exercises: Vec<ProposedExercise>,
+    ) -> anyhow::Result<View> {
+        let mut planned: Vec<PlannedExerciseView> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
+
+        let db = self.db.lock().await;
+        let plan_id = db.create_plan(user.id, &title, rationale.as_deref(), Some(philosophy.id))?;
+
+        for (idx, ex) in exercises.into_iter().enumerate() {
+            let Some(et) = find_exercise_type(&self.catalogue, &ex.exercise) else {
+                notes.push(format!("Skipped \"{}\" -- I couldn't match it to a known exercise.", ex.exercise));
+                continue;
+            };
+            db.add_plan_exercise(&WorkoutPlanExercise {
+                id: 0,
+                plan_id,
+                exercise_type_id: et.exercise_type.id,
+                order_idx: idx as i32,
+                target_sets: ex.target_sets,
+                target_reps: ex.target_reps,
+                target_weight_kg: ex.target_weight_kg,
+                target_secs: ex.target_secs,
+                notes: ex.notes.clone(),
+            })?;
+            planned.push(PlannedExerciseView {
+                name: et.exercise_type.name.clone(),
+                target_sets: ex.target_sets.map(|n| n.max(0) as u32),
+                target_reps: ex.target_reps.map(|n| n.max(0) as u32),
+                target_weight_kg: ex.target_weight_kg,
+                target_secs: ex.target_secs.map(|n| n.max(0) as u32),
+                cue: ex.notes,
+            });
+        }
+
+        Ok(View::Workout(WorkoutView { title, rationale, exercises: planned, notes }))
+    }
+
+    /// Format recent sessions (each exercise with its sets and effort) for the
+    /// designer prompt, e.g. "Bench Press (60kg x 8 easy, 65kg x 6 medium)".
+    fn format_designer_history(&self, sessions: &[SessionWithSets]) -> String {
+        if sessions.is_empty() {
+            return "RECENT HISTORY: none logged yet.\n".to_string();
+        }
+        let mut out = "RECENT HISTORY (most recent first):\n".to_string();
+        for (session, entries) in sessions {
+            out.push_str(&format!("- Session {}:\n", session.started_at));
+            for (_entry, sets) in entries {
+                let Some(first) = sets.first() else { continue };
+                let name = self
+                    .catalogue
+                    .iter()
+                    .find(|e| e.exercise_type.id == first.exercise_type_id)
+                    .map(|e| e.exercise_type.name.as_str())
+                    .unwrap_or("unknown");
+                let set_descs = sets.iter().map(format_set_desc).collect::<Vec<_>>().join(", ");
+                out.push_str(&format!("    {name} ({set_descs})\n"));
+            }
+        }
+        out
+    }
+
     fn cmd_start(&self, user: &User) -> String {
         let mut msg = format!(
             "You're already registered, {}! Here's what I can help with:\n\
@@ -423,6 +544,7 @@ impl AssistantHandler {
              - /history -- recent workout summaries\n\
              - /exercises -- available exercises\n\
              - /philosophy -- build or refine your training philosophy\n\
+             - /nextworkout -- design a workout for today\n\
              - /clear -- clear conversation context\n\
              - /timers -- toggle rest timers between sets\n",
             user.name
@@ -441,6 +563,7 @@ impl AssistantHandler {
          /history -- Last 5 workout summaries\n\
          /exercises -- List available exercises by muscle group\n\
          /philosophy -- Build or refine your training philosophy (multi-turn)\n\
+         /nextworkout -- Design a tailored workout for today (logs nothing)\n\
          /cancel -- Cancel an in-progress interview (e.g. /philosophy)\n\
          /clear -- Clear conversation context (fresh start)\n\
          /timers -- Toggle the rest timer between sets (on by default)\n"
@@ -688,6 +811,20 @@ impl AssistantHandler {
     }
 
     async fn call_llm(&self, system_prompt: &str, history: &[crate::db::ConversationMessage], user_text: &str) -> anyhow::Result<String> {
+        self.call_llm_with(system_prompt, history, user_text, 1024, 0.1).await
+    }
+
+    /// Like [`Self::call_llm`] but with an explicit token cap and temperature. Used
+    /// by `/nextworkout`, whose multi-exercise design overruns the default 1024-token
+    /// budget.
+    async fn call_llm_with(
+        &self,
+        system_prompt: &str,
+        history: &[crate::db::ConversationMessage],
+        user_text: &str,
+        max_tokens: u32,
+        temperature: f32,
+    ) -> anyhow::Result<String> {
         let mut messages = vec![LlmMessage { role: LlmRole::System, content: system_prompt.to_string() }];
 
         for msg in history {
@@ -701,7 +838,8 @@ impl AssistantHandler {
 
         messages.push(LlmMessage { role: LlmRole::User, content: user_text.to_string() });
 
-        let request = LlmRequest { messages, temperature: Some(0.1), max_completion_tokens: Some(1024), json_mode: true };
+        let request =
+            LlmRequest { messages, temperature: Some(temperature), max_completion_tokens: Some(max_tokens), json_mode: true };
 
         let response = self.llm.complete(request).await.context("LLM completion failed")?;
         Ok(response.content)
@@ -868,6 +1006,12 @@ impl AssistantHandler {
                 // Only meaningful inside the `/philosophy` interview, which applies it
                 // directly. Ignore it if the model emits it during normal chat.
                 tracing::debug!("Ignoring save_philosophy outside the philosophy interview");
+                Ok(ActionOutcome::none())
+            }
+            AssistantAction::ProposeWorkout { .. } => {
+                // Only meaningful for `/nextworkout`, which persists the plan directly
+                // and never routes it through here. Ignore it during normal chat.
+                tracing::debug!("Ignoring propose_workout outside /nextworkout");
                 Ok(ActionOutcome::none())
             }
             AssistantAction::Unknown => {
@@ -1370,6 +1514,23 @@ going in the existing session — and I'll log that set accordingly."
         assistant_msg.exclude_from_context = true;
         db.insert_message(&assistant_msg)?;
         Ok(())
+    }
+}
+
+/// One logged set as the designer prompt reads it, e.g. "60kg x 8 easy" or
+/// "60s hard". Effort is the perceived difficulty so the designer can progress or
+/// back off the load.
+fn format_set_desc(set: &ExerciseSet) -> String {
+    let effort = set.perceived_difficulty.as_str();
+    match set.measurement_type {
+        MeasurementType::WeightReps => match set.count {
+            Some(reps) => format!("{:.0}kg x {reps} {effort}", set.value),
+            None => format!("{:.0}kg {effort}", set.value),
+        },
+        MeasurementType::TimeBased => format!("{:.0}s {effort}", set.value),
+        MeasurementType::DistanceBased => format!("{:.0}m {effort}", set.value),
+        MeasurementType::LevelBased => format!("level {:.0} {effort}", set.value),
+        MeasurementType::ScoreBased => format!("score {:.1} {effort}", set.value),
     }
 }
 
@@ -2743,5 +2904,73 @@ mod tests {
         let db = handler.db.lock().await;
         assert!(db.get_interview_state(user.id, "telegram").unwrap().is_none());
         assert!(db.latest_philosophy(user.id).unwrap().is_none(), "nothing should be saved");
+    }
+
+    #[tokio::test]
+    async fn nextworkout_without_philosophy_offers_to_build_one() {
+        let (handler, _) = setup_handler("").await;
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
+
+        let reply = handler.handle_text_message(&msg, "/nextworkout").await.unwrap();
+        assert!(shown(&reply).contains("/philosophy"), "should point the user at /philosophy first");
+    }
+
+    #[tokio::test]
+    async fn nextworkout_designs_and_persists_plan_without_logging() {
+        let design = r#"{"message": "Here's today's session.", "actions": [
+            {"type": "propose_workout", "title": "Upper push", "rationale": "Bench was easy; push it.", "exercises": [
+                {"exercise": "Bench Press", "target_sets": 3, "target_reps": 6, "target_weight_kg": 65.0, "notes": "drive through heels"},
+                {"exercise": "One Arm Dumbbell Row", "target_sets": 3, "target_reps": 8, "target_weight_kg": 24.0}
+            ]}
+        ]}"#;
+        let (handler, _) = setup_handler(design).await;
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
+
+        let user = { handler.db.lock().await.get_user_by_telegram_id("12345").unwrap().unwrap() };
+        {
+            handler.db.lock().await.insert_philosophy(user.id, "goal=hypertrophy; 5x5; dumbbells to 24kg", "interview").unwrap();
+        }
+
+        let reply = handler.handle_text_message(&msg, "/nextworkout").await.unwrap();
+        let text = shown(&reply);
+        assert!(text.contains("Upper push"));
+        assert!(text.contains("Bench Press"));
+        assert!(text.contains("3 sets × 6 reps @ 65kg"));
+
+        let db = handler.db.lock().await;
+        let plan = db.latest_proposed_plan(user.id).unwrap().expect("a proposed plan should be persisted");
+        assert_eq!(plan.title, "Upper push");
+        assert_eq!(db.list_plan_exercises(plan.id).unwrap().len(), 2);
+        // The crucial guarantee: designing logs NOTHING.
+        assert!(db.get_active_session(user.id).unwrap().is_none(), "nextworkout must not start a session");
+        assert!(db.recent_sessions_with_sets(user.id, 5).unwrap().is_empty(), "nextworkout must not log sets");
+    }
+
+    #[tokio::test]
+    async fn nextworkout_drops_unresolved_exercise_with_note() {
+        let design = r#"{"message": "Plan ready.", "actions": [
+            {"type": "propose_workout", "title": "Mixed", "exercises": [
+                {"exercise": "Bench Press", "target_sets": 3, "target_reps": 8, "target_weight_kg": 60.0},
+                {"exercise": "Jetpack Flips", "target_sets": 3, "target_reps": 8}
+            ]}
+        ]}"#;
+        let (handler, _) = setup_handler(design).await;
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
+        let user = { handler.db.lock().await.get_user_by_telegram_id("12345").unwrap().unwrap() };
+        {
+            handler.db.lock().await.insert_philosophy(user.id, "general fitness", "interview").unwrap();
+        }
+
+        let reply = handler.handle_text_message(&msg, "/nextworkout").await.unwrap();
+        let text = shown(&reply);
+        assert!(text.contains("Bench Press"));
+        assert!(text.contains("Skipped") && text.contains("Jetpack Flips"), "unresolved exercise should be noted, not fatal");
+
+        let db = handler.db.lock().await;
+        let plan = db.latest_proposed_plan(user.id).unwrap().unwrap();
+        assert_eq!(db.list_plan_exercises(plan.id).unwrap().len(), 1, "only the resolved exercise is persisted");
     }
 }
