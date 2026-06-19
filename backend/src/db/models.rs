@@ -367,6 +367,8 @@ pub struct Session {
     pub started_at: String,
     pub ended_at: Option<String>,
     pub notes: Option<String>,
+    /// Whether the inter-set rest timer arms after each logged set. Defaults to on.
+    pub timers_enabled: bool,
 }
 
 /// A block of related sets within a session (or standalone).
@@ -546,7 +548,7 @@ pub fn new_user_with_pubkey(name: &str, pubkey: &str, timezone: &str) -> User {
 }
 
 pub fn new_session(user_id: i64, notes: Option<&str>) -> Session {
-    Session { id: 0, user_id, started_at: now_str(), ended_at: None, notes: notes.map(String::from) }
+    Session { id: 0, user_id, started_at: now_str(), ended_at: None, notes: notes.map(String::from), timers_enabled: true }
 }
 
 pub fn new_exercise_entry(user_id: i64, session_id: Option<i64>, comment: Option<&str>) -> ExerciseEntry {

@@ -7,10 +7,17 @@ use super::models::{Difficulty, ExerciseEntry, ExerciseSet, ExerciseTypeWithAnce
 // ── Sessions ───────────────────────────────────────────────────────────────────
 
 fn row_to_session(row: &Row) -> rusqlite::Result<Session> {
-    Ok(Session { id: row.get(0)?, user_id: row.get(1)?, started_at: row.get(2)?, ended_at: row.get(3)?, notes: row.get(4)? })
+    Ok(Session {
+        id: row.get(0)?,
+        user_id: row.get(1)?,
+        started_at: row.get(2)?,
+        ended_at: row.get(3)?,
+        notes: row.get(4)?,
+        timers_enabled: row.get(5)?,
+    })
 }
 
-const SELECT_SESSION: &str = "SELECT id, user_id, started_at, ended_at, notes FROM sessions";
+const SELECT_SESSION: &str = "SELECT id, user_id, started_at, ended_at, notes, timers_enabled FROM sessions";
 
 impl Database {
     pub fn start_session(&self, user_id: i64, notes: Option<&str>) -> anyhow::Result<Session> {
@@ -18,6 +25,15 @@ impl Database {
         let id = self.conn().last_insert_rowid();
         let session = self.get_session(id)?.context("Session disappeared immediately after insert")?;
         Ok(session)
+    }
+
+    /// Flip (or set) the per-session rest-timer toggle. Returns the new state.
+    pub fn set_session_timers(&self, session_id: i64, enabled: bool) -> anyhow::Result<bool> {
+        let rows = self
+            .conn()
+            .execute("UPDATE sessions SET timers_enabled = ?2 WHERE id = ?1", params![session_id, enabled])?;
+        anyhow::ensure!(rows > 0, "session id {session_id} not found");
+        Ok(enabled)
     }
 
     /// End a session and cascade-close every still-open exercise_entry that
@@ -71,7 +87,8 @@ impl Database {
                     COUNT(DISTINCT ee.id) AS exercise_count, \
                     CASE WHEN s.ended_at IS NULL THEN NULL \
                          ELSE CAST((julianday(s.ended_at) - julianday(s.started_at)) * 24 * 60 AS INTEGER) \
-                    END AS duration_mins \
+                    END AS duration_mins, \
+                    s.timers_enabled \
              FROM sessions s \
              LEFT JOIN exercise_entry ee ON ee.session_id = s.id \
              WHERE s.user_id = ?1 \
@@ -81,8 +98,14 @@ impl Database {
              ORDER BY s.started_at DESC",
         )?;
         let rows = stmt.query_map(params![user_id, from, to], |row| {
-            let session =
-                Session { id: row.get(0)?, user_id: row.get(1)?, started_at: row.get(2)?, ended_at: row.get(3)?, notes: row.get(4)? };
+            let session = Session {
+                id: row.get(0)?,
+                user_id: row.get(1)?,
+                started_at: row.get(2)?,
+                ended_at: row.get(3)?,
+                notes: row.get(4)?,
+                timers_enabled: row.get(7)?,
+            };
             Ok(SessionSummary { session, exercise_count: row.get(5)?, duration_mins: row.get(6)? })
         })?;
         rows.collect::<Result<Vec<_>, _>>().context("Failed to list session summaries")

@@ -32,6 +32,10 @@ pub enum View {
     /// A short textual notice — help, registration confirmations, acknowledgements,
     /// error messages.
     Notice { text: String },
+    /// The new state of the per-session rest-timer toggle, after a `/timers` flip.
+    /// Clients show it however they like — Telegram as a one-line notice, the TUI by
+    /// updating its sidebar switch.
+    Timers { enabled: bool },
 }
 
 impl View {

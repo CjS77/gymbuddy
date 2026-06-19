@@ -19,6 +19,7 @@ impl Render for Telegram {
             View::History(history) => (render_history(history), None),
             View::Status(status) => (render_status(status), Some("HTML")),
             View::Catalog(catalog) => (render_catalog(catalog), Some("HTML")),
+            View::Timers { enabled } => (format!("Rest timers are now {}.", if *enabled { "on" } else { "off" }), None),
             // `View` is `#[non_exhaustive]`; nothing to render for a variant this
             // build does not know about.
             _ => (String::new(), None),

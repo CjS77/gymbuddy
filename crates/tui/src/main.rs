@@ -5,6 +5,7 @@
 //! server thinks. All domain logic lives server-side; this binary only renders.
 
 mod app;
+mod audio;
 mod config;
 mod render;
 mod ui;
@@ -15,7 +16,8 @@ use anyhow::Context as _;
 use clap::Parser;
 use futures::StreamExt as _;
 use gymbuddy_client::GymClient;
-use gymbuddy_proto::ClientRequest;
+use gymbuddy_proto::{ClientRequest, ServerResponse, TimerSignal};
+use gymbuddy_timer_core::{Cue, run_timer};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{Event, EventStream, KeyEventKind};
@@ -62,6 +64,13 @@ async fn run(
     let mut app = App::new(client.my_pubkey_hex().to_string(), name, timezone);
     let mut events = EventStream::new();
 
+    // Rest-timer plumbing: the server sends a one-shot arm/cancel directive; we run
+    // the countdown locally so the audible cues are precise. `cue_tx` is kept here
+    // for the whole loop, so the channel never closes between timers.
+    let audio = audio::default_player();
+    let (cue_tx, mut cue_rx) = tokio::sync::mpsc::unbounded_channel::<Cue>();
+    let mut timer_task: Option<tokio::task::JoinHandle<()>> = None;
+
     // Identify ourselves; the answer drives registration vs. welcome.
     client.send(&ClientRequest::Hello).await?;
 
@@ -81,6 +90,9 @@ async fn run(
             },
             maybe_resp = responses.next() => match maybe_resp {
                 Some(Ok(resp)) => {
+                    if let ServerResponse::Reply { timer: Some(signal), .. } = &resp {
+                        apply_timer_signal(signal, &cue_tx, &mut timer_task);
+                    }
                     if let Some(req) = app.on_response(resp) {
                         client.send(&req).await?;
                     }
@@ -88,9 +100,34 @@ async fn run(
                 Some(Err(e)) => app.mark_disconnected(format!("connection error: {e:#}")),
                 None => app.mark_disconnected("disconnected from server"),
             },
+            Some(cue) = cue_rx.recv() => {
+                audio.play(&cue);
+                app.push_cue_line(cue_line(&cue));
+            }
         }
     }
     Ok(())
+}
+
+/// Start, restart, or cancel the local rest countdown in response to a server
+/// [`TimerSignal`]. Re-arming aborts the previous task (logging a new set restarts
+/// the rest), and the engine task self-terminates when its cue sender is dropped.
+fn apply_timer_signal(signal: &TimerSignal, cue_tx: &tokio::sync::mpsc::UnboundedSender<Cue>, task: &mut Option<tokio::task::JoinHandle<()>>) {
+    if let Some(handle) = task.take() {
+        handle.abort();
+    }
+    if let TimerSignal::Arm { duration_secs, exercise } = signal {
+        *task = Some(tokio::spawn(run_timer(*duration_secs, exercise.clone(), cue_tx.clone())));
+    }
+}
+
+/// The transcript line for a rest-timer cue (rendered alongside its audible beep).
+fn cue_line(cue: &Cue) -> String {
+    match cue {
+        Cue::Ready { exercise } => format!("Get ready for your next set of {exercise}."),
+        Cue::Countdown(n) => format!("{n}…"),
+        Cue::Go => "Go!".to_string(),
+    }
 }
 
 fn init_terminal() -> anyhow::Result<Tui> {

@@ -59,6 +59,9 @@ pub struct App {
     pub should_quit: bool,
     /// Lines scrolled up from the bottom (0 = following the latest).
     pub scroll_back: u16,
+    /// Mirror of the server's per-session rest-timer toggle, shown in the sidebar.
+    /// Optimistic default until the first `/timers` reply confirms it.
+    pub timers_enabled: bool,
     default_name: Option<String>,
     default_timezone: Option<String>,
 }
@@ -73,9 +76,15 @@ impl App {
             connected: true,
             should_quit: false,
             scroll_back: 0,
+            timers_enabled: true,
             default_name,
             default_timezone,
         }
+    }
+
+    /// Append a rest-timer cue line to the transcript (driven by the local timer).
+    pub fn push_cue_line(&mut self, text: impl Into<String>) {
+        self.push(Speaker::System, text);
     }
 
     fn push(&mut self, speaker: Speaker, text: impl Into<String>) {
@@ -93,6 +102,11 @@ impl App {
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
             return Action::Quit;
+        }
+        // Ctrl+T flips the sidebar timer switch — it travels as the same `/timers`
+        // command Telegram uses, so the server stays the single source of truth.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('t')) {
+            return Action::Send(ClientRequest::Chat { text: "/timers".to_string() });
         }
         match key.code {
             KeyCode::Esc => Action::Quit,
@@ -166,7 +180,13 @@ impl App {
                 None
             }
             ServerResponse::NeedsRegistration => self.begin_registration(),
-            ServerResponse::Reply { view } => {
+            // The optional `timer` directive is handled by the event loop (which
+            // owns the local countdown task); here we only render the view and keep
+            // the sidebar switch in sync with a `/timers` reply.
+            ServerResponse::Reply { view, .. } => {
+                if let View::Timers { enabled } = &view {
+                    self.timers_enabled = *enabled;
+                }
                 self.push_view(view);
                 None
             }

@@ -11,12 +11,33 @@ use crate::render::render_view;
 
 /// Render the whole screen.
 pub fn draw(frame: &mut Frame, app: &App) {
-    let [transcript_area, input_area, status_area] =
+    let [top_area, input_area, status_area] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(3), Constraint::Length(1)]).areas(frame.area());
+    // Transcript on the left, a fixed-width settings sidebar on the right.
+    let [transcript_area, sidebar_area] = Layout::horizontal([Constraint::Min(1), Constraint::Length(20)]).areas(top_area);
 
     draw_transcript(frame, app, transcript_area);
+    draw_sidebar(frame, app, sidebar_area);
     draw_input(frame, app, input_area);
     draw_status(frame, app, status_area);
+}
+
+/// The settings sidebar: currently a single rest-timer on/off switch, toggled with
+/// Ctrl+T.
+fn draw_sidebar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let (switch, switch_style) = if app.timers_enabled {
+        ("[ ON  ]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+    } else {
+        ("[ OFF ]", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD))
+    };
+    let lines = vec![
+        Line::from(Span::styled("Rest timers", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(switch, switch_style)),
+        Line::from(""),
+        Line::from(Span::styled("^T toggle", Style::default().fg(Color::DarkGray))),
+    ];
+    let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Settings"));
+    frame.render_widget(paragraph, area);
 }
 
 fn draw_transcript(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -51,7 +72,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     } else {
         ("○ disconnected", Style::default().fg(Color::Red))
     };
-    let text = format!(" {marker}   you:{}   ^C/Esc quit · PgUp/PgDn scroll", short_key(&app.my_pubkey));
+    let text = format!(" {marker}   you:{}   ^C/Esc quit · PgUp/PgDn scroll · ^T timers", short_key(&app.my_pubkey));
     frame.render_widget(Paragraph::new(text).style(style), area);
 }
 

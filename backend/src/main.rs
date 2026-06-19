@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +19,8 @@ use gymbuddy_backend::telegram::{Message, TelegramClient, Voice};
 use gymbuddy_backend::transport;
 use gymbuddy_backend::voice::VoicePipeline;
 use corre_llm::OpenAiCompatProvider;
-use gymbuddy_proto::Render;
+use gymbuddy_proto::{Render, TimerSignal};
+use gymbuddy_timer_core::{Cue, run_timer};
 
 #[derive(Parser)]
 #[command(name = "gymbuddy", about = "You friendly AI personal trainer")]
@@ -184,6 +186,7 @@ async fn run_polling_loop(
     voice_pipeline: Option<&VoicePipeline>,
 ) -> anyhow::Result<()> {
     let mut offset = 0i64;
+    let mut rest_timers = RestTimerRegistry::default();
 
     loop {
         match telegram.get_updates(offset, 30).await {
@@ -191,7 +194,7 @@ async fn run_polling_loop(
                 for update in updates {
                     offset = update.update_id + 1;
                     if let Some(ref message) = update.message {
-                        process_message(telegram, handler, voice_pipeline, message, allowed_ids).await;
+                        process_message(telegram, handler, voice_pipeline, message, allowed_ids, &mut rest_timers).await;
                     }
                 }
             }
@@ -209,6 +212,7 @@ async fn process_message(
     voice_pipeline: Option<&VoicePipeline>,
     message: &Message,
     allowed_ids: &[i64],
+    rest_timers: &mut RestTimerRegistry,
 ) {
     if message.chat.chat_type != "private" {
         return;
@@ -220,9 +224,9 @@ async fn process_message(
     }
 
     if let Some(ref text) = message.text {
-        process_text_message(telegram, handler, message, text).await;
+        process_text_message(telegram, handler, message, text, rest_timers).await;
     } else if let Some(ref voice) = message.voice {
-        process_voice_message(telegram, handler, voice_pipeline, message, voice).await;
+        process_voice_message(telegram, handler, voice_pipeline, message, voice, rest_timers).await;
     } else if message.audio.is_some() {
         if let Err(e) =
             telegram.send_message(message.chat.id, "Please use the microphone button to record voice messages directly.", None, None).await
@@ -232,20 +236,31 @@ async fn process_message(
     }
 }
 
-async fn process_text_message(telegram: &TelegramClient, handler: &Arc<AssistantHandler>, message: &Message, text: &str) {
+async fn process_text_message(
+    telegram: &TelegramClient,
+    handler: &Arc<AssistantHandler>,
+    message: &Message,
+    text: &str,
+    rest_timers: &mut RestTimerRegistry,
+) {
     let _ = telegram.send_chat_action(message.chat.id, "typing").await;
 
-    let (reply_text, parse_mode) = match handler.handle_text_message(message, text).await {
-        Ok(view) => Telegram.render(&view),
+    let (reply_text, parse_mode, timer) = match handler.handle_text_message(message, text).await {
+        Ok(reply) => {
+            let (rendered, parse_mode) = Telegram.render(&reply.view);
+            (rendered, parse_mode, reply.timer)
+        }
         Err(e) => {
             tracing::error!("Handler error: {e:#}");
-            ("Something went wrong -- please try again later.".to_string(), None)
+            ("Something went wrong -- please try again later.".to_string(), None, None)
         }
     };
 
     if let Err(e) = send_long_message(telegram, message.chat.id, &reply_text, parse_mode).await {
         tracing::error!("Failed to send reply: {e:#}");
     }
+
+    rest_timers.apply(telegram, message.chat.id, timer);
 }
 
 async fn process_voice_message(
@@ -254,6 +269,7 @@ async fn process_voice_message(
     voice_pipeline: Option<&VoicePipeline>,
     message: &Message,
     voice: &Voice,
+    rest_timers: &mut RestTimerRegistry,
 ) {
     // 0. Check if voice is enabled
     let Some(pipeline) = voice_pipeline else {
@@ -332,15 +348,16 @@ async fn process_voice_message(
     let stop_action = spawn_chat_action_loop(telegram, message.chat.id, "typing");
 
     // 6. Process transcript through handler (identical to text messages)
-    let reply = match handler.handle_text_message(message, &transcript).await {
-        Ok(view) => to_plain(&view),
+    let (reply, timer) = match handler.handle_text_message(message, &transcript).await {
+        Ok(r) => (to_plain(&r.view), r.timer),
         Err(e) => {
             tracing::error!("Handler error: {e:#}");
-            "I had trouble processing that -- could you try again?".to_string()
+            ("I had trouble processing that -- could you try again?".to_string(), None)
         }
     };
 
     let _ = stop_action.send(());
+    rest_timers.apply(telegram, message.chat.id, timer);
 
     // 7. Send text reply with transcript echo (if configured)
     if pipeline.should_send_text() {
@@ -385,6 +402,64 @@ async fn download_voice(telegram: &TelegramClient, file_id: &str) -> anyhow::Res
     let file = telegram.get_file(file_id).await?;
     let file_path = file.file_path.context("Telegram returned no file_path")?;
     telegram.download_file_bytes(&file_path).await
+}
+
+/// Server-side rest timers for the Telegram transport: one in-flight countdown per
+/// chat. Telegram has no persistent client loop, so (unlike the TUI/Android clients,
+/// which run the countdown locally) the server runs it and sends the cue messages.
+#[derive(Default)]
+struct RestTimerRegistry {
+    timers: HashMap<i64, tokio::task::JoinHandle<()>>,
+}
+
+impl RestTimerRegistry {
+    /// Apply a [`TimerSignal`] from a handled reply: arm a fresh countdown, cancel
+    /// the running one, or do nothing.
+    fn apply(&mut self, telegram: &TelegramClient, chat_id: i64, signal: Option<TimerSignal>) {
+        match signal {
+            Some(TimerSignal::Arm { duration_secs, exercise }) => self.arm(telegram, chat_id, duration_secs, exercise),
+            Some(TimerSignal::Cancel) => self.cancel(chat_id),
+            None => {}
+        }
+    }
+
+    /// Start a countdown for `chat_id`, replacing (and aborting) any in-flight one —
+    /// logging a new set restarts the rest.
+    fn arm(&mut self, telegram: &TelegramClient, chat_id: i64, duration_secs: u32, exercise: String) {
+        self.cancel(chat_id);
+        self.timers.insert(chat_id, spawn_telegram_rest_timer(telegram, chat_id, duration_secs, exercise));
+    }
+
+    fn cancel(&mut self, chat_id: i64) {
+        if let Some(handle) = self.timers.remove(&chat_id) {
+            handle.abort();
+        }
+    }
+}
+
+/// Spawn a Telegram rest countdown: run the shared timer engine and turn its cues
+/// into chat messages. Telegram gets the 10-seconds warning and the "Go!" message
+/// only — the silent 3-2-1 ticks are for clients that beep. Aborting the returned
+/// handle drops the cue receiver, which stops the engine task too.
+fn spawn_telegram_rest_timer(telegram: &TelegramClient, chat_id: i64, duration_secs: u32, exercise: String) -> tokio::task::JoinHandle<()> {
+    let telegram = telegram.clone();
+    tokio::spawn(async move {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let engine = tokio::spawn(run_timer(duration_secs, exercise, tx));
+        while let Some(cue) = rx.recv().await {
+            let message = match cue {
+                Cue::Ready { exercise } => Some(format!("Get ready for your next set of {exercise}.")),
+                Cue::Countdown(_) => None,
+                Cue::Go => Some("Go!".to_string()),
+            };
+            if let Some(message) = message
+                && let Err(e) = telegram.send_message(chat_id, &message, None, None).await
+            {
+                tracing::warn!("Failed to send rest-timer message: {e:#}");
+            }
+        }
+        let _ = engine.await;
+    })
 }
 
 /// Re-sends a chat action every 4 seconds until the returned sender is dropped or signalled.

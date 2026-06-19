@@ -22,7 +22,7 @@ use super::prompts::{
 };
 use gymbuddy_proto::{
     CatalogEntry, CatalogGroup, CatalogView, ExerciseLog, HealthNote, HistoryView, Measurement, SessionSummaryView, SessionView, SetLine,
-    StatusView, View,
+    StatusView, TimerSignal, View,
 };
 
 pub struct AssistantHandler {
@@ -31,6 +31,52 @@ pub struct AssistantHandler {
     config: GymConfig,
     catalogue: Vec<ExerciseTypeWithAncestry>,
     issue_reporter: Option<Arc<dyn IssueReporter>>,
+}
+
+/// A handled turn: the domain [`View`] to render plus an optional rest-timer
+/// directive that rides along with it. The Telegram path arms its timer server-side
+/// from `timer`; the confide path forwards it to the client, which runs the
+/// countdown locally.
+pub struct Reply {
+    pub view: View,
+    pub timer: Option<TimerSignal>,
+}
+
+impl Reply {
+    fn view(view: View) -> Self {
+        Self { view, timer: None }
+    }
+}
+
+impl From<View> for Reply {
+    fn from(view: View) -> Self {
+        Self::view(view)
+    }
+}
+
+/// Result of executing a single [`AssistantAction`]: an optional reply suffix
+/// (set-count checkpoint, close pushback, …) and an optional rest-timer directive
+/// (arm after a logged set, cancel after closing/ending).
+#[derive(Default)]
+struct ActionOutcome {
+    suffix: Option<String>,
+    timer: Option<TimerSignal>,
+}
+
+impl ActionOutcome {
+    fn none() -> Self {
+        Self::default()
+    }
+
+    fn cancel() -> Self {
+        Self { suffix: None, timer: Some(TimerSignal::Cancel) }
+    }
+}
+
+impl From<Option<String>> for ActionOutcome {
+    fn from(suffix: Option<String>) -> Self {
+        Self { suffix, timer: None }
+    }
 }
 
 /// Outcome of resolving which `exercise_entry` a logged set should join.
@@ -60,17 +106,17 @@ impl AssistantHandler {
     }
 
     /// Process an incoming Telegram text message and return a reply.
-    pub async fn handle_text_message(&self, message: &TgMessage, text: &str) -> anyhow::Result<View> {
+    pub async fn handle_text_message(&self, message: &TgMessage, text: &str) -> anyhow::Result<Reply> {
         let (user, is_new) = self.ensure_user(message).await?;
         if is_new {
-            return Ok(View::notice(self.welcome_message(&user)));
+            return Ok(View::notice(self.welcome_message(&user)).into());
         }
         self.handle_message_for_user(&user, text, "telegram").await
     }
 
-    pub async fn handle_message_for_user(&self, user: &User, text: &str, platform: &str) -> anyhow::Result<View> {
+    pub async fn handle_message_for_user(&self, user: &User, text: &str, platform: &str) -> anyhow::Result<Reply> {
         if let Some(reply) = self.handle_command(text, user, platform).await? {
-            return Ok(reply);
+            return Ok(reply.into());
         }
 
         self.close_stale_session(user).await?;
@@ -78,7 +124,7 @@ impl AssistantHandler {
         let text = if text.len() > self.config.max_message_length { &text[..self.config.max_message_length] } else { text };
 
         if let Some(reply) = self.maybe_session_continuity_short_circuit(user, text, platform).await? {
-            return Ok(reply);
+            return Ok(reply.into());
         }
 
         if let Some(reply) = self.maybe_session_continuity_resume(user, text, platform).await? {
@@ -103,7 +149,7 @@ impl AssistantHandler {
                     "I had trouble processing that -- could you try again?"
                 };
                 self.store_excluded_conversation_on_platform(user.id, platform, text, error_reply).await?;
-                return Ok(View::notice(error_reply));
+                return Ok(View::notice(error_reply).into());
             }
         };
 
@@ -116,10 +162,19 @@ impl AssistantHandler {
 
         let mut failures: Vec<String> = Vec::new();
         let mut suffixes: Vec<String> = Vec::new();
+        // The last action that touches the timer wins (e.g. logging then ending a
+        // session in one turn ends with the cancel).
+        let mut timer: Option<TimerSignal> = None;
         for action in &parsed.actions {
             match self.execute_action(action, user).await {
-                Ok(Some(suffix)) => suffixes.push(suffix),
-                Ok(None) => {}
+                Ok(outcome) => {
+                    if let Some(suffix) = outcome.suffix {
+                        suffixes.push(suffix);
+                    }
+                    if outcome.timer.is_some() {
+                        timer = outcome.timer;
+                    }
+                }
                 Err(e) => {
                     tracing::warn!("Action execution failed: {e:#}");
                     failures.push(format!("{e:#}"));
@@ -138,7 +193,7 @@ impl AssistantHandler {
         // The conversational follow-ups (`suffixes`) and any action `failures` ride
         // alongside the prose as structured `notes`/`failures`; each client decides
         // how to present them. `strip_markdown` keeps stray markup out of chat boxes.
-        Ok(View::Message { text: crate::text::strip_markdown(&parsed.message), notes: suffixes, failures })
+        Ok(Reply { view: View::Message { text: crate::text::strip_markdown(&parsed.message), notes: suffixes, failures }, timer })
     }
 
     async fn ensure_user(&self, message: &TgMessage) -> anyhow::Result<(User, bool)> {
@@ -205,8 +260,21 @@ impl AssistantHandler {
             "/history" => Ok(Some(View::History(self.cmd_history(user).await?))),
             "/exercises" => Ok(Some(View::Catalog(self.cmd_exercises()))),
             "/clear" => Ok(Some(View::notice(self.cmd_clear(user, platform).await?))),
+            "/timers" => Ok(Some(self.cmd_timers(user).await?)),
             "/feedback" => self.cmd_feedback(user, text).await,
             _ => Ok(None),
+        }
+    }
+
+    /// Toggle the active session's rest-timer flag and report the new state.
+    async fn cmd_timers(&self, user: &User) -> anyhow::Result<View> {
+        let db = self.db.lock().await;
+        match db.get_active_session(user.id)? {
+            Some(session) => {
+                let enabled = db.set_session_timers(session.id, !session.timers_enabled)?;
+                Ok(View::Timers { enabled })
+            }
+            None => Ok(View::notice("No active workout session — start one and I'll arm rest timers between your sets.")),
         }
     }
 
@@ -217,7 +285,8 @@ impl AssistantHandler {
              - /status -- see your current session\n\
              - /history -- recent workout summaries\n\
              - /exercises -- available exercises\n\
-             - /clear -- clear conversation context\n",
+             - /clear -- clear conversation context\n\
+             - /timers -- toggle rest timers between sets\n",
             user.name
         );
         if user.beta_tester {
@@ -233,7 +302,8 @@ impl AssistantHandler {
          /status -- Current session and today's stats\n\
          /history -- Last 5 workout summaries\n\
          /exercises -- List available exercises by muscle group\n\
-         /clear -- Clear conversation context (fresh start)\n"
+         /clear -- Clear conversation context (fresh start)\n\
+         /timers -- Toggle the rest timer between sets (on by default)\n"
             .to_string();
         if user.beta_tester {
             msg.push_str("/feedback <text> -- File a bug report or feature request\n");
@@ -497,9 +567,10 @@ impl AssistantHandler {
         Ok(response.content)
     }
 
-    /// Returns an optional suffix appended to the assistant's reply (set-count
-    /// checkpoint, premature-close pushback, leaked-entry warning).
-    async fn execute_action(&self, action: &AssistantAction, user: &User) -> anyhow::Result<Option<String>> {
+    /// Execute one action, returning an optional reply suffix (set-count checkpoint,
+    /// premature-close pushback, leaked-entry warning) and an optional rest-timer
+    /// directive (arm after a logged set, cancel after closing/ending).
+    async fn execute_action(&self, action: &AssistantAction, user: &User) -> anyhow::Result<ActionOutcome> {
         tracing::debug!(action = ?action, user_id = user.id, "Executing action");
         match action {
             AssistantAction::LogExercise { exercise, reps, weight_kg, perceived_difficulty, comment, superset } => {
@@ -507,7 +578,7 @@ impl AssistantHandler {
                 let session = self.ensure_session(user).await?;
                 let entry_id = match self.resolve_entry_for_log(user.id, session.id, et.exercise_type.id, *superset).await? {
                     LogEntryTarget::AskSuperset { ongoing_exercise } => {
-                        return Ok(Some(superset_prompt(&ongoing_exercise, &et.exercise_type.name)));
+                        return Ok(Some(superset_prompt(&ongoing_exercise, &et.exercise_type.name)).into());
                     }
                     LogEntryTarget::Use(id) => id,
                 };
@@ -523,39 +594,47 @@ impl AssistantHandler {
                     s.comment = comment.clone();
                     db.insert_set(&s)?;
                 }
-                Ok(self.set_count_checkpoint_suffix(entry_id, &et.exercise_type.name).await?)
+                let suffix = self.set_count_checkpoint_suffix(entry_id, &et.exercise_type.name).await?;
+                let timer = self.arm_rest_timer(&session, &et.exercise_type.name, pd).await?;
+                Ok(ActionOutcome { suffix, timer })
             }
             AssistantAction::LogExerciseTimed { exercise, duration_secs, perceived_difficulty, comment, superset } => {
                 let et = find_exercise_type(&self.catalogue, exercise).ok_or_else(|| anyhow::anyhow!("Unknown exercise: {exercise}"))?;
                 let session = self.ensure_session(user).await?;
                 let entry_id = match self.resolve_entry_for_log(user.id, session.id, et.exercise_type.id, *superset).await? {
                     LogEntryTarget::AskSuperset { ongoing_exercise } => {
-                        return Ok(Some(superset_prompt(&ongoing_exercise, &et.exercise_type.name)));
+                        return Ok(Some(superset_prompt(&ongoing_exercise, &et.exercise_type.name)).into());
                     }
                     LogEntryTarget::Use(id) => id,
                 };
+                let pd = perceived_difficulty.unwrap_or(Difficulty::Medium);
                 let mut s = new_exercise_set(entry_id, et.exercise_type.id, MeasurementType::TimeBased, *duration_secs as f64);
-                s.perceived_difficulty = perceived_difficulty.unwrap_or(Difficulty::Medium);
+                s.perceived_difficulty = pd;
                 s.comment = comment.clone();
                 self.db.lock().await.insert_set(&s)?;
-                Ok(self.set_count_checkpoint_suffix(entry_id, &et.exercise_type.name).await?)
+                let suffix = self.set_count_checkpoint_suffix(entry_id, &et.exercise_type.name).await?;
+                let timer = self.arm_rest_timer(&session, &et.exercise_type.name, pd).await?;
+                Ok(ActionOutcome { suffix, timer })
             }
             AssistantAction::LogExerciseDistance { exercise, distance_m, duration_secs, perceived_difficulty, comment, superset } => {
                 let et = find_exercise_type(&self.catalogue, exercise).ok_or_else(|| anyhow::anyhow!("Unknown exercise: {exercise}"))?;
                 let session = self.ensure_session(user).await?;
                 let entry_id = match self.resolve_entry_for_log(user.id, session.id, et.exercise_type.id, *superset).await? {
                     LogEntryTarget::AskSuperset { ongoing_exercise } => {
-                        return Ok(Some(superset_prompt(&ongoing_exercise, &et.exercise_type.name)));
+                        return Ok(Some(superset_prompt(&ongoing_exercise, &et.exercise_type.name)).into());
                     }
                     LogEntryTarget::Use(id) => id,
                 };
                 let value = distance_m.unwrap_or_else(|| duration_secs.unwrap_or(0) as f64);
                 let mt = if distance_m.is_some() { MeasurementType::DistanceBased } else { MeasurementType::TimeBased };
+                let pd = perceived_difficulty.unwrap_or(Difficulty::Medium);
                 let mut s = new_exercise_set(entry_id, et.exercise_type.id, mt, value);
-                s.perceived_difficulty = perceived_difficulty.unwrap_or(Difficulty::Medium);
+                s.perceived_difficulty = pd;
                 s.comment = comment.clone();
                 self.db.lock().await.insert_set(&s)?;
-                Ok(self.set_count_checkpoint_suffix(entry_id, &et.exercise_type.name).await?)
+                let suffix = self.set_count_checkpoint_suffix(entry_id, &et.exercise_type.name).await?;
+                let timer = self.arm_rest_timer(&session, &et.exercise_type.name, pd).await?;
+                Ok(ActionOutcome { suffix, timer })
             }
             AssistantAction::StartSession { notes, plan } => {
                 let db = self.db.lock().await;
@@ -570,10 +649,10 @@ impl AssistantHandler {
                             entries = if open.len() == 1 { "entry" } else { "entries" },
                             list = names.join(", "),
                         );
-                        return Ok(Some(suffix));
+                        return Ok(Some(suffix).into());
                     }
                     tracing::debug!("Session already active, skipping start");
-                    return Ok(None);
+                    return Ok(ActionOutcome::none());
                 }
                 // No active session — clean up any leaked open entries from previously
                 // ended sessions before starting fresh.
@@ -583,7 +662,7 @@ impl AssistantHandler {
                 let combined_notes = combine_plan_with_notes(plan.as_deref(), notes.as_deref());
                 let session = db.start_session(user.id, combined_notes.as_deref())?;
                 tracing::debug!(id = session.id, plan = ?plan, "Started session");
-                Ok(None)
+                Ok(ActionOutcome::none())
             }
             AssistantAction::EndSession => {
                 let db = self.db.lock().await;
@@ -593,20 +672,23 @@ impl AssistantHandler {
                 } else {
                     tracing::debug!("No active session to end");
                 }
-                Ok(None)
+                // Resting is over once the session ends.
+                Ok(ActionOutcome::cancel())
             }
-            AssistantAction::CloseExerciseEntry { exercise, entry_id } => {
-                self.close_exercise_entry_action(user, exercise.as_deref(), *entry_id, false).await
-            }
-            AssistantAction::ConfirmCloseExerciseEntry { exercise, entry_id } => {
-                self.close_exercise_entry_action(user, exercise.as_deref(), *entry_id, true).await
-            }
+            AssistantAction::CloseExerciseEntry { exercise, entry_id } => Ok(ActionOutcome {
+                suffix: self.close_exercise_entry_action(user, exercise.as_deref(), *entry_id, false).await?,
+                timer: Some(TimerSignal::Cancel),
+            }),
+            AssistantAction::ConfirmCloseExerciseEntry { exercise, entry_id } => Ok(ActionOutcome {
+                suffix: self.close_exercise_entry_action(user, exercise.as_deref(), *entry_id, true).await?,
+                timer: Some(TimerSignal::Cancel),
+            }),
             AssistantAction::DeleteExerciseEntry { entry_id } => {
                 let db = self.db.lock().await;
                 let entry = db.get_entry(*entry_id)?.ok_or_else(|| anyhow::anyhow!("entry {entry_id} not found"))?;
                 anyhow::ensure!(entry.user_id == user.id, "entry {entry_id} does not belong to user");
                 db.delete_entry(*entry_id)?;
-                Ok(None)
+                Ok(ActionOutcome::cancel())
             }
             AssistantAction::CloseAllOpenEntries => {
                 let db = self.db.lock().await;
@@ -614,7 +696,7 @@ impl AssistantHandler {
                     let n = db.close_open_entries_for_session(session.id, None)?;
                     tracing::debug!(session_id = session.id, closed = n, "Closed all open entries");
                 }
-                Ok(None)
+                Ok(ActionOutcome::cancel())
             }
             AssistantAction::LogHealth { entry_type, body_part, severity, description } => {
                 let mut entry = new_health_entry(user.id, *entry_type, description);
@@ -624,7 +706,7 @@ impl AssistantHandler {
                 }
                 tracing::debug!(entry_type = ?entry_type, body_part = ?body_part, severity = ?severity, "Inserting health entry");
                 self.db.lock().await.insert_health_entry(&entry)?;
-                Ok(None)
+                Ok(ActionOutcome::none())
             }
             AssistantAction::ResolveHealth { description } => {
                 let db = self.db.lock().await;
@@ -635,7 +717,7 @@ impl AssistantHandler {
                 } else {
                     tracing::debug!(search = %description, "No matching health entry found to resolve");
                 }
-                Ok(None)
+                Ok(ActionOutcome::none())
             }
             AssistantAction::SetGoal { exercise, target_value, end_date } => {
                 let et = find_exercise_type(&self.catalogue, exercise).ok_or_else(|| anyhow::anyhow!("Unknown exercise: {exercise}"))?;
@@ -643,17 +725,31 @@ impl AssistantHandler {
                 goal.end_date = end_date.clone();
                 tracing::debug!(exercise = %et.exercise_type.name, target = %target_value, end_date = ?end_date, "Inserting goal");
                 self.db.lock().await.insert_goal(&goal)?;
-                Ok(None)
+                Ok(ActionOutcome::none())
             }
-            AssistantAction::EditSet { exercise, new_exercise, new_reps, new_value, new_difficulty } => {
-                self.edit_set_action(user, exercise.as_deref(), new_exercise.as_deref(), *new_reps, *new_value, *new_difficulty).await
-            }
-            AssistantAction::GetLastExercise { exercise } => self.get_last_exercise_action(user, exercise).await,
+            AssistantAction::EditSet { exercise, new_exercise, new_reps, new_value, new_difficulty } => Ok(self
+                .edit_set_action(user, exercise.as_deref(), new_exercise.as_deref(), *new_reps, *new_value, *new_difficulty)
+                .await?
+                .into()),
+            AssistantAction::GetLastExercise { exercise } => Ok(self.get_last_exercise_action(user, exercise).await?.into()),
             AssistantAction::Unknown => {
                 tracing::debug!("Ignoring unknown action type from LLM");
-                Ok(None)
+                Ok(ActionOutcome::none())
             }
         }
+    }
+
+    /// Build the rest-timer arm directive for a just-logged set, or `None` when the
+    /// session has timers disabled. Superset detection mirrors the rest of the
+    /// codebase: ≥2 simultaneously-open entries means a superset (flat shorter rest),
+    /// otherwise the perceived difficulty sets the duration.
+    async fn arm_rest_timer(&self, session: &Session, exercise: &str, difficulty: Difficulty) -> anyhow::Result<Option<TimerSignal>> {
+        if !session.timers_enabled {
+            return Ok(None);
+        }
+        let is_superset = self.db.lock().await.list_open_entries_for_session(session.id)?.len() >= 2;
+        let duration_secs = self.config.rest_timer.rest_secs_for(Some(difficulty), is_superset);
+        Ok(Some(TimerSignal::Arm { duration_secs, exercise: exercise.to_string() }))
     }
 
     async fn ensure_session(&self, user: &User) -> anyhow::Result<crate::db::Session> {
@@ -1025,7 +1121,7 @@ going in the existing session — and I'll log that set accordingly."
     ///     short-circuit).
     ///   * For "same": bump the session's started_at to now (so the gap is 0),
     ///     then recurse with the original text.
-    async fn maybe_session_continuity_resume(&self, user: &User, text: &str, platform: &str) -> anyhow::Result<Option<View>> {
+    async fn maybe_session_continuity_resume(&self, user: &User, text: &str, platform: &str) -> anyhow::Result<Option<Reply>> {
         let lowered = text.to_lowercase();
         let is_new = ["new workout", "new session", "yes new", "yes, new"].iter().any(|n| lowered.contains(n))
             || lowered.trim() == "yes"
@@ -1371,10 +1467,10 @@ mod tests {
     use corre_core::app::{LlmRequest, LlmResponse};
     use gymbuddy_proto::Render as _;
 
-    /// The text a Telegram user would see for a view — lets these tests keep
+    /// The text a Telegram user would see for a reply — lets these tests keep
     /// asserting on rendered output after the move to the domain `View` model.
-    fn shown(view: &View) -> String {
-        Telegram.render(view).0
+    fn shown(reply: &Reply) -> String {
+        Telegram.render(&reply.view).0
     }
 
     struct MockLlm {
@@ -1434,6 +1530,7 @@ mod tests {
             voice: None,
             github: None,
             confide: None,
+            rest_timer: crate::config::RestTimerConfig::default(),
         }
     }
 
@@ -2336,7 +2433,7 @@ mod tests {
             ]}"#,
         );
         let view = handler.handle_text_message(&msg, "what was my last bench press?").await.unwrap();
-        let (reply, _) = Telegram.render(&view);
+        let (reply, _) = Telegram.render(&view.view);
         assert!(reply.contains("Bench Press"), "reply must name the resolved exercise, got: {reply}");
         assert!(reply.contains("8×80.0kg"), "reply must include the set, got: {reply}");
     }
@@ -2353,7 +2450,7 @@ mod tests {
             ]}"#,
         );
         let view = handler.handle_text_message(&msg, "what was my last bench press?").await.unwrap();
-        let (reply, _) = Telegram.render(&view);
+        let (reply, _) = Telegram.render(&view.view);
         assert!(reply.to_lowercase().contains("haven't logged"), "expected not-found phrasing, got: {reply}");
     }
 

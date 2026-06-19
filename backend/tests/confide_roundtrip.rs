@@ -98,7 +98,7 @@ async fn register_then_chat_logs_sets_over_confide() {
     // The server sends a domain view; the client renders it. Here we assert the
     // wire payload is a `Message` carrying the assistant prose and the set-count
     // checkpoint note produced by logging the third set.
-    let ServerResponse::Reply { view } = resp else { panic!("expected Reply, got {resp:?}") };
+    let ServerResponse::Reply { view, .. } = resp else { panic!("expected Reply, got {resp:?}") };
     let View::Message { text, notes, .. } = view else { panic!("expected Message, got {view:?}") };
     assert!(text.starts_with("Logged your bench press!"), "unexpected reply: {text}");
     assert!(notes.iter().any(|n| n.contains("You've logged 3 sets of Bench Press")), "expected checkpoint note, got {notes:?}");
