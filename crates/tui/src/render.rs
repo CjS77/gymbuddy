@@ -4,7 +4,7 @@
 //! headings, bullets, and space-aligned columns (no bordered `Table` widget,
 //! which clashes with the flowing transcript).
 
-use gymbuddy_proto::{CatalogView, ExerciseLog, HistoryView, Measurement, PlannedExerciseView, SetLine, StatusView, View, WorkoutView};
+use gymbuddy_proto::{CatalogView, ExerciseLog, HistoryView, SetLine, StatusView, View, WorkoutView};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -142,7 +142,7 @@ fn render_workout(workout: &WorkoutView) -> Vec<Line<'static>> {
     if !workout.exercises.is_empty() {
         lines.push(Line::from(""));
         for (i, exercise) in workout.exercises.iter().enumerate() {
-            let target = format_target(exercise);
+            let target = exercise.target_line();
             let target_part = if target.is_empty() { String::new() } else { format!(" — {target}") };
             lines.push(Line::from(vec![
                 Span::styled(format!("  {}. ", i + 1), Style::default().fg(MUTED)),
@@ -170,63 +170,18 @@ fn render_workout(workout: &WorkoutView) -> Vec<Line<'static>> {
     lines
 }
 
-/// The prescription line for one planned exercise, e.g. "3 sets × 6 reps @ 65kg".
-fn format_target(exercise: &PlannedExerciseView) -> String {
-    let mut parts = String::new();
-    if let Some(sets) = exercise.target_sets {
-        parts.push_str(&format!("{sets} sets"));
-    }
-    if let Some(secs) = exercise.target_secs {
-        if !parts.is_empty() {
-            parts.push_str(" × ");
-        }
-        parts.push_str(&format!("{secs}s"));
-    } else if let Some(reps) = exercise.target_reps {
-        if !parts.is_empty() {
-            parts.push_str(" × ");
-        }
-        parts.push_str(&format!("{reps} reps"));
-    }
-    if let Some(weight) = exercise.target_weight_kg {
-        if !parts.is_empty() {
-            parts.push(' ');
-        }
-        parts.push_str(&format!("@ {}kg", trim(weight)));
-    }
-    parts
-}
-
 fn exercise_bullet(log: &ExerciseLog, index: Option<usize>) -> Line<'static> {
     let bullet = match index {
         Some(i) => format!("  {i}. "),
         None => "  • ".to_string(),
     };
     let n = log.sets.len();
-    let sets = log.sets.iter().map(format_set).collect::<Vec<_>>().join(", ");
+    let sets = log.sets.iter().map(SetLine::compact).collect::<Vec<_>>().join(", ");
     Line::from(vec![
         Span::styled(bullet, Style::default().fg(MUTED)),
         Span::styled(log.name.clone(), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
         Span::raw(format!(" ({n} {}) — {sets}", if n == 1 { "set" } else { "sets" })),
     ])
-}
-
-/// Compact, human-friendly set rendering, e.g. "8×80kg", "82.5kg", "30s".
-fn format_set(set: &SetLine) -> String {
-    match set.measurement {
-        Measurement::WeightReps => match set.count {
-            Some(c) => format!("{c}×{}kg", trim(set.value)),
-            None => format!("{}kg", trim(set.value)),
-        },
-        Measurement::TimeBased => format!("{}s", trim(set.value)),
-        Measurement::DistanceBased => format!("{}m", trim(set.value)),
-        Measurement::LevelBased => format!("L{}", trim(set.value)),
-        Measurement::ScoreBased => format!("{}pt", trim(set.value)),
-    }
-}
-
-/// Drop a trailing ".0" so whole numbers read cleanly (80.0 → "80", 82.5 → "82.5").
-fn trim(v: f64) -> String {
-    if v.fract() == 0.0 { format!("{v:.0}") } else { format!("{v}") }
 }
 
 fn plain_lines(text: &str) -> Vec<Line<'static>> {
@@ -248,7 +203,7 @@ fn muted(text: String) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gymbuddy_proto::{CatalogEntry, CatalogGroup, ExerciseLog, HealthNote, SessionView};
+    use gymbuddy_proto::{CatalogEntry, CatalogGroup, ExerciseLog, HealthNote, Measurement, SessionView};
 
     fn flat(lines: &[Line]) -> String {
         lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect::<Vec<_>>().join("\n")

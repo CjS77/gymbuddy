@@ -633,18 +633,10 @@ fn format_prescription(p: &PrescribedExercise) -> String {
 
 fn format_set_entry(set: &ExerciseSet, exercise_name: &str) -> String {
     let mut parts = vec![exercise_name.to_string()];
-    match set.measurement_type {
-        MeasurementType::WeightReps => {
-            if let Some(c) = set.count {
-                parts.push(format!("{c} reps"));
-            }
-            parts.push(format!("{:.1}kg", set.value));
-        }
-        MeasurementType::TimeBased => parts.push(format!("{:.0}s", set.value)),
-        MeasurementType::DistanceBased => parts.push(format!("{:.0}m", set.value)),
-        MeasurementType::LevelBased => parts.push(format!("level {:.0}", set.value)),
-        MeasurementType::ScoreBased => parts.push(format!("score {:.1}", set.value)),
+    if let (MeasurementType::WeightReps, Some(c)) = (set.measurement_type, set.count) {
+        parts.push(format!("{c} reps"));
     }
+    parts.push(set.measurement_type.describe_value(set.value));
     parts.join(" ")
 }
 

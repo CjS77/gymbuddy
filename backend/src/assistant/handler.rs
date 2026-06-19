@@ -113,6 +113,22 @@ impl CloseOutcome {
     }
 }
 
+/// The resolved destination for a log-set action, produced by
+/// [`AssistantHandler::resolve_log_target`]: either a ready entry, or a superset
+/// disambiguation prompt (in which case nothing is logged this turn).
+enum LogTarget {
+    Ready(LogReady),
+    AskSuperset(String),
+}
+
+/// Which entry, in which session, for which exercise type a logged set lands on.
+struct LogReady {
+    exercise_type_id: i64,
+    exercise_name: String,
+    session: Session,
+    entry_id: i64,
+}
+
 impl AssistantHandler {
     pub async fn new(db: Arc<Mutex<Database>>, llm: Box<dyn LlmProvider>, config: GymConfig) -> anyhow::Result<Self> {
         Self::new_with_reporter(db, llm, config, None).await
@@ -523,12 +539,7 @@ impl AssistantHandler {
             out.push_str(&format!("- Session {}:\n", session.started_at));
             for (_entry, sets) in entries {
                 let Some(first) = sets.first() else { continue };
-                let name = self
-                    .catalogue
-                    .iter()
-                    .find(|e| e.exercise_type.id == first.exercise_type_id)
-                    .map(|e| e.exercise_type.name.as_str())
-                    .unwrap_or("unknown");
+                let name = self.exercise_name(first.exercise_type_id);
                 let set_descs = sets.iter().map(format_set_desc).collect::<Vec<_>>().join(", ");
                 out.push_str(&format!("    {name} ({set_descs})\n"));
             }
@@ -592,11 +603,7 @@ impl AssistantHandler {
                 let mut in_progress: Vec<ExerciseLog> = Vec::new();
                 for entry in &db.list_entries_for_session(session.id)? {
                     let sets = db.list_sets_for_entry(entry.id)?;
-                    let name = sets
-                        .first()
-                        .and_then(|s| self.catalogue.iter().find(|e| e.exercise_type.id == s.exercise_type_id))
-                        .map(|e| e.exercise_type.name.clone())
-                        .unwrap_or_else(|| "unknown".to_string());
+                    let name = sets.first().map_or_else(|| "unknown".to_string(), |s| self.exercise_name(s.exercise_type_id));
                     let log = ExerciseLog { name, sets: sets.iter().map(set_line).collect() };
                     if entry.end_timestamp.is_some() {
                         completed.push(log);
@@ -674,6 +681,16 @@ impl AssistantHandler {
         CatalogView { groups: groups.into_iter().map(|(_, cg)| cg).collect() }
     }
 
+    /// Resolve an exercise type's display name from the in-memory catalogue, falling
+    /// back to "unknown" when the id is not present.
+    fn exercise_name(&self, exercise_type_id: i64) -> String {
+        self.catalogue
+            .iter()
+            .find(|e| e.exercise_type.id == exercise_type_id)
+            .map(|e| e.exercise_type.name.clone())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
     async fn close_stale_session(&self, user: &User) -> anyhow::Result<()> {
         let db = self.db.lock().await;
         let Some(session) = db.get_active_session(user.id)? else {
@@ -707,9 +724,7 @@ impl AssistantHandler {
             for entry in &entries {
                 let sets = db.list_sets_for_entry(entry.id)?;
                 let exercise_type_id = sets.first().map(|s| s.exercise_type_id);
-                let exercise_name = exercise_type_id
-                    .and_then(|id| self.catalogue.iter().find(|e| e.exercise_type.id == id).map(|e| e.exercise_type.name.clone()))
-                    .unwrap_or_else(|| "unknown".to_string());
+                let exercise_name = exercise_type_id.map_or_else(|| "unknown".to_string(), |id| self.exercise_name(id));
                 let summary_parts: Vec<String> = sets.iter().map(format_set_short).collect();
                 session_entries.push(EntryView {
                     id: entry.id,
@@ -805,12 +820,7 @@ impl AssistantHandler {
         let mut planned = db.list_schedule_exercises(schedule.id)?;
         planned.sort_by_key(|p| p.order_idx);
         let next = planned.iter().find(|p| !completed_exercise_ids.contains(&p.exercise_type_id)).map(|p| {
-            let exercise_name = self
-                .catalogue
-                .iter()
-                .find(|e| e.exercise_type.id == p.exercise_type_id)
-                .map(|e| e.exercise_type.name.clone())
-                .unwrap_or_else(|| "unknown".to_string());
+            let exercise_name = self.exercise_name(p.exercise_type_id);
             PlanExerciseView { exercise_name, target_sets: p.target_sets, target_reps: p.target_reps, target_weight_kg: p.target_weight_kg }
         });
         Ok(Some(ActivePlanView { name: schedule.name, completed_exercise_ids: completed_exercise_ids.to_vec(), next }))
@@ -835,8 +845,11 @@ impl AssistantHandler {
             return Ok(Some(self.workout_plan_progress(db, &plan, &logged, true)?));
         }
 
-        // Otherwise a freshly designed plan ready to start.
-        if let Some(plan) = db.latest_proposed_plan(user_id)? {
+        // Otherwise a freshly designed plan ready to start — but only while it is
+        // recent, so a stale design does not resurface as "ready" days later.
+        if let Some(plan) = db.latest_proposed_plan(user_id)?
+            && proposed_plan_within_window(&plan.created_at, Utc::now().naive_utc())
+        {
             return Ok(Some(self.workout_plan_progress(db, &plan, &std::collections::HashSet::new(), false)?));
         }
 
@@ -856,12 +869,7 @@ impl AssistantHandler {
         let mut done = Vec::new();
         let mut next = None;
         for ex in &exercises {
-            let name = self
-                .catalogue
-                .iter()
-                .find(|e| e.exercise_type.id == ex.exercise_type_id)
-                .map(|e| e.exercise_type.name.clone())
-                .unwrap_or_else(|| "unknown".to_string());
+            let name = self.exercise_name(ex.exercise_type_id);
             if logged.contains(&ex.exercise_type_id) {
                 done.push(name);
             } else if next.is_none() {
@@ -921,61 +929,49 @@ impl AssistantHandler {
         tracing::debug!(action = ?action, user_id = user.id, "Executing action");
         match action {
             AssistantAction::LogExercise { exercise, reps, weight_kg, perceived_difficulty, comment, superset } => {
-                let et = find_exercise_type(&self.catalogue, exercise).ok_or_else(|| anyhow::anyhow!("Unknown exercise: {exercise}"))?;
-                let session = self.ensure_session(user).await?;
-                let entry_id = match self.resolve_entry_for_log(user.id, session.id, et.exercise_type.id, *superset).await? {
-                    LogEntryTarget::AskSuperset { ongoing_exercise } => {
-                        return Ok(Some(superset_prompt(&ongoing_exercise, &et.exercise_type.name)).into());
-                    }
-                    LogEntryTarget::Use(id) => id,
+                let target = match self.resolve_log_target(user, exercise, *superset).await? {
+                    LogTarget::Ready(t) => t,
+                    LogTarget::AskSuperset(prompt) => return Ok(Some(prompt).into()),
                 };
                 let weight = weight_kg.unwrap_or(0.0);
                 let pd = perceived_difficulty.unwrap_or(Difficulty::Medium);
                 {
                     let db = self.db.lock().await;
-                    let existing = db.list_sets_for_entry(entry_id)?.len() as i32;
-                    let mut s = new_exercise_set(entry_id, et.exercise_type.id, MeasurementType::WeightReps, weight);
+                    let existing = db.list_sets_for_entry(target.entry_id)?.len() as i32;
+                    let mut s = new_exercise_set(target.entry_id, target.exercise_type_id, MeasurementType::WeightReps, weight);
                     s.count = *reps;
                     s.order_idx = existing;
                     s.perceived_difficulty = pd;
                     s.comment = comment.clone();
                     db.insert_set(&s)?;
                 }
-                self.finish_logged_set(user, &session, entry_id, &et.exercise_type.name, pd).await
+                self.finish_logged_set(user, &target.session, target.entry_id, &target.exercise_name, pd).await
             }
             AssistantAction::LogExerciseTimed { exercise, duration_secs, perceived_difficulty, comment, superset } => {
-                let et = find_exercise_type(&self.catalogue, exercise).ok_or_else(|| anyhow::anyhow!("Unknown exercise: {exercise}"))?;
-                let session = self.ensure_session(user).await?;
-                let entry_id = match self.resolve_entry_for_log(user.id, session.id, et.exercise_type.id, *superset).await? {
-                    LogEntryTarget::AskSuperset { ongoing_exercise } => {
-                        return Ok(Some(superset_prompt(&ongoing_exercise, &et.exercise_type.name)).into());
-                    }
-                    LogEntryTarget::Use(id) => id,
+                let target = match self.resolve_log_target(user, exercise, *superset).await? {
+                    LogTarget::Ready(t) => t,
+                    LogTarget::AskSuperset(prompt) => return Ok(Some(prompt).into()),
                 };
                 let pd = perceived_difficulty.unwrap_or(Difficulty::Medium);
-                let mut s = new_exercise_set(entry_id, et.exercise_type.id, MeasurementType::TimeBased, *duration_secs as f64);
+                let mut s = new_exercise_set(target.entry_id, target.exercise_type_id, MeasurementType::TimeBased, *duration_secs as f64);
                 s.perceived_difficulty = pd;
                 s.comment = comment.clone();
                 self.db.lock().await.insert_set(&s)?;
-                self.finish_logged_set(user, &session, entry_id, &et.exercise_type.name, pd).await
+                self.finish_logged_set(user, &target.session, target.entry_id, &target.exercise_name, pd).await
             }
             AssistantAction::LogExerciseDistance { exercise, distance_m, duration_secs, perceived_difficulty, comment, superset } => {
-                let et = find_exercise_type(&self.catalogue, exercise).ok_or_else(|| anyhow::anyhow!("Unknown exercise: {exercise}"))?;
-                let session = self.ensure_session(user).await?;
-                let entry_id = match self.resolve_entry_for_log(user.id, session.id, et.exercise_type.id, *superset).await? {
-                    LogEntryTarget::AskSuperset { ongoing_exercise } => {
-                        return Ok(Some(superset_prompt(&ongoing_exercise, &et.exercise_type.name)).into());
-                    }
-                    LogEntryTarget::Use(id) => id,
+                let target = match self.resolve_log_target(user, exercise, *superset).await? {
+                    LogTarget::Ready(t) => t,
+                    LogTarget::AskSuperset(prompt) => return Ok(Some(prompt).into()),
                 };
                 let value = distance_m.unwrap_or_else(|| duration_secs.unwrap_or(0) as f64);
                 let mt = if distance_m.is_some() { MeasurementType::DistanceBased } else { MeasurementType::TimeBased };
                 let pd = perceived_difficulty.unwrap_or(Difficulty::Medium);
-                let mut s = new_exercise_set(entry_id, et.exercise_type.id, mt, value);
+                let mut s = new_exercise_set(target.entry_id, target.exercise_type_id, mt, value);
                 s.perceived_difficulty = pd;
                 s.comment = comment.clone();
                 self.db.lock().await.insert_set(&s)?;
-                self.finish_logged_set(user, &session, entry_id, &et.exercise_type.name, pd).await
+                self.finish_logged_set(user, &target.session, target.entry_id, &target.exercise_name, pd).await
             }
             AssistantAction::StartSession { notes, plan } => {
                 let db = self.db.lock().await;
@@ -1147,11 +1143,39 @@ impl AssistantHandler {
     /// After a session starts, bind the most recent designed (proposed) workout to it
     /// so guided execution begins. No-op when there is no proposed plan.
     fn bind_proposed_plan(&self, db: &Database, user_id: i64, session_id: i64) -> anyhow::Result<()> {
-        if let Some(plan) = db.latest_proposed_plan(user_id)? {
+        let Some(plan) = db.latest_proposed_plan(user_id)? else {
+            return Ok(());
+        };
+        if proposed_plan_within_window(&plan.created_at, Utc::now().naive_utc()) {
             db.bind_plan_to_session(plan.id, session_id)?;
             tracing::debug!(plan_id = plan.id, session_id, "Bound designed workout to session for guided execution");
+        } else {
+            // Designed too long ago to silently attach to this session — retire it so
+            // it stops being a binding candidate.
+            db.set_plan_status(plan.id, crate::db::PlanStatus::Abandoned)?;
+            tracing::debug!(plan_id = plan.id, "Abandoned a stale proposed workout instead of binding");
         }
         Ok(())
+    }
+
+    /// Shared preamble for the three log-set actions: resolve the exercise type,
+    /// ensure an active session, and choose the entry to log into. Yields
+    /// [`LogTarget::AskSuperset`] (logging nothing) when the set is an ambiguous
+    /// taxonomy relative of an already-open entry.
+    async fn resolve_log_target(&self, user: &User, exercise: &str, superset: bool) -> anyhow::Result<LogTarget> {
+        let et = find_exercise_type(&self.catalogue, exercise).ok_or_else(|| anyhow::anyhow!("Unknown exercise: {exercise}"))?;
+        let session = self.ensure_session(user).await?;
+        match self.resolve_entry_for_log(user.id, session.id, et.exercise_type.id, superset).await? {
+            LogEntryTarget::AskSuperset { ongoing_exercise } => {
+                Ok(LogTarget::AskSuperset(superset_prompt(&ongoing_exercise, &et.exercise_type.name)))
+            }
+            LogEntryTarget::Use(entry_id) => Ok(LogTarget::Ready(LogReady {
+                exercise_type_id: et.exercise_type.id,
+                exercise_name: et.exercise_type.name.clone(),
+                session,
+                entry_id,
+            })),
+        }
     }
 
     /// Decide which `exercise_entry` a logged set belongs to.
@@ -1303,9 +1327,9 @@ impl AssistantHandler {
             if new_value.is_some() {
                 parts.push(format!(
                     "{} {} → {}",
-                    value_label(outcome.before.measurement_type),
-                    format_value(outcome.before.measurement_type, outcome.before.value),
-                    format_value(outcome.after.measurement_type, outcome.after.value),
+                    outcome.before.measurement_type.value_label(),
+                    outcome.before.measurement_type.format_value(outcome.before.value),
+                    outcome.after.measurement_type.format_value(outcome.after.value),
                 ));
             }
             if new_reps.is_some() {
@@ -1617,15 +1641,10 @@ going in the existing session — and I'll log that set accordingly."
 /// back off the load.
 fn format_set_desc(set: &ExerciseSet) -> String {
     let effort = set.perceived_difficulty.as_str();
-    match set.measurement_type {
-        MeasurementType::WeightReps => match set.count {
-            Some(reps) => format!("{:.0}kg x {reps} {effort}", set.value),
-            None => format!("{:.0}kg {effort}", set.value),
-        },
-        MeasurementType::TimeBased => format!("{:.0}s {effort}", set.value),
-        MeasurementType::DistanceBased => format!("{:.0}m {effort}", set.value),
-        MeasurementType::LevelBased => format!("level {:.0} {effort}", set.value),
-        MeasurementType::ScoreBased => format!("score {:.1} {effort}", set.value),
+    let measure = set.measurement_type.describe_value(set.value);
+    match (set.measurement_type, set.count) {
+        (MeasurementType::WeightReps, Some(reps)) => format!("{measure} x {reps} {effort}"),
+        _ => format!("{measure} {effort}"),
     }
 }
 
@@ -1698,28 +1717,6 @@ pub(crate) fn entry_exercise_name(db: &Database, catalogue: &[ExerciseTypeWithAn
     Ok(name)
 }
 
-/// Human-readable label for the measured value of a set, by measurement type.
-fn value_label(mt: MeasurementType) -> &'static str {
-    match mt {
-        MeasurementType::WeightReps => "weight",
-        MeasurementType::TimeBased => "duration",
-        MeasurementType::DistanceBased => "distance",
-        MeasurementType::LevelBased => "level",
-        MeasurementType::ScoreBased => "score",
-    }
-}
-
-/// Render a set's measured value with its unit, by measurement type.
-fn format_value(mt: MeasurementType, value: f64) -> String {
-    match mt {
-        MeasurementType::WeightReps => format!("{value:.1}kg"),
-        MeasurementType::TimeBased => format!("{value:.0}s"),
-        MeasurementType::DistanceBased => format!("{value:.0}m"),
-        MeasurementType::LevelBased => format!("level {value:.0}"),
-        MeasurementType::ScoreBased => format!("{value:.1}"),
-    }
-}
-
 /// Render an optional rep count, falling back to an em dash when absent.
 fn opt_count(c: Option<i32>) -> String {
     c.map(|c| c.to_string()).unwrap_or_else(|| "—".to_string())
@@ -1764,18 +1761,10 @@ pub(crate) fn parse_plan_from_notes(notes: Option<&str>) -> (Option<String>, Opt
 }
 
 /// Compact rendering of a single set used inside an entry summary, e.g. "8×80kg",
-/// "30s", "5000m".
+/// "30s", "5000m". Delegates to the wire [`SetLine::compact`] so the backend's
+/// compact form has a single source of truth shared with every client.
 pub(crate) fn format_set_short(set: &ExerciseSet) -> String {
-    match set.measurement_type {
-        MeasurementType::WeightReps => match set.count {
-            Some(c) => format!("{c}×{:.1}kg", set.value),
-            None => format!("{:.1}kg", set.value),
-        },
-        MeasurementType::TimeBased => format!("{:.0}s", set.value),
-        MeasurementType::DistanceBased => format!("{:.0}m", set.value),
-        MeasurementType::LevelBased => format!("L{:.0}", set.value),
-        MeasurementType::ScoreBased => format!("{:.1}pt", set.value),
-    }
+    set_line(set).compact()
 }
 
 /// Hours since the most-recent set in `session` was logged, falling back to the
@@ -1801,6 +1790,21 @@ fn compute_last_activity_age_hours(db: &Database, session: &Session) -> anyhow::
 
 fn parse_sqlite_datetime(s: &str) -> Option<NaiveDateTime> {
     NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok()
+}
+
+/// How long a designed-but-unstarted `/nextworkout` plan stays eligible to bind to a
+/// new session. After this it is stale: a week-old design must not silently attach to
+/// an unrelated workout the user happens to start.
+const PROPOSED_PLAN_BIND_WINDOW_HOURS: i64 = 12;
+
+/// Whether a `proposed` plan created at `created_at` is still recent enough to bind to
+/// a session. An unparseable timestamp fails open (treated as in-window — we just
+/// wrote it), matching `compute_last_activity_age_hours`'s lenient parsing.
+fn proposed_plan_within_window(created_at: &str, now: NaiveDateTime) -> bool {
+    match parse_sqlite_datetime(created_at) {
+        Some(ts) => (now - ts).num_hours() < PROPOSED_PLAN_BIND_WINDOW_HOURS,
+        None => true,
+    }
 }
 
 /// Loose match for "did the previous assistant turn ask the session-continuity
@@ -2855,7 +2859,7 @@ mod tests {
         let view = handler.handle_text_message(&msg, "what was my last bench press?").await.unwrap();
         let (reply, _) = Telegram.render(&view.view);
         assert!(reply.contains("Bench Press"), "reply must name the resolved exercise, got: {reply}");
-        assert!(reply.contains("8×80.0kg"), "reply must include the set, got: {reply}");
+        assert!(reply.contains("8×80kg"), "reply must include the set, got: {reply}");
     }
 
     #[tokio::test]
@@ -3136,5 +3140,18 @@ mod tests {
         let db = handler.db.lock().await;
         assert!(db.active_plan_for_user(user.id).unwrap().is_none());
         assert_eq!(db.get_plan(plan_id).unwrap().unwrap().status, crate::db::PlanStatus::Completed);
+    }
+
+    #[test]
+    fn proposed_plan_window_excludes_stale_designs() {
+        let now = parse_sqlite_datetime("2026-06-19 12:00:00").unwrap();
+        // Designed an hour ago → still bindable.
+        assert!(proposed_plan_within_window("2026-06-19 11:00:00", now));
+        // Designed yesterday → stale, must not bind to today's session.
+        assert!(!proposed_plan_within_window("2026-06-18 11:00:00", now));
+        // Exactly at the 12h cutoff → stale (the window is exclusive).
+        assert!(!proposed_plan_within_window("2026-06-19 00:00:00", now));
+        // Unparseable timestamp fails open (we just wrote it).
+        assert!(proposed_plan_within_window("not a date", now));
     }
 }

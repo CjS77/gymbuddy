@@ -57,6 +57,41 @@ impl MeasurementType {
             _ => Self::WeightReps,
         }
     }
+
+    /// Noun for the measured quantity: "weight", "duration", "distance", "level",
+    /// "score". Pair with [`Self::format_value`] when a labelled value is wanted.
+    pub fn value_label(self) -> &'static str {
+        match self {
+            Self::WeightReps => "weight",
+            Self::TimeBased => "duration",
+            Self::DistanceBased => "distance",
+            Self::LevelBased => "level",
+            Self::ScoreBased => "score",
+        }
+    }
+
+    /// The measured value with its unit but no leading noun, e.g. "80.0kg", "60s",
+    /// "5000m", "3", "9.5". The single source of truth for prompt-side value
+    /// rendering (client display uses [`SetLine::compact`](gymbuddy_proto::SetLine::compact)).
+    pub fn format_value(self, value: f64) -> String {
+        match self {
+            Self::WeightReps => format!("{value:.1}kg"),
+            Self::TimeBased => format!("{value:.0}s"),
+            Self::DistanceBased => format!("{value:.0}m"),
+            Self::LevelBased => format!("{value:.0}"),
+            Self::ScoreBased => format!("{value:.1}"),
+        }
+    }
+
+    /// A self-describing value for standalone prompt text: "80.0kg", "60s", "5000m",
+    /// "level 3", "score 9.5". (Weight/time/distance carry their own unit; level and
+    /// score get the noun prefixed.)
+    pub fn describe_value(self, value: f64) -> String {
+        match self {
+            Self::WeightReps | Self::TimeBased | Self::DistanceBased => self.format_value(value),
+            Self::LevelBased | Self::ScoreBased => format!("{} {}", self.value_label(), self.format_value(value)),
+        }
+    }
 }
 
 impl fmt::Display for MeasurementType {

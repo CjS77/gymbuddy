@@ -3,7 +3,7 @@
 //! Reproduces the exact output the handler emitted before the view refactor, so
 //! the Telegram bot is visually unchanged — locked down by golden tests below.
 
-use gymbuddy_proto::{CatalogView, HistoryView, Measurement, PlannedExerciseView, Render, SetLine, StatusView, View, WorkoutView};
+use gymbuddy_proto::{CatalogView, HistoryView, Render, SetLine, StatusView, View, WorkoutView};
 
 /// The Telegram renderer. `Output` is `(text, parse_mode)` — `parse_mode` is
 /// `Some("HTML")` for the rich `/status` and `/exercises` views, `None` otherwise.
@@ -134,7 +134,7 @@ fn render_workout(workout: &WorkoutView) -> String {
     if !workout.exercises.is_empty() {
         result.push('\n');
         for (i, exercise) in workout.exercises.iter().enumerate() {
-            let target = format_target(exercise);
+            let target = exercise.target_line();
             let target_part = if target.is_empty() { String::new() } else { format!(" — {target}") };
             result.push_str(&format!("{}. <b>{}</b>{target_part}\n", i + 1, escape_html(&exercise.name)));
             if let Some(cue) = &exercise.cue
@@ -156,59 +156,14 @@ fn render_workout(workout: &WorkoutView) -> String {
     result
 }
 
-/// The prescription line for one planned exercise, e.g. "3 sets × 6 reps @ 65kg"
-/// or "3 sets × 60s". Empty when no targets are set.
-fn format_target(exercise: &PlannedExerciseView) -> String {
-    let mut parts = String::new();
-    if let Some(sets) = exercise.target_sets {
-        parts.push_str(&format!("{sets} sets"));
-    }
-    if let Some(secs) = exercise.target_secs {
-        if !parts.is_empty() {
-            parts.push_str(" × ");
-        }
-        parts.push_str(&format!("{secs}s"));
-    } else if let Some(reps) = exercise.target_reps {
-        if !parts.is_empty() {
-            parts.push_str(" × ");
-        }
-        parts.push_str(&format!("{reps} reps"));
-    }
-    if let Some(weight) = exercise.target_weight_kg {
-        if !parts.is_empty() {
-            parts.push(' ');
-        }
-        parts.push_str(&format!("@ {}", fmt_weight(weight)));
-    }
-    parts
-}
-
-/// Weight without a trailing `.0`: 65.0 → "65kg", 22.5 → "22.5kg".
-fn fmt_weight(kg: f64) -> String {
-    if (kg - kg.trunc()).abs() < 1e-9 { format!("{kg:.0}kg") } else { format!("{kg:.1}kg") }
-}
-
+/// Compact rendering of one set ("8×80kg", "30s", …) shared with every client via
+/// [`SetLine::compact`](gymbuddy_proto::SetLine::compact).
 fn joined_sets(sets: &[SetLine]) -> String {
-    sets.iter().map(format_set).collect::<Vec<_>>().join(", ")
+    sets.iter().map(SetLine::compact).collect::<Vec<_>>().join(", ")
 }
 
 fn set_count(n: usize) -> String {
     format!("{n} {}", if n == 1 { "set" } else { "sets" })
-}
-
-/// Compact rendering of one set, e.g. "8×80.0kg", "30s", "5000m". Mirrors the
-/// backend's `format_set_short`, operating on the wire [`SetLine`].
-fn format_set(set: &SetLine) -> String {
-    match set.measurement {
-        Measurement::WeightReps => match set.count {
-            Some(c) => format!("{c}×{:.1}kg", set.value),
-            None => format!("{:.1}kg", set.value),
-        },
-        Measurement::TimeBased => format!("{:.0}s", set.value),
-        Measurement::DistanceBased => format!("{:.0}m", set.value),
-        Measurement::LevelBased => format!("L{:.0}", set.value),
-        Measurement::ScoreBased => format!("{:.1}pt", set.value),
-    }
 }
 
 /// Escape the three characters that are significant in Telegram HTML.
@@ -219,7 +174,7 @@ pub(crate) fn escape_html(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gymbuddy_proto::{CatalogEntry, CatalogGroup, ExerciseLog, HealthNote, SessionView};
+    use gymbuddy_proto::{CatalogEntry, CatalogGroup, ExerciseLog, HealthNote, Measurement, SessionView};
 
     fn set(count: Option<u32>, value: f64) -> SetLine {
         SetLine { measurement: Measurement::WeightReps, count, value }
@@ -241,9 +196,9 @@ mod tests {
         let expected = "<b>Status for Alice</b>\n\
                         \n<b>Active session</b> (started 2026-06-16 10:00:00)\n\
                         <b>Completed:</b>\n\
-                        - <b>Bench Press</b> (2 sets) — 8×80.0kg, 8×80.0kg\n\
+                        - <b>Bench Press</b> (2 sets) — 8×80kg, 8×80kg\n\
                         <b>Current exercise:</b>\n\
-                        - <b>Squat</b> (1 set) — 5×100.0kg\n\
+                        - <b>Squat</b> (1 set) — 5×100kg\n\
                         \n<b>Active health issues</b>\n\
                         - injury (shoulder): sore\n";
         assert_eq!(html, expected);

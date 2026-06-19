@@ -133,6 +133,12 @@ impl Database {
     // ── Plans ─────────────────────────────────────────────────────────────────────
 
     pub fn create_plan(&self, user_id: i64, title: &str, rationale: Option<&str>, philosophy_id: Option<i64>) -> anyhow::Result<i64> {
+        // A user keeps at most one live proposal: supersede any earlier `proposed`
+        // plans so they neither accumulate nor bind to a later session.
+        self.conn().execute(
+            "UPDATE workout_plans SET status = ?1, updated_at = datetime('now') WHERE user_id = ?2 AND status = ?3",
+            params![PlanStatus::Abandoned.as_str(), user_id, PlanStatus::Proposed.as_str()],
+        )?;
         self.conn().execute(
             "INSERT INTO workout_plans (user_id, title, rationale, philosophy_id) VALUES (?1, ?2, ?3, ?4)",
             params![user_id, title, rationale, philosophy_id],
@@ -324,6 +330,18 @@ mod tests {
 
         db.set_plan_status(plan_id, PlanStatus::Completed).unwrap();
         assert!(db.active_plan_for_user(user_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn designing_a_new_plan_abandons_the_previous_proposal() {
+        let (db, user_id) = test_db();
+        let first = db.create_plan(user_id, "Plan A", None, None).unwrap();
+        let second = db.create_plan(user_id, "Plan B", None, None).unwrap();
+
+        assert_eq!(db.get_plan(first).unwrap().unwrap().status, PlanStatus::Abandoned);
+        assert_eq!(db.get_plan(second).unwrap().unwrap().status, PlanStatus::Proposed);
+        // Only the newest proposal is live and bindable.
+        assert_eq!(db.latest_proposed_plan(user_id).unwrap().unwrap().id, second);
     }
 
     #[test]
