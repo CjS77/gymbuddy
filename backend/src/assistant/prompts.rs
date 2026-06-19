@@ -9,6 +9,7 @@ pub struct PromptContext {
     pub session_entries: Vec<EntryView>,          // closed + open entries in the active session, in insertion order
     pub leaked_open_entries: Vec<EntryView>,      // open entries belonging to ENDED prior sessions or the active session
     pub active_plan: Option<ActivePlanView>,      // populated when the active session was started with a `plan:` sentinel
+    pub active_workout_plan: Option<WorkoutPlanProgress>, // a `/nextworkout` design that is ready or under guided execution
     pub health_entries: Vec<HealthEntry>,
     pub recent_summaries: Vec<SessionSummary>,
     pub recent_sets: Vec<ExerciseSet>,
@@ -49,6 +50,31 @@ pub struct PlanExerciseView {
     pub target_weight_kg: Option<f64>,
 }
 
+/// Progress of a `/nextworkout` design: either freshly designed and ready to start
+/// (`started == false`) or bound to the active session and under guided execution
+/// (`started == true`). Drives the proactive set-by-set coaching.
+#[derive(Debug, Clone)]
+pub struct WorkoutPlanProgress {
+    pub title: String,
+    pub started: bool,
+    /// Names of prescribed exercises the user has already logged sets for this session.
+    pub done: Vec<String>,
+    /// The next prescribed exercise still to do.
+    pub next: Option<PrescribedExercise>,
+    /// How many prescribed exercises remain.
+    pub remaining: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrescribedExercise {
+    pub exercise_name: String,
+    pub target_sets: Option<i32>,
+    pub target_reps: Option<i32>,
+    pub target_weight_kg: Option<f64>,
+    pub target_secs: Option<i32>,
+    pub notes: Option<String>,
+}
+
 pub fn build_system_prompt(ctx: &PromptContext) -> String {
     let session_status = match &ctx.active_session {
         Some(s) => format!("Active (started {})", s.started_at),
@@ -58,6 +84,7 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
     let entries_section = format_session_entries(&ctx.session_entries);
     let leaked_section = format_leaked_entries(&ctx.leaked_open_entries);
     let plan_section = format_active_plan(&ctx.active_plan);
+    let workout_plan_section = format_active_workout_plan(&ctx.active_workout_plan);
     let continuity_section = format_session_continuity(ctx.last_activity_age_hours);
     let continuity_banner = format_session_continuity_banner(ctx.last_activity_age_hours);
     let health_section = format_health_entries(&ctx.health_entries);
@@ -117,6 +144,11 @@ re-labels the whole exercise block; `new_value` is the new weight_kg (or duratio
 / distance_m for timed / distance exercises). Include ONLY the fields the user wants \
 changed. Never send an id — the host finds the set by recency and appends the exact \
 before→after summary to your reply.\n\
+- {{\"type\": \"append_philosophy_note\", \"note\": \"<durable preference or constraint>\"}}\n\
+  Appends a lasting preference the user voices mid-workout (e.g. \"always prefer \
+goblet squats to barbell\", \"keep deadlifts light, my back is fragile\") to their \
+training philosophy so FUTURE /nextworkout designs respect it. Use it only for \
+durable preferences — not one-off changes to today's set.\n\
 - {{\"type\": \"get_last_exercise\", \"exercise\": \"<EXACT or fuzzy name>\"}}\n\
   Looks up the user's most recent exercise_entry for the named exercise and \
 appends a summary (resolved exercise name, start time, every set) to your reply. \
@@ -215,6 +247,16 @@ go on deadlift?\"), emit a get_last_exercise action with the exercise name. Do \
 NOT make up numbers from RECENT HISTORY — the host fetches the authoritative \
 entry and appends the summary to your reply.\n\
 - If the user mentions pain, injury, or illness, log it with log_health\n\
+- GUIDED WORKOUT: When a PRESCRIBED WORKOUT or DESIGNED WORKOUT section is present, \
+you are coaching the user through a pre-designed session like a personal trainer. \
+After you log or confirm the set the user just reported, PROACTIVELY tell them the \
+NEXT prescribed set — name, target weight and reps — with a short motivating reason \
+drawn from their history (e.g. \"last time 55kg felt easy, so let's go 60kg\"). State \
+the prescription; do not ask \"what next?\". If the user reports pain, log_health and \
+offer a lighter or substitute movement that hits the same muscles within their \
+equipment. When they voice a durable preference (\"I always prefer goblet squats\"), \
+emit append_philosophy_note so future designs honour it. The user still reports what \
+they ACTUALLY did — adjust like a real trainer if it differs from the prescription.\n\
 - Keep responses concise -- this is a chat interface\n\
 - Be encouraging but not patronizing\n\
 - All action fields use metric units (weight_kg, distance_m). If the user specifies \
@@ -289,6 +331,7 @@ Active session: {session_status}\n\
 {entries_section}\
 {leaked_section}\
 {plan_section}\
+{workout_plan_section}\
 {continuity_section}\
 {health_section}\n\
 {history_section}\n\
@@ -535,6 +578,59 @@ fn format_active_plan(plan: &Option<ActivePlanView>) -> String {
     s
 }
 
+/// Render the `/nextworkout` design for the system prompt: a "ready to start" hint
+/// before the workout begins, or live progress with the NEXT prescribed set once it
+/// is under way. Distinct from the schedule-based ACTIVE PLAN section above.
+fn format_active_workout_plan(plan: &Option<WorkoutPlanProgress>) -> String {
+    let Some(plan) = plan else {
+        return String::new();
+    };
+
+    let mut s = String::new();
+    if plan.started {
+        s.push_str(&format!("PRESCRIBED WORKOUT (guided, in progress): {}\n", plan.title));
+        if !plan.done.is_empty() {
+            s.push_str(&format!("- done so far: {}\n", plan.done.join(", ")));
+        }
+        match &plan.next {
+            Some(next) => s.push_str(&format!("- NEXT SET: {} ({} to go)\n", format_prescription(next), plan.remaining)),
+            None => s.push_str("- all prescribed exercises done — congratulate the user and offer to end the session\n"),
+        }
+    } else {
+        s.push_str(&format!("DESIGNED WORKOUT READY: {}\n", plan.title));
+        if let Some(next) = &plan.next {
+            s.push_str(&format!("- first up when they start: {}\n", format_prescription(next)));
+        }
+        s.push_str("- when the user starts their workout, walk them through it set by set\n");
+    }
+    s.push('\n');
+    s
+}
+
+/// A prescribed exercise as one compact line, e.g. "Bench Press — 3 sets 6 reps @ 65kg (push it)".
+fn format_prescription(p: &PrescribedExercise) -> String {
+    let mut parts = Vec::new();
+    if let Some(sets) = p.target_sets {
+        parts.push(format!("{sets} sets"));
+    }
+    if let Some(secs) = p.target_secs {
+        parts.push(format!("{secs}s"));
+    } else if let Some(reps) = p.target_reps {
+        parts.push(format!("{reps} reps"));
+    }
+    if let Some(w) = p.target_weight_kg {
+        parts.push(format!("@ {w:.0}kg"));
+    }
+    let mut s = p.exercise_name.clone();
+    if !parts.is_empty() {
+        s.push_str(&format!(" — {}", parts.join(" ")));
+    }
+    if let Some(notes) = p.notes.as_deref().filter(|n| !n.trim().is_empty()) {
+        s.push_str(&format!(" ({notes})"));
+    }
+    s
+}
+
 fn format_set_entry(set: &ExerciseSet, exercise_name: &str) -> String {
     let mut parts = vec![exercise_name.to_string()];
     match set.measurement_type {
@@ -689,6 +785,7 @@ mod tests {
             session_entries: vec![],
             leaked_open_entries: vec![],
             active_plan: None,
+            active_workout_plan: None,
             health_entries: vec![],
             recent_summaries: vec![],
             recent_sets: vec![],

@@ -142,6 +142,13 @@ pub enum AssistantAction {
         #[serde(default)]
         exercises: Vec<ProposedExercise>,
     },
+    /// Append a durable training preference or constraint the user voices mid-workout
+    /// (e.g. "always give me goblet squats instead of barbell") to their philosophy,
+    /// so future designs respect it.
+    AppendPhilosophyNote {
+        #[serde(alias = "content")]
+        note: String,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -423,6 +430,16 @@ mod tests {
                 assert_eq!(exercises[0].notes.as_deref(), Some("brace hard"));
             }
             _ => panic!("expected ProposeWorkout"),
+        }
+    }
+
+    #[test]
+    fn parse_append_philosophy_note() {
+        let json = r#"{"type": "append_philosophy_note", "note": "prefers goblet squats over barbell"}"#;
+        let action: AssistantAction = serde_json::from_str(json).unwrap();
+        match action {
+            AssistantAction::AppendPhilosophyNote { note } => assert!(note.contains("goblet")),
+            _ => panic!("expected AppendPhilosophyNote"),
         }
     }
 

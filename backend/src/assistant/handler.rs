@@ -18,8 +18,8 @@ use super::actions::{AssistantAction, ProposedExercise};
 use super::matching::find_exercise_type;
 use super::parser::parse_assistant_response;
 use super::prompts::{
-    ActivePlanView, EntryView, PlanExerciseView, PromptContext, SESSION_CONTINUITY_ASK_HOURS, SESSION_CONTINUITY_HOURS,
-    build_designer_prompt, build_philosophy_prompt, build_system_prompt,
+    ActivePlanView, EntryView, PlanExerciseView, PrescribedExercise, PromptContext, SESSION_CONTINUITY_ASK_HOURS,
+    SESSION_CONTINUITY_HOURS, WorkoutPlanProgress, build_designer_prompt, build_philosophy_prompt, build_system_prompt,
 };
 use gymbuddy_proto::{
     CatalogEntry, CatalogGroup, CatalogView, ExerciseLog, HealthNote, HistoryView, Measurement, PlannedExerciseView, SessionSummaryView,
@@ -741,6 +741,11 @@ impl AssistantHandler {
             None => None,
         };
 
+        // A `/nextworkout` design: bound to the current session (guided execution) or
+        // freshly designed and ready to start. Sourced from `workout_plans`, distinct
+        // from the schedule-based `active_plan` above.
+        let active_workout_plan = self.build_active_workout_plan(&db, user.id, active_session.as_ref(), &session_sets)?;
+
         // Leaked open entries: open EEs not belonging to the active session, OR open
         // entries in the active session (so the LLM can decide to close/delete before
         // a new session is requested).
@@ -773,6 +778,7 @@ impl AssistantHandler {
             session_entries,
             leaked_open_entries,
             active_plan,
+            active_workout_plan,
             health_entries,
             recent_summaries,
             recent_sets,
@@ -808,6 +814,69 @@ impl AssistantHandler {
             PlanExerciseView { exercise_name, target_sets: p.target_sets, target_reps: p.target_reps, target_weight_kg: p.target_weight_kg }
         });
         Ok(Some(ActivePlanView { name: schedule.name, completed_exercise_ids: completed_exercise_ids.to_vec(), next }))
+    }
+
+    /// Build the guided-execution view of a `/nextworkout` design. Prefers a plan
+    /// bound to the active session (guided, in progress); otherwise surfaces the most
+    /// recent designed-but-unstarted plan so the assistant can offer to run it.
+    fn build_active_workout_plan(
+        &self,
+        db: &Database,
+        user_id: i64,
+        active_session: Option<&Session>,
+        session_sets: &[(ExerciseSet, String)],
+    ) -> anyhow::Result<Option<WorkoutPlanProgress>> {
+        // Guided execution: a plan bound to the CURRENT session.
+        if let Some(session) = active_session
+            && let Some(plan) = db.active_plan_for_user(user_id)?
+            && plan.session_id == Some(session.id)
+        {
+            let logged: std::collections::HashSet<i64> = session_sets.iter().map(|(s, _)| s.exercise_type_id).collect();
+            return Ok(Some(self.workout_plan_progress(db, &plan, &logged, true)?));
+        }
+
+        // Otherwise a freshly designed plan ready to start.
+        if let Some(plan) = db.latest_proposed_plan(user_id)? {
+            return Ok(Some(self.workout_plan_progress(db, &plan, &std::collections::HashSet::new(), false)?));
+        }
+
+        Ok(None)
+    }
+
+    /// Compute done/next/remaining for `plan`, treating any prescribed exercise whose
+    /// type appears in `logged` as done.
+    fn workout_plan_progress(
+        &self,
+        db: &Database,
+        plan: &crate::db::WorkoutPlan,
+        logged: &std::collections::HashSet<i64>,
+        started: bool,
+    ) -> anyhow::Result<WorkoutPlanProgress> {
+        let exercises = db.list_plan_exercises(plan.id)?;
+        let mut done = Vec::new();
+        let mut next = None;
+        for ex in &exercises {
+            let name = self
+                .catalogue
+                .iter()
+                .find(|e| e.exercise_type.id == ex.exercise_type_id)
+                .map(|e| e.exercise_type.name.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            if logged.contains(&ex.exercise_type_id) {
+                done.push(name);
+            } else if next.is_none() {
+                next = Some(PrescribedExercise {
+                    exercise_name: name,
+                    target_sets: ex.target_sets,
+                    target_reps: ex.target_reps,
+                    target_weight_kg: ex.target_weight_kg,
+                    target_secs: ex.target_secs,
+                    notes: ex.notes.clone(),
+                });
+            }
+        }
+        let remaining = exercises.len().saturating_sub(done.len());
+        Ok(WorkoutPlanProgress { title: plan.title.clone(), started, done, next, remaining })
     }
 
     async fn call_llm(&self, system_prompt: &str, history: &[crate::db::ConversationMessage], user_text: &str) -> anyhow::Result<String> {
@@ -934,6 +1003,8 @@ impl AssistantHandler {
                 let combined_notes = combine_plan_with_notes(plan.as_deref(), notes.as_deref());
                 let session = db.start_session(user.id, combined_notes.as_deref())?;
                 tracing::debug!(id = session.id, plan = ?plan, "Started session");
+                // Begin guided execution if the user just designed a workout.
+                self.bind_proposed_plan(&db, user.id, session.id)?;
                 Ok(ActionOutcome::none())
             }
             AssistantAction::EndSession => {
@@ -941,6 +1012,12 @@ impl AssistantHandler {
                 if let Some(session) = db.get_active_session(user.id)? {
                     tracing::debug!(id = session.id, "Ending session");
                     db.end_session(session.id)?;
+                    // Complete a guided workout plan bound to this session.
+                    if let Some(plan) = db.active_plan_for_user(user.id)?
+                        && plan.session_id == Some(session.id)
+                    {
+                        db.set_plan_status(plan.id, crate::db::PlanStatus::Completed)?;
+                    }
                 } else {
                     tracing::debug!("No active session to end");
                 }
@@ -1014,6 +1091,10 @@ impl AssistantHandler {
                 tracing::debug!("Ignoring propose_workout outside /nextworkout");
                 Ok(ActionOutcome::none())
             }
+            AssistantAction::AppendPhilosophyNote { note } => {
+                self.db.lock().await.append_philosophy_note(user.id, note)?;
+                Ok(Some("Noted for future workouts.".to_string()).into())
+            }
             AssistantAction::Unknown => {
                 tracing::debug!("Ignoring unknown action type from LLM");
                 Ok(ActionOutcome::none())
@@ -1056,7 +1137,21 @@ impl AssistantHandler {
         // for this user are leaks from a previously-ended session. Close them
         // silently before starting fresh.
         self.silent_close_leaked_entries(user.id).await?;
-        self.db.lock().await.start_session(user.id, None)
+        let db = self.db.lock().await;
+        let session = db.start_session(user.id, None)?;
+        // Logging the first prescribed exercise auto-starts the guided workout.
+        self.bind_proposed_plan(&db, user.id, session.id)?;
+        Ok(session)
+    }
+
+    /// After a session starts, bind the most recent designed (proposed) workout to it
+    /// so guided execution begins. No-op when there is no proposed plan.
+    fn bind_proposed_plan(&self, db: &Database, user_id: i64, session_id: i64) -> anyhow::Result<()> {
+        if let Some(plan) = db.latest_proposed_plan(user_id)? {
+            db.bind_plan_to_session(plan.id, session_id)?;
+            tracing::debug!(plan_id = plan.id, session_id, "Bound designed workout to session for guided execution");
+        }
+        Ok(())
     }
 
     /// Decide which `exercise_entry` a logged set belongs to.
@@ -2972,5 +3067,74 @@ mod tests {
         let db = handler.db.lock().await;
         let plan = db.latest_proposed_plan(user.id).unwrap().unwrap();
         assert_eq!(db.list_plan_exercises(plan.id).unwrap().len(), 1, "only the resolved exercise is persisted");
+    }
+
+    /// Register a user, give them a philosophy, design a one-exercise workout, then
+    /// start a session — returning the user once a guided plan is bound.
+    async fn start_guided_workout(handler: &AssistantHandler, llm: &MockLlm, msg: &TgMessage) -> User {
+        let _ = handler.handle_text_message(msg, "hello").await.unwrap();
+        let user = { handler.db.lock().await.get_user_by_telegram_id("12345").unwrap().unwrap() };
+        {
+            handler.db.lock().await.insert_philosophy(user.id, "5x5, dumbbells to 24kg", "interview").unwrap();
+        }
+        llm.set_response(
+            r#"{"message": "Here's your session.", "actions": [
+                {"type": "propose_workout", "title": "Push", "exercises": [
+                    {"exercise": "Bench Press", "target_sets": 3, "target_reps": 6, "target_weight_kg": 60.0}
+                ]}
+            ]}"#,
+        );
+        let _ = handler.handle_text_message(msg, "/nextworkout").await.unwrap();
+        llm.set_response(r#"{"message": "Let's go!", "actions": [{"type": "start_session"}]}"#);
+        let _ = handler.handle_text_message(msg, "let's start the workout").await.unwrap();
+        user
+    }
+
+    #[tokio::test]
+    async fn starting_a_session_binds_the_designed_plan_and_prescribes() {
+        let (handler, llm) = setup_handler("").await;
+        let msg = make_message(12345, "hello");
+        let user = start_guided_workout(&handler, &llm, &msg).await;
+
+        {
+            let db = handler.db.lock().await;
+            let plan = db.active_plan_for_user(user.id).unwrap().expect("plan should be active after start");
+            let session = db.get_active_session(user.id).unwrap().unwrap();
+            assert_eq!(plan.session_id, Some(session.id), "plan bound to the session");
+            assert!(db.latest_proposed_plan(user.id).unwrap().is_none(), "no longer 'proposed' once active");
+        }
+
+        // The next turn's system prompt carries the guided prescription.
+        llm.set_response(r#"{"message": "ok", "actions": []}"#);
+        let _ = handler.handle_text_message(&msg, "ready").await.unwrap();
+        let last = llm.recorded_requests().pop().unwrap();
+        let system = &last.messages[0].content;
+        assert!(system.contains("PRESCRIBED WORKOUT"), "guided section should be in the prompt");
+        assert!(system.contains("Bench Press"));
+    }
+
+    #[tokio::test]
+    async fn mid_workout_note_appends_to_philosophy_and_end_completes_plan() {
+        let (handler, llm) = setup_handler("").await;
+        let msg = make_message(12345, "hello");
+        let user = start_guided_workout(&handler, &llm, &msg).await;
+        let plan_id = handler.db.lock().await.active_plan_for_user(user.id).unwrap().unwrap().id;
+
+        // A durable preference voiced mid-workout is appended to the philosophy.
+        llm.set_response(r#"{"message": "Got it.", "actions": [{"type": "append_philosophy_note", "note": "prefers goblet squats"}]}"#);
+        let reply = handler.handle_text_message(&msg, "I always prefer goblet squats").await.unwrap();
+        assert!(shown(&reply).contains("Noted for future workouts"));
+        {
+            let latest = handler.db.lock().await.latest_philosophy(user.id).unwrap().unwrap();
+            assert!(latest.content.contains("goblet squats"));
+            assert_eq!(latest.source, "note");
+        }
+
+        // Ending the session completes the bound plan.
+        llm.set_response(r#"{"message": "Nice work!", "actions": [{"type": "end_session"}]}"#);
+        let _ = handler.handle_text_message(&msg, "done").await.unwrap();
+        let db = handler.db.lock().await;
+        assert!(db.active_plan_for_user(user.id).unwrap().is_none());
+        assert_eq!(db.get_plan(plan_id).unwrap().unwrap().status, crate::db::PlanStatus::Completed);
     }
 }
