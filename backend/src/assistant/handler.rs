@@ -138,7 +138,7 @@ impl AssistantHandler {
 
     pub async fn handle_message_for_user(&self, user: &User, text: &str, platform: &str) -> anyhow::Result<Reply> {
         if let Some(reply) = self.handle_command(text, user, platform).await? {
-            return Ok(reply.into());
+            return Ok(reply);
         }
 
         self.close_stale_session(user).await?;
@@ -275,27 +275,32 @@ impl AssistantHandler {
         )
     }
 
-    async fn handle_command(&self, text: &str, user: &User, platform: &str) -> anyhow::Result<Option<View>> {
+    /// Handle a slash command, if `text` is one. Most commands map straight to a
+    /// [`View`]; `/timers` additionally rides a [`TimerSignal`] so disabling it can
+    /// cancel an in-flight rest, hence the [`Reply`] return.
+    async fn handle_command(&self, text: &str, user: &User, platform: &str) -> anyhow::Result<Option<Reply>> {
         let cmd = text.split_whitespace().next().unwrap_or("").to_lowercase();
         match cmd.as_str() {
-            "/start" => Ok(Some(View::notice(self.cmd_start(user)))),
-            "/help" => Ok(Some(View::notice(Self::cmd_help(user)))),
-            "/status" => Ok(Some(self.cmd_status(user).await?)),
-            "/history" => Ok(Some(View::History(self.cmd_history(user).await?))),
-            "/exercises" => Ok(Some(View::Catalog(self.cmd_exercises()))),
-            "/clear" => Ok(Some(View::notice(self.cmd_clear(user, platform).await?))),
+            "/start" => Ok(Some(View::notice(self.cmd_start(user)).into())),
+            "/help" => Ok(Some(View::notice(Self::cmd_help(user)).into())),
+            "/status" => Ok(Some(self.cmd_status(user).await?.into())),
+            "/history" => Ok(Some(View::History(self.cmd_history(user).await?).into())),
+            "/exercises" => Ok(Some(View::Catalog(self.cmd_exercises()).into())),
+            "/clear" => Ok(Some(View::notice(self.cmd_clear(user, platform).await?).into())),
             "/timers" => Ok(Some(self.cmd_timers(user).await?)),
-            "/feedback" => self.cmd_feedback(user, text).await,
+            "/feedback" => Ok(self.cmd_feedback(user, text).await?.map(Into::into)),
             _ => Ok(None),
         }
     }
 
     /// Toggle the user's rest-timer preference and report the new state. As a user
     /// preference it persists across sessions, so it works with or without an active
-    /// workout and survives ending one and starting the next.
-    async fn cmd_timers(&self, user: &User) -> anyhow::Result<View> {
+    /// workout and survives ending one and starting the next. Disabling also cancels
+    /// any rest already counting down; enabling has nothing to arm until the next set.
+    async fn cmd_timers(&self, user: &User) -> anyhow::Result<Reply> {
         let enabled = self.db.lock().await.set_user_timers(user.id, !user.timers_enabled)?;
-        Ok(View::Timers { enabled })
+        let timer = (!enabled).then_some(TimerSignal::Cancel);
+        Ok(Reply { view: View::Timers { enabled }, timer })
     }
 
     fn cmd_start(&self, user: &User) -> String {
@@ -2144,6 +2149,23 @@ mod tests {
         let session = db.get_active_session(user.id).unwrap().unwrap();
         let entries = db.list_entries_for_session(session.id).unwrap();
         assert!(entries[0].end_timestamp.is_some(), "≥3-set close should succeed without pushback");
+    }
+
+    #[tokio::test]
+    async fn timers_command_cancels_only_on_disable() {
+        let (handler, _llm) = setup_handler(r#"{"message": "ok", "actions": []}"#).await;
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "hello").await.unwrap(); // register (defaults timers on)
+
+        // First /timers disables, which must cancel any rest already counting down.
+        let off = handler.handle_text_message(&msg, "/timers").await.unwrap();
+        assert!(shown(&off).contains("now off"));
+        assert_eq!(off.timer, Some(TimerSignal::Cancel), "disabling must cancel an in-flight rest");
+
+        // Re-enabling has nothing to arm until the next set, so no timer directive.
+        let on = handler.handle_text_message(&msg, "/timers").await.unwrap();
+        assert!(shown(&on).contains("now on"));
+        assert!(on.timer.is_none(), "enabling must not emit a timer directive");
     }
 
     #[tokio::test]
