@@ -592,9 +592,7 @@ impl AssistantHandler {
                     s.comment = comment.clone();
                     db.insert_set(&s)?;
                 }
-                let suffix = self.set_count_checkpoint_suffix(entry_id, &et.exercise_type.name).await?;
-                let timer = self.arm_rest_timer(user, &session, &et.exercise_type.name, pd).await?;
-                Ok(ActionOutcome { suffix, timer })
+                self.finish_logged_set(user, &session, entry_id, &et.exercise_type.name, pd).await
             }
             AssistantAction::LogExerciseTimed { exercise, duration_secs, perceived_difficulty, comment, superset } => {
                 let et = find_exercise_type(&self.catalogue, exercise).ok_or_else(|| anyhow::anyhow!("Unknown exercise: {exercise}"))?;
@@ -610,9 +608,7 @@ impl AssistantHandler {
                 s.perceived_difficulty = pd;
                 s.comment = comment.clone();
                 self.db.lock().await.insert_set(&s)?;
-                let suffix = self.set_count_checkpoint_suffix(entry_id, &et.exercise_type.name).await?;
-                let timer = self.arm_rest_timer(user, &session, &et.exercise_type.name, pd).await?;
-                Ok(ActionOutcome { suffix, timer })
+                self.finish_logged_set(user, &session, entry_id, &et.exercise_type.name, pd).await
             }
             AssistantAction::LogExerciseDistance { exercise, distance_m, duration_secs, perceived_difficulty, comment, superset } => {
                 let et = find_exercise_type(&self.catalogue, exercise).ok_or_else(|| anyhow::anyhow!("Unknown exercise: {exercise}"))?;
@@ -630,9 +626,7 @@ impl AssistantHandler {
                 s.perceived_difficulty = pd;
                 s.comment = comment.clone();
                 self.db.lock().await.insert_set(&s)?;
-                let suffix = self.set_count_checkpoint_suffix(entry_id, &et.exercise_type.name).await?;
-                let timer = self.arm_rest_timer(user, &session, &et.exercise_type.name, pd).await?;
-                Ok(ActionOutcome { suffix, timer })
+                self.finish_logged_set(user, &session, entry_id, &et.exercise_type.name, pd).await
             }
             AssistantAction::StartSession { notes, plan } => {
                 let db = self.db.lock().await;
@@ -738,16 +732,30 @@ impl AssistantHandler {
     }
 
     /// Build the rest-timer arm directive for a just-logged set, or `None` when the
-    /// user has timers disabled. Superset detection mirrors the rest of the
-    /// codebase: ≥2 simultaneously-open entries means a superset (flat shorter rest),
-    /// otherwise the perceived difficulty sets the duration.
+    /// user has timers disabled. A superset (≥2 open entries) gets the flat shorter
+    /// rest; otherwise the perceived difficulty sets the duration.
     async fn arm_rest_timer(&self, user: &User, session: &Session, exercise: &str, difficulty: Difficulty) -> anyhow::Result<Option<TimerSignal>> {
         if !user.timers_enabled {
             return Ok(None);
         }
-        let is_superset = self.db.lock().await.list_open_entries_for_session(session.id)?.len() >= 2;
+        let is_superset = self.db.lock().await.is_supersetting(session.id)?;
         let duration_secs = self.config.rest_timer.rest_secs_for(Some(difficulty), is_superset);
         Ok(Some(TimerSignal::Arm { duration_secs, exercise: exercise.to_string() }))
+    }
+
+    /// Shared trailer for the three log-set actions: the set-count checkpoint suffix
+    /// plus the rest-timer arm directive, bundled into the action outcome.
+    async fn finish_logged_set(
+        &self,
+        user: &User,
+        session: &Session,
+        entry_id: i64,
+        exercise: &str,
+        difficulty: Difficulty,
+    ) -> anyhow::Result<ActionOutcome> {
+        let suffix = self.set_count_checkpoint_suffix(entry_id, exercise).await?;
+        let timer = self.arm_rest_timer(user, session, exercise, difficulty).await?;
+        Ok(ActionOutcome { suffix, timer })
     }
 
     async fn ensure_session(&self, user: &User) -> anyhow::Result<crate::db::Session> {
