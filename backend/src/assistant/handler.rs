@@ -90,6 +90,28 @@ enum LogEntryTarget {
     AskSuperset { ongoing_exercise: String },
 }
 
+/// Outcome of a close-entry action. Distinguishes a real close (the entry ended,
+/// so the rest timer should be canceled) from the premature-close pushback (the
+/// entry is still open and the user is still resting, so the timer keeps running).
+enum CloseOutcome {
+    /// The entry was ended.
+    Closed,
+    /// Fewer than 3 sets and unconfirmed: entry left open, carrying this pushback
+    /// suffix.
+    Pushback(String),
+}
+
+impl CloseOutcome {
+    /// Map to the action outcome: a real close cancels the timer; a pushback only
+    /// surfaces its suffix and leaves any in-flight rest running.
+    fn into_action_outcome(self) -> ActionOutcome {
+        match self {
+            CloseOutcome::Closed => ActionOutcome::cancel(),
+            CloseOutcome::Pushback(suffix) => ActionOutcome::from(Some(suffix)),
+        }
+    }
+}
+
 impl AssistantHandler {
     pub async fn new(db: Arc<Mutex<Database>>, llm: Box<dyn LlmProvider>, config: GymConfig) -> anyhow::Result<Self> {
         Self::new_with_reporter(db, llm, config, None).await
@@ -667,14 +689,12 @@ impl AssistantHandler {
                 // Resting is over once the session ends.
                 Ok(ActionOutcome::cancel())
             }
-            AssistantAction::CloseExerciseEntry { exercise, entry_id } => Ok(ActionOutcome {
-                suffix: self.close_exercise_entry_action(user, exercise.as_deref(), *entry_id, false).await?,
-                timer: Some(TimerSignal::Cancel),
-            }),
-            AssistantAction::ConfirmCloseExerciseEntry { exercise, entry_id } => Ok(ActionOutcome {
-                suffix: self.close_exercise_entry_action(user, exercise.as_deref(), *entry_id, true).await?,
-                timer: Some(TimerSignal::Cancel),
-            }),
+            AssistantAction::CloseExerciseEntry { exercise, entry_id } => {
+                Ok(self.close_exercise_entry_action(user, exercise.as_deref(), *entry_id, false).await?.into_action_outcome())
+            }
+            AssistantAction::ConfirmCloseExerciseEntry { exercise, entry_id } => {
+                Ok(self.close_exercise_entry_action(user, exercise.as_deref(), *entry_id, true).await?.into_action_outcome())
+            }
             AssistantAction::DeleteExerciseEntry { entry_id } => {
                 let db = self.db.lock().await;
                 let entry = db.get_entry(*entry_id)?.ok_or_else(|| anyhow::anyhow!("entry {entry_id} not found"))?;
@@ -807,15 +827,15 @@ impl AssistantHandler {
 
     /// Resolve an entry to close (explicit id > exercise-name match > most recent
     /// open in the active session). When `confirm` is false and the resolved entry
-    /// has fewer than 3 sets, returns the pushback suffix and leaves the entry
-    /// open.
+    /// has fewer than 3 sets, returns [`CloseOutcome::Pushback`] and leaves the
+    /// entry open; otherwise ends it and returns [`CloseOutcome::Closed`].
     async fn close_exercise_entry_action(
         &self,
         user: &User,
         exercise: Option<&str>,
         entry_id: Option<i64>,
         confirm: bool,
-    ) -> anyhow::Result<Option<String>> {
+    ) -> anyhow::Result<CloseOutcome> {
         let db = self.db.lock().await;
         let active = db.get_active_session(user.id)?;
         let resolved = if let Some(id) = entry_id {
@@ -844,10 +864,10 @@ impl AssistantHandler {
                 "You've only done {count} {sets} of {name}. You should really push for one more! Should we keep going?",
                 sets = if count == 1 { "set" } else { "sets" },
             );
-            return Ok(Some(suffix));
+            return Ok(CloseOutcome::Pushback(suffix));
         }
         db.end_entry(resolved.id)?;
-        Ok(None)
+        Ok(CloseOutcome::Closed)
     }
 
     /// Edit a recently-logged set. Resolves the target by recency, optionally
@@ -2062,6 +2082,8 @@ mod tests {
         );
         let reply = handler.handle_text_message(&msg, "close bench").await.unwrap();
         assert!(shown(&reply).contains("You've only done 2 sets of Bench Press. You should really push for one more! Should we keep going?"));
+        // The entry stays open, so the in-flight rest timer must keep running.
+        assert!(reply.timer.is_none(), "pushback must not cancel the rest timer");
 
         let db = handler.db.lock().await;
         let user = db.get_user_by_telegram_id("12345").unwrap().unwrap();
@@ -2113,7 +2135,9 @@ mod tests {
                 {"type": "close_exercise_entry", "exercise": "Bench Press"}
             ]}"#,
         );
-        let _ = handler.handle_text_message(&msg, "move on").await.unwrap();
+        let reply = handler.handle_text_message(&msg, "move on").await.unwrap();
+        // A real close ends the entry, so the rest timer is canceled.
+        assert_eq!(reply.timer, Some(TimerSignal::Cancel), "a real close cancels the rest timer");
 
         let db = handler.db.lock().await;
         let user = db.get_user_by_telegram_id("12345").unwrap().unwrap();
