@@ -157,6 +157,14 @@ was my last bench press?\", \"when did I last squat?\"). Do NOT invent numbers \
 from RECENT HISTORY — emit the action and let the host fetch the authoritative \
 entry. If the user gave a parent or muscle-group word the host falls back to the \
 nearest descendant that has been logged.\n\
+- {{\"type\": \"explain_exercise\", \"exercise\": \"<EXACT or fuzzy NAME from \
+the AVAILABLE EXERCISES list>\"}}\n\
+  Emit this whenever the user asks how to perform an exercise, asks about its \
+form, technique, cues, common mistakes, or which muscles it works. Set \
+`exercise` to the closest matching catalogue name. Keep your own `message` to \
+a one-line acknowledgement; the host will append the technique explanation OR \
+a refusal if the exercise isn't in the catalogue. Do NOT write the form \
+answer yourself in `message`.\n\
 \n\
 EXERCISE TAXONOMY: Exercises are organised in a 4-level tree: muscle_group → \
 specific_muscle → exercise → variation. Users can log against any level.\n\
@@ -267,6 +275,15 @@ Format each line as the exercise name followed by its sets in \
 parentheses, e.g. \"Bench Press (3 sets: 32kg x 10, 40kg x 8, 50kg x \
 8)\". Use a real newline between entries; never run multiple exercises \
 together on one line.\n\
+\n\
+FORM / TECHNIQUE QUESTIONS:\n\
+When the user asks how to perform an exercise, asks about its form, technique, \
+cues, common mistakes, or which muscles it works, emit ONE explain_exercise \
+action with the closest matching catalogue name and keep your own `message` to \
+a short one-line acknowledgement. Do NOT write the form/technique answer in \
+your own `message` — the host generates it from a focused explainer and \
+appends it to your reply. If the exercise is not in the catalogue, still emit \
+the action with the user's wording; the host will return a polite refusal.\n\
 \n\
 COLLECTING DATA BEFORE LOGGING:\n\
 This rule applies ONLY to data-collection actions (log_exercise, log_exercise_timed, \
@@ -462,6 +479,49 @@ choose the closest available exercise and note the substitution in the rationale
 AVAILABLE EXERCISES:\n\
 {exercise_list}",
         philosophy_section = format_philosophy_section(philosophy),
+    )
+}
+
+/// Focused prompt for the second "explainer" LLM call triggered by an
+/// `explain_exercise` action. Returns the SAME JSON envelope the main assistant
+/// uses (`{"message": "...", "actions": []}`) so the host can reuse
+/// `parse_assistant_response` — `call_llm_with` forces `json_mode: true` for
+/// every call site, so a plain-prose reply would be malformed.
+pub fn build_explainer_prompt(et: &ExerciseTypeWithAncestry) -> String {
+    let name = &et.exercise_type.name;
+    let muscle_group = et.muscle_group.as_deref().unwrap_or("(unspecified)");
+    let specific_muscle = et.specific_muscle.as_deref().unwrap_or("(unspecified)");
+    let parent_exercise = et.exercise.as_deref().unwrap_or("(none)");
+    let purpose = et.exercise_type.purpose.as_deref().unwrap_or("(unspecified)");
+    let measurement = et.exercise_type.measurement_type.map(|m| m.as_str()).unwrap_or("weight_reps");
+
+    format!(
+        "You are a personal gym coach explaining ONE specific exercise to the user. \
+You are NOT logging anything, NOT starting a session, and NOT recommending other \
+exercises. Stay narrowly on this exercise's form and execution.\n\
+\n\
+EXERCISE: \"{name}\"\n\
+- muscle group: {muscle_group}\n\
+- specific muscle: {specific_muscle}\n\
+- parent exercise: {parent_exercise}\n\
+- training purpose: {purpose}\n\
+- measurement: {measurement}\n\
+\n\
+RESPONSE FORMAT: You MUST respond with ONLY a JSON object. No text before or after.\n\
+{{\n\
+  \"message\": \"<the technique explanation, as plain prose>\",\n\
+  \"actions\": []\n\
+}}\n\
+\n\
+Inside `message`, cover, in this order, as continuous plain prose (no markdown \
+headings, no bullet markers, no asterisks):\n\
+1. A brief setup — body position and starting stance.\n\
+2. 3-4 key execution cues.\n\
+3. Which muscles are primarily worked.\n\
+4. 1-2 common mistakes to avoid.\n\
+\n\
+Stay under ~120 words. Be concrete and specific to {name} — do NOT explain a \
+different exercise. `actions` MUST be an empty array."
     )
 }
 
@@ -926,5 +986,24 @@ mod tests {
         let ctx = base_context();
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("get_last_exercise"), "prompt must advertise the get_last_exercise action");
+    }
+
+    #[test]
+    fn prompt_describes_explain_exercise_action() {
+        let ctx = base_context();
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("explain_exercise"), "prompt must advertise the explain_exercise action");
+        assert!(prompt.contains("FORM / TECHNIQUE QUESTIONS"), "prompt must include the FORM / TECHNIQUE guideline section");
+    }
+
+    #[test]
+    fn explainer_prompt_includes_exercise_metadata() {
+        let et = make_exercise_type(1, "Romanian Deadlift", "rdl", "Legs", MeasurementType::WeightReps);
+        let prompt = build_explainer_prompt(&et);
+        assert!(prompt.contains("Romanian Deadlift"), "explainer prompt must name the exercise");
+        assert!(prompt.contains("Legs"), "explainer prompt must include the muscle group");
+        // Pin the JSON envelope contract so a future edit that drops it is caught.
+        assert!(prompt.contains("\"message\""), "explainer prompt must require the message field");
+        assert!(prompt.contains("\"actions\": []"), "explainer prompt must require an empty actions array");
     }
 }

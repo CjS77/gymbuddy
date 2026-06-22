@@ -19,7 +19,8 @@ use super::matching::find_exercise_type;
 use super::parser::parse_assistant_response;
 use super::prompts::{
     ActivePlanView, EntryView, PlanExerciseView, PrescribedExercise, PromptContext, SESSION_CONTINUITY_ASK_HOURS,
-    SESSION_CONTINUITY_HOURS, WorkoutPlanProgress, build_designer_prompt, build_philosophy_prompt, build_system_prompt,
+    SESSION_CONTINUITY_HOURS, WorkoutPlanProgress, build_designer_prompt, build_explainer_prompt, build_philosophy_prompt,
+    build_system_prompt,
 };
 use gymbuddy_proto::{
     CatalogEntry, CatalogGroup, CatalogView, ExerciseLog, HealthNote, HistoryView, Measurement, PlannedExerciseView, SessionSummaryView,
@@ -1091,6 +1092,7 @@ impl AssistantHandler {
                 self.db.lock().await.append_philosophy_note(user.id, note)?;
                 Ok(Some("Noted for future workouts.".to_string()).into())
             }
+            AssistantAction::ExplainExercise { exercise } => Ok(self.explain_exercise_action(exercise).await?.into()),
             AssistantAction::Unknown => {
                 tracing::debug!("Ignoring unknown action type from LLM");
                 Ok(ActionOutcome::none())
@@ -1382,6 +1384,27 @@ impl AssistantHandler {
             )
         };
         Ok(Some(suffix))
+    }
+
+    /// Generate a form / technique explanation for a catalogue exercise via a
+    /// focused second LLM call. Off-catalogue names return a fixed refusal with
+    /// no LLM call, which is the host-side gate that enforces the issue's
+    /// acceptance criterion ("no answer is generated for exercises outside the
+    /// permitted set, regardless of how the question is phrased").
+    async fn explain_exercise_action(&self, exercise: &str) -> anyhow::Result<Option<String>> {
+        let Some(et) = find_exercise_type(&self.catalogue, exercise) else {
+            return Ok(Some(format!(
+                "I'm not familiar with \"{exercise}\" — I can only explain exercises from my catalogue. \
+                 Try /exercises to see what I know."
+            )));
+        };
+        let prompt = build_explainer_prompt(et);
+        let response = self
+            .call_llm_with(&prompt, &[], "Explain this exercise.", 512, 0.2)
+            .await
+            .context("explainer LLM call failed")?;
+        let parsed = parse_assistant_response(&response);
+        Ok(Some(crate::text::strip_markdown(&parsed.message)))
     }
 
     /// Set-count checkpoint: every time the user logs a set in an open entry that
@@ -1877,17 +1900,33 @@ mod tests {
     }
 
     struct MockLlm {
-        response: std::sync::Mutex<String>,
+        responses: std::sync::Mutex<std::collections::VecDeque<String>>,
         recorded: std::sync::Mutex<Vec<LlmRequest>>,
     }
 
     impl MockLlm {
         fn new(response: &str) -> Self {
-            Self { response: std::sync::Mutex::new(response.to_string()), recorded: std::sync::Mutex::new(Vec::new()) }
+            let mut q = std::collections::VecDeque::new();
+            q.push_back(response.to_string());
+            Self { responses: std::sync::Mutex::new(q), recorded: std::sync::Mutex::new(Vec::new()) }
         }
 
         fn set_response(&self, response: &str) {
-            *self.response.lock().unwrap() = response.to_string();
+            let mut q = self.responses.lock().unwrap();
+            q.clear();
+            q.push_back(response.to_string());
+        }
+
+        /// Queue an ordered sequence of responses for back-to-back LLM calls.
+        /// The first call pops the front, the next pops the new front, etc. The
+        /// last response is held (not popped) so any extra calls keep returning
+        /// it, matching `set_response`'s single-response semantics.
+        fn push_responses(&self, items: &[&str]) {
+            let mut q = self.responses.lock().unwrap();
+            q.clear();
+            for item in items {
+                q.push_back((*item).to_string());
+            }
         }
 
         fn recorded_requests(&self) -> Vec<LlmRequest> {
@@ -1899,7 +1938,15 @@ mod tests {
     impl LlmProvider for MockLlm {
         async fn complete(&self, request: LlmRequest) -> anyhow::Result<LlmResponse> {
             self.recorded.lock().unwrap().push(request);
-            Ok(LlmResponse { content: self.response.lock().unwrap().clone() })
+            let content = {
+                let mut q = self.responses.lock().unwrap();
+                if q.len() > 1 {
+                    q.pop_front().unwrap()
+                } else {
+                    q.front().cloned().unwrap_or_default()
+                }
+            };
+            Ok(LlmResponse { content })
         }
     }
 
@@ -2876,6 +2923,79 @@ mod tests {
         let view = handler.handle_text_message(&msg, "what was my last bench press?").await.unwrap();
         let (reply, _) = Telegram.render(&view.view);
         assert!(reply.to_lowercase().contains("haven't logged"), "expected not-found phrasing, got: {reply}");
+    }
+
+    // ─── explain_exercise ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn explain_exercise_known_returns_explanation() {
+        let (handler, llm) = setup_handler(r#"{"message": "ok", "actions": []}"#).await;
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
+
+        llm.push_responses(&[
+            r#"{"message": "Sure, here's how to do a Romanian Deadlift.", "actions": [
+                {"type": "explain_exercise", "exercise": "Romanian Deadlift"}
+            ]}"#,
+            r#"{"message": "Setup: feet hip-width, bar at mid-shin. Hinge at the hips, keeping a soft knee bend, and lower the bar along your thighs until you feel a hamstring stretch. Drive your hips through to stand. Primary muscles: hamstrings and glutes. Common mistake: rounding the lower back as you descend.", "actions": []}"#,
+        ]);
+
+        let before = llm.recorded_requests().len();
+        let view = handler.handle_text_message(&msg, "how do I do a Romanian Deadlift?").await.unwrap();
+        let (reply, _) = Telegram.render(&view.view);
+
+        assert!(reply.contains("Sure"), "reply must contain the assistant's acknowledgement, got: {reply}");
+        assert!(reply.contains("hamstring"), "reply must contain the explainer's content, got: {reply}");
+        assert_eq!(llm.recorded_requests().len() - before, 2, "exactly two LLM calls (main + explainer) must be recorded");
+    }
+
+    #[tokio::test]
+    async fn explain_exercise_unknown_returns_refusal() {
+        let (handler, llm) = setup_handler(r#"{"message": "ok", "actions": []}"#).await;
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
+
+        llm.set_response(
+            r#"{"message": "Looking that up.", "actions": [
+                {"type": "explain_exercise", "exercise": "Underwater Basket Weaving"}
+            ]}"#,
+        );
+
+        let before = llm.recorded_requests().len();
+        let view = handler.handle_text_message(&msg, "how do I do underwater basket weaving?").await.unwrap();
+        let (reply, _) = Telegram.render(&view.view);
+
+        assert!(reply.contains("I'm not familiar with"), "reply must contain the catalogue refusal, got: {reply}");
+        assert_eq!(
+            llm.recorded_requests().len() - before,
+            1,
+            "exactly one LLM call must be recorded — the host gate must short-circuit before the explainer",
+        );
+    }
+
+    #[tokio::test]
+    async fn explain_exercise_alias_resolves() {
+        let (handler, llm) = setup_handler(r#"{"message": "ok", "actions": []}"#).await;
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
+
+        llm.push_responses(&[
+            r#"{"message": "Here you go.", "actions": [
+                {"type": "explain_exercise", "exercise": "rdl"}
+            ]}"#,
+            r#"{"message": "Stand tall, hinge at the hips, lower the bar.", "actions": []}"#,
+        ]);
+
+        let before = llm.recorded_requests().len();
+        let _ = handler.handle_text_message(&msg, "form on rdl?").await.unwrap();
+
+        let recorded = llm.recorded_requests();
+        assert_eq!(recorded.len() - before, 2, "alias path must still trigger the second LLM call");
+        let explainer_system = recorded.last().unwrap().messages.first().unwrap().content.clone();
+        assert!(
+            explainer_system.contains("Romanian Deadlift"),
+            "explainer prompt must name the canonical exercise after alias resolution, got: {explainer_system}",
+        );
     }
 
     // ─── /exercises rendering ────────────────────────────────────────────────

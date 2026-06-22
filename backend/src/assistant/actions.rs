@@ -149,6 +149,16 @@ pub enum AssistantAction {
         #[serde(alias = "content")]
         note: String,
     },
+    /// Free-text question about an exercise's form, technique, cues, muscles
+    /// worked, or common mistakes. The host resolves `exercise` against the
+    /// catalogue via `find_exercise_type` and either generates the answer via
+    /// a focused explainer LLM call (resolved) or returns a fixed refusal
+    /// (unresolved). The LLM's own `message` should be a brief acknowledgement
+    /// only; the technique content is appended by the host.
+    ExplainExercise {
+        #[serde(alias = "name", alias = "exercise_name")]
+        exercise: String,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -430,6 +440,26 @@ mod tests {
                 assert_eq!(exercises[0].notes.as_deref(), Some("brace hard"));
             }
             _ => panic!("expected ProposeWorkout"),
+        }
+    }
+
+    #[test]
+    fn parse_explain_exercise() {
+        let json = r#"{"type": "explain_exercise", "exercise": "Romanian Deadlift"}"#;
+        let action: AssistantAction = serde_json::from_str(json).unwrap();
+        match action {
+            AssistantAction::ExplainExercise { exercise } => assert_eq!(exercise, "Romanian Deadlift"),
+            _ => panic!("expected ExplainExercise"),
+        }
+    }
+
+    #[test]
+    fn parse_explain_exercise_name_alias() {
+        let json = r#"{"type": "explain_exercise", "name": "Squat"}"#;
+        let action: AssistantAction = serde_json::from_str(json).unwrap();
+        match action {
+            AssistantAction::ExplainExercise { exercise } => assert_eq!(exercise, "Squat"),
+            _ => panic!("expected ExplainExercise"),
         }
     }
 
