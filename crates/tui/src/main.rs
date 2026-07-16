@@ -7,6 +7,7 @@
 mod app;
 mod audio;
 mod config;
+mod history;
 mod render;
 mod ui;
 
@@ -26,6 +27,7 @@ use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, d
 
 use crate::app::{Action, App};
 use crate::config::{Cli, ResolvedConfig};
+use crate::history::History;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -54,6 +56,11 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
+/// Load the prompt history, run the session, then write the history back.
+///
+/// The save deliberately wraps [`event_loop`] rather than sitting at its end:
+/// the loop bails out on a send or event-stream error, and a session that ended
+/// badly is exactly one whose history you still want.
 async fn run(
     terminal: &mut Tui,
     client: &GymClient,
@@ -62,6 +69,27 @@ async fn run(
     timezone: Option<String>,
 ) -> anyhow::Result<()> {
     let mut app = App::new(client.my_pubkey_hex().to_string(), name, timezone);
+    let history_path = history::path_for(&app.my_pubkey);
+    if let Some(path) = &history_path {
+        app.history = History::new(history::load(path));
+    }
+
+    let result = event_loop(terminal, client, responses, &mut app).await;
+
+    // Best-effort: the terminal is being torn down and losing recall is not worth
+    // failing the run over.
+    if let Some(path) = &history_path {
+        let _ = history::save(path, app.history.entries());
+    }
+    result
+}
+
+async fn event_loop(
+    terminal: &mut Tui,
+    client: &GymClient,
+    responses: &mut gymbuddy_client::Responses,
+    app: &mut App,
+) -> anyhow::Result<()> {
     let mut events = EventStream::new();
 
     // Rest-timer plumbing: the server sends a one-shot arm/cancel directive; we run
@@ -75,7 +103,7 @@ async fn run(
     client.send(&ClientRequest::Hello).await?;
 
     while !app.should_quit {
-        terminal.draw(|frame| ui::draw(frame, &app))?;
+        terminal.draw(|frame| ui::draw(frame, app))?;
 
         tokio::select! {
             maybe_event = events.next() => match maybe_event {

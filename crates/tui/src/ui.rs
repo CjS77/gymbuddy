@@ -57,13 +57,19 @@ fn draw_transcript(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 }
 
 fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let paragraph = Paragraph::new(app.input.as_str()).block(Block::default().borders(Borders::ALL).title(app.input_label()));
+    // Scroll the line under a fixed window so the cursor stays visible once the
+    // text outgrows the box. Both offsets are in display columns, not chars, so
+    // wide glyphs land the cursor in the right place.
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let scroll = app.input.visual_scroll(inner_width);
+    let paragraph = Paragraph::new(app.input.value())
+        .scroll((0, scroll as u16))
+        .block(Block::default().borders(Borders::ALL).title(app.input_label()));
     frame.render_widget(paragraph, area);
 
-    // Place the cursor after the typed text, clamped to the inner width.
+    let cursor_col = app.input.visual_cursor().saturating_sub(scroll) as u16;
     let max_x = area.x + area.width.saturating_sub(2);
-    let cursor_x = (area.x + 1 + app.input.chars().count() as u16).min(max_x);
-    frame.set_cursor_position((cursor_x, area.y + 1));
+    frame.set_cursor_position(((area.x + 1 + cursor_col).min(max_x), area.y + 1));
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -111,5 +117,45 @@ fn short_key(key: &str) -> String {
         key.to_string()
     } else {
         format!("{}…{}", &key[..6], &key[key.len() - 6..])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::Terminal;
+    use ratatui::backend::{Backend as _, TestBackend};
+
+    use crate::app::App;
+
+    /// Draw a full frame with `text` typed at the prompt and report where the
+    /// cursor landed, as (column, row).
+    fn cursor_after_typing(text: &str, width: u16) -> (u16, u16) {
+        let mut app = App::new("pk".into(), None, None);
+        app.mode = crate::app::Mode::Chat;
+        app.input = tui_input::Input::new(text.to_string());
+        let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
+        terminal.draw(|frame| super::draw(frame, &app)).unwrap();
+        terminal.backend_mut().get_cursor_position().unwrap().into()
+    }
+
+    #[test]
+    fn cursor_sits_after_ascii_text() {
+        // Input box starts at column 0; +1 for the border, +5 for "bench".
+        assert_eq!(cursor_after_typing("bench", 40).0, 6);
+    }
+
+    /// The bug this replaced: counting chars puts the cursor half a glyph short
+    /// for every wide character on the line.
+    #[test]
+    fn wide_glyphs_advance_the_cursor_by_display_width() {
+        // Four CJK chars are 4 chars but 8 columns wide.
+        assert_eq!(cursor_after_typing("四字熟語", 40).0, 9);
+    }
+
+    #[test]
+    fn cursor_stays_inside_the_box_when_the_line_overflows() {
+        let width = 20;
+        let (col, _) = cursor_after_typing(&"x".repeat(100), width);
+        assert!(col < width - 1, "cursor {col} escaped a {width}-wide box");
     }
 }

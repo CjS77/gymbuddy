@@ -12,6 +12,11 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+# Never imported by name — we reach crossterm through ratatui's re-export. It is
+# still load-bearing: it carries the `event-stream` feature, which crossterm does
+# not enable by default and ratatui does not ask for. Feature unification is what
+# makes `ratatui::crossterm::event::EventStream` exist. Dropping this as "unused"
+# breaks the event loop.
 crossterm = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }
@@ -25,3 +30,10 @@ rodio = { version = "0.19", default-features = false }
 serde = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
+# Readline-style prompt line editing. default-features off drops its optional
+# ratatui/crossterm integration, leaving unicode-width + unicode-segmentation: we
+# map keys to `InputRequest`s ourselves, so the crate's event helper is dead weight.
+tui-input = { version = "0.15", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
