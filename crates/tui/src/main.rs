@@ -6,6 +6,7 @@
 
 mod app;
 mod audio;
+mod completion;
 mod config;
 mod history;
 mod render;

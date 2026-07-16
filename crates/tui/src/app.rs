@@ -7,6 +7,7 @@ use gymbuddy_proto::{ClientRequest, ServerResponse, View};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tui_input::{Input, InputRequest};
 
+use crate::completion::Completion;
 use crate::history::History;
 
 /// Who produced a transcript line.
@@ -93,6 +94,8 @@ pub struct App {
     /// Recall ring for previously submitted chat lines. Loaded from and saved to
     /// disk by `main`, so the state transitions here stay free of I/O.
     pub history: History,
+    /// Tab completion for slash commands, over the set the server advertises.
+    pub completion: Completion,
     pub connected: bool,
     pub should_quit: bool,
     /// Lines scrolled up from the bottom (0 = following the latest).
@@ -112,6 +115,7 @@ impl App {
             transcript: Vec::new(),
             input: Input::default(),
             history: History::default(),
+            completion: Completion::default(),
             connected: true,
             should_quit: false,
             scroll_back: 0,
@@ -147,9 +151,18 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('t')) {
             return Action::Send(ClientRequest::Chat { text: "/timers".to_string() });
         }
+        // Any key but Tab ends an in-flight completion cycle, so the next Tab reads
+        // the line as it now stands instead of resuming a stale walk.
+        if !matches!(key.code, KeyCode::Tab) {
+            self.completion.reset();
+        }
         match key.code {
             KeyCode::Esc => Action::Quit,
             KeyCode::Enter => self.submit(),
+            KeyCode::Tab => {
+                self.complete_command();
+                Action::None
+            }
             KeyCode::Up => {
                 self.recall_prev();
                 Action::None
@@ -172,6 +185,15 @@ impl App {
                 }
                 Action::None
             }
+        }
+    }
+
+    /// Complete the slash command at the prompt, leaving the line untouched when
+    /// there is nothing to complete.
+    fn complete_command(&mut self) {
+        let (line, cursor) = (self.input.value().to_string(), self.input.cursor());
+        if let Some((completed, cursor)) = self.completion.complete(&line, cursor) {
+            self.input = Input::new(completed).with_cursor(cursor);
         }
     }
 
@@ -242,7 +264,10 @@ impl App {
             ServerResponse::Welcome { name } => {
                 self.mode = Mode::Chat;
                 self.push(Speaker::System, format!("Connected as {name}. Type a message; /help for commands."));
-                None
+                // Ask what this user may run, so Tab can complete it. Asked once a
+                // session; a client that cared about a mid-session grant could
+                // re-issue it.
+                Some(ClientRequest::ListCommands)
             }
             ServerResponse::NeedsRegistration => self.begin_registration(),
             // The optional `timer` directive is handled by the event loop (which
@@ -259,9 +284,12 @@ impl App {
                 self.push(Speaker::System, format!("Error: {message}"));
                 None
             }
-            // Advertised by the server ([C2.1]) but not yet asked for or used —
-            // [T1.3] is what turns this into tab completion.
-            ServerResponse::Commands { .. } => None,
+            // The server is the only authority on the command set: it is per-user,
+            // so the client never hardcodes one.
+            ServerResponse::Commands { commands } => {
+                self.completion.set_commands(commands.into_iter().map(|c| c.name));
+                None
+            }
         }
     }
 
@@ -300,6 +328,8 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use gymbuddy_proto::CommandInfo;
+
     use super::*;
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -487,6 +517,75 @@ mod tests {
         app.on_response(ServerResponse::Welcome { name: "Alice".into() });
         submit(&mut app, "squats 100kg");
         assert_eq!(app.history.entries(), ["squats 100kg"]);
+    }
+
+    /// Advertise a command set as the server would.
+    fn advertise(app: &mut App, names: &[&str]) {
+        let commands = names.iter().map(|n| CommandInfo { name: n.to_string(), description: String::new() }).collect();
+        app.on_response(ServerResponse::Commands { commands });
+    }
+
+    /// The set is per-user, so the client asks for it the moment it knows who it
+    /// is rather than assuming one.
+    #[test]
+    fn welcome_asks_the_server_for_the_command_set() {
+        let mut app = App::new("pk".into(), None, None);
+        let follow_up = app.on_response(ServerResponse::Welcome { name: "Alice".into() });
+        assert!(matches!(follow_up, Some(ClientRequest::ListCommands)), "expected ListCommands");
+    }
+
+    #[test]
+    fn tab_completes_an_advertised_command() {
+        let mut app = chatting();
+        advertise(&mut app, &["/status", "/history"]);
+        type_text(&mut app, "/hi");
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.input.value(), "/history");
+    }
+
+    /// Until the server answers there is no set, and Tab must be inert rather than
+    /// guessing at commands this user may not have.
+    #[test]
+    fn tab_does_nothing_before_the_server_advertises() {
+        let mut app = chatting();
+        type_text(&mut app, "/hi");
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.input.value(), "/hi");
+    }
+
+    #[test]
+    fn repeated_tab_cycles_at_the_prompt() {
+        let mut app = chatting();
+        advertise(&mut app, &["/start", "/status"]);
+        type_text(&mut app, "/s");
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.input.value(), "/sta");
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.input.value(), "/start");
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.input.value(), "/status");
+    }
+
+    /// Typing between Tabs must restart from the new line, not resume the walk.
+    #[test]
+    fn typing_after_a_tab_ends_the_cycle() {
+        let mut app = chatting();
+        advertise(&mut app, &["/start", "/status"]);
+        type_text(&mut app, "/s");
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.input.value(), "/sta");
+        type_text(&mut app, "r");
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.input.value(), "/start");
+    }
+
+    #[test]
+    fn tab_leaves_ordinary_chat_alone() {
+        let mut app = chatting();
+        advertise(&mut app, &["/status"]);
+        type_text(&mut app, "bench 80kg");
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.input.value(), "bench 80kg");
     }
 
     #[test]

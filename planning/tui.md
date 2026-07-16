@@ -33,10 +33,15 @@ Tab completes `/` commands at the prompt.
   pair instead.
 - Completing argument values (exercise names for `/nextworkout`) is out of scope
   here; file separately if wanted.
+- Unblocked — [C2.1] landed, so the set arrives over the wire. The TUI asks with
+  `ClientRequest::ListCommands` once it is welcomed and completes from the answer,
+  which means Tab is inert until the server replies and offers nothing at all if
+  it never does. Completion state lives in `crates/tui/src/completion.rs`, keeping
+  the rules out of `app.rs`.
 
 #### Metadata
 - Priority: P2
-- Progress: Blocked — needs [C2.1] (server-advertised command set) before it can start
+- Progress: In progress
 - Depends on: [T1.1], [C2.1]
 
 ## Epic 2: Planning and progress surfaces
