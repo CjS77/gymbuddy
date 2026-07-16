@@ -56,8 +56,8 @@ tantivy = "0.22"
 clap = { version = "4", features = ["derive"] }
 
 # TUI
-ratatui = "0.29"
-crossterm = { version = "0.28", features = ["event-stream"] }
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
 
 # Logging
 tracing = "0.1"
