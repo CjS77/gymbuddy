@@ -22,10 +22,10 @@ gymbuddy-timer-core = { path = "crates/timer" }
 # Encrypted p2p transport (iroh-based, E2E-encrypted, ed25519 PeerId = identity)
 confide = { path = "../confide" }
 
-corre-sdk = { version = "0.21", git = "https://github.com/corre-pa/corre", branch = "main" }
-corre-core = { version = "0.21", git = "https://github.com/corre-pa/corre", branch = "main" }
-corre-llm = { version = "0.21", git = "https://github.com/corre-pa/corre", branch = "main" }
-corre-safety = { version = "0.21", git = "https://github.com/corre-pa/corre", branch = "main" }
+corre-sdk = { version = "0.22", git = "https://github.com/corre-pa/corre", branch = "main" }
+corre-core = { version = "0.22", git = "https://github.com/corre-pa/corre", branch = "main" }
+corre-llm = { version = "0.22", git = "https://github.com/corre-pa/corre", branch = "main" }
+corre-safety = { version = "0.22", git = "https://github.com/corre-pa/corre", branch = "main" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

@@ -43,13 +43,11 @@ impl AssistantHandler {
 
         messages.push(LlmMessage { role: LlmRole::User, content: user_text.to_string() });
 
-        // NOTE: `json_mode` is best-effort and currently a no-op. corre's
-        // `OpenAiCompatProvider` ignores this field entirely (it hardcodes
-        // `response_format: None`), so NO JSON mode is negotiated with the provider.
-        // Our JSON contract is instead enforced by the prompt text (see prompts.rs)
-        // plus the tolerant `parse_assistant_response` extractor. We still set it to
-        // `true` to record intent, so JSON mode engages automatically if/when the
-        // provider learns to honour it upstream. See ticket C1.7.
+        // Every prompt in `prompts.rs` demands a JSON object, so ask the provider to
+        // enforce it. As of corre-llm 0.22 this reaches the wire as
+        // `response_format: {"type": "json_object"}`; before that the field was read
+        // by nothing and the contract rested on prompt text alone. It still rests on
+        // the parser's tolerance for any model that ignores `response_format`.
         let request =
             LlmRequest { messages, temperature: Some(temperature), max_completion_tokens: Some(max_tokens), json_mode: true };
 
@@ -170,6 +168,23 @@ mod tests {
         let user = db.get_user_by_telegram_id("12345").unwrap().unwrap();
         let context_msgs = db.get_recent_messages_for_platform(user.id, "telegram", 100).unwrap();
         assert_eq!(context_msgs.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn every_request_asks_the_provider_for_json_mode() {
+        // Our half of the contract. corre-llm 0.22 maps `json_mode` onto
+        // `response_format: {"type": "json_object"}`; before it did, this flag was
+        // read by nothing and setting it was a silent no-op. Now that it reaches
+        // the wire, dropping it would quietly weaken every prompt in `prompts.rs`
+        // back to text-only enforcement.
+        let (handler, llm) = setup_handler(r#"{"message": "Hi", "actions": []}"#).await;
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
+        let _ = handler.handle_text_message(&msg, "what did I do today?").await.unwrap();
+
+        let recorded = llm.recorded_requests();
+        assert!(!recorded.is_empty(), "expected at least one LLM round-trip");
+        assert!(recorded.iter().all(|r| r.json_mode), "every request must ask for JSON mode");
     }
 
     #[tokio::test]

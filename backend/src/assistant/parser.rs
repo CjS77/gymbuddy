@@ -2,14 +2,17 @@ use super::actions::AssistantResponse;
 
 /// Extract the JSON object from raw LLM output.
 ///
-/// This tolerance is the DELIBERATE, load-bearing strategy for reliable structured
-/// output — not a lucky accident. The current provider does not negotiate a JSON
-/// response format with the model (the `json_mode` flag on `LlmRequest` is ignored
-/// by `corre`'s `OpenAiCompatProvider`; see the note in `handler::call_llm_with`),
-/// so the "respond with ONLY a JSON object" prompt contract is actually recovered
-/// HERE, by peeling off the wrapping models habitually add:
+/// This tolerance is load-bearing, not incidental. `LlmRequest::json_mode` was
+/// ignored by `corre-llm`'s `OpenAiCompatProvider` until 0.22 — it hardcoded
+/// `response_format: None` — so for this code's whole life before that, the JSON
+/// contract was enforced by prompt text alone, and the "respond with ONLY a JSON
+/// object" contract was actually recovered HERE, by peeling off the wrapping models
+/// habitually add:
 ///   - markdown code fences (```` ```json … ``` ```` or bare ```` ``` … ``` ````), and
 ///   - surrounding prose ("Sure! Here you go: { … } hope that helps").
+///
+/// Keep it now that JSON mode is honoured: it costs nothing and remains the sole
+/// guard for any model or provider that ignores `response_format`.
 ///
 /// Our response schema is always a JSON *object*, so once any fence is stripped we
 /// narrow to the outermost `{ … }` and ignore stray `[…]` or prose on either side.

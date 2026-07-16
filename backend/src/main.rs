@@ -93,8 +93,15 @@ async fn setup()
     tracing::info!(path = %cli.config.display(), "Loading config");
     let config = CorreConfig::load(&cli.config).context("loading config")?;
     let data_dir = config.data_dir();
-    tracing::debug!(raw_gym = %config.gym, "Raw [gym] table from config");
-    let mut gym_config = GymConfig::from_toml_table(Some(&config.gym))?;
+    // corre 0.22 dropped the hardcoded `[gym]` table from `CorreConfig` when it
+    // removed the corre-gym app. This repo is that app now, so it reads its own
+    // table out of the same file rather than expecting the host to surface it.
+    let raw_config: toml::Value = std::fs::read_to_string(&cli.config)
+        .with_context(|| format!("reading {}", cli.config.display()))?
+        .parse()
+        .with_context(|| format!("parsing {} as TOML", cli.config.display()))?;
+    tracing::debug!(raw_gym = ?raw_config.get("gym"), "Raw [gym] table from config");
+    let mut gym_config = GymConfig::from_toml_table(raw_config.get("gym"))?;
     gym_config.resolve_secrets()?;
     gym_config.resolve_endpoints()?;
 
