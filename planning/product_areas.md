@@ -21,7 +21,8 @@ Completed work lives in [done.md](done.md), not in the area files.
 
 Area files hold only live work. A task moves through three steps:
 
-1. **Start it.** Set its **Progress** to `In progress` in the area file. Carry out work in epics in their own git branches.
+1. **Start it.** Set its **Progress** to `In progress` in the area file. Epics are
+   worked in their own git worktree — see [Epic worktrees](#epic-worktrees).
 2. **Finish it.** Do the work; get it merged and verified. Set **Progress** to
    `Done`.
 3. **Archive it.** Cut the task out of the area file entirely and paste it into
@@ -33,6 +34,24 @@ in place is fine: it parks the task until the next housekeeping pass, and it let
 work be closed out by hand without also doing the archiving. The area files stay
 short enough to read in full, and the history stays intact in `done.md` where it
 can be skimmed when needed but doesn't crowd out current work.
+
+### Epic worktrees
+
+The worktree is the unit of isolation; the task is the unit of commit.
+
+1. **Add a git worktree for the epic and switch into it.** One per epic, not one
+   per task — the epic's tasks share a branch, and their dependencies
+   (`Depends on:`) mean they are meant to land in order on top of each other.
+2. **Work the epic's tasks there, committing each task as it is done.** A task is
+   a commit. Don't batch an epic into one commit; don't split a task across
+   several unless it genuinely stands alone.
+3. **Stop when the epic is done, and hand it to the user for testing.** The user
+   merges the branch back into `main` and removes the worktree. Whoever wrote the
+   epic does neither — no self-merge, no cleanup of a worktree still awaiting
+   review.
+
+The handover in step 3 is the point of the whole arrangement: the epic sits intact
+and testable in its own directory until someone who didn't write it has run it.
 
 ### Housekeeping
 
