@@ -309,10 +309,15 @@ complete `/` commands at the prompt, and is blocked until this lands.
   times — the dispatcher (`handler.rs:307`), `cmd_help` (`:570`), and `cmd_start`
   (`:550`, which omits `/cancel`). Derive them from one table rather than adding a
   fourth.
+- Resolved — the table is `backend/src/assistant/commands.rs`, and the dispatcher
+  matches a parsed `Command` enum rather than a raw string. That makes the link
+  compiler-enforced: a row added to the table with no handler fails to build. The
+  `/start` list is now derived too, so it gained the `/cancel` it had drifted into
+  omitting, and both lists inherit `/help`'s wording.
 
 #### Metadata
 - Priority: P2
-- Progress: Not started
+- Progress: In progress
 
 ## Epic 3: Domain model & storage
 

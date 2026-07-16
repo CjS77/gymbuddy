@@ -15,6 +15,7 @@ use crate::github::IssueReporter;
 use crate::telegram::Message as TgMessage;
 
 use super::actions::{AssistantAction, ProposedExercise};
+use super::commands::{self, Command};
 use super::matching::find_exercise_type;
 use super::parser::parse_assistant_response;
 use super::prompts::{
@@ -302,21 +303,25 @@ impl AssistantHandler {
     /// Handle a slash command, if `text` is one. Most commands map straight to a
     /// [`View`]; `/timers` additionally rides a [`TimerSignal`] so disabling it can
     /// cancel an in-flight rest, hence the [`Reply`] return.
+    ///
+    /// The match is exhaustive over [`Command`], so a new row in the command table
+    /// cannot be advertised without also being handled here.
     async fn handle_command(&self, text: &str, user: &User, platform: &str) -> anyhow::Result<Option<Reply>> {
-        let cmd = text.split_whitespace().next().unwrap_or("").to_lowercase();
-        match cmd.as_str() {
-            "/start" => Ok(Some(View::notice(self.cmd_start(user)).into())),
-            "/help" => Ok(Some(View::notice(Self::cmd_help(user)).into())),
-            "/status" => Ok(Some(self.cmd_status(user).await?.into())),
-            "/history" => Ok(Some(View::History(self.cmd_history(user).await?).into())),
-            "/exercises" => Ok(Some(View::Catalog(self.cmd_exercises()).into())),
-            "/clear" => Ok(Some(View::notice(self.cmd_clear(user, platform).await?).into())),
-            "/timers" => Ok(Some(self.cmd_timers(user).await?)),
-            "/philosophy" => Ok(Some(self.cmd_philosophy_start(user, platform).await?.into())),
-            "/nextworkout" => Ok(Some(self.cmd_next_workout(user, text).await?.into())),
-            "/cancel" => Ok(Some(self.cmd_cancel(user, platform).await?.into())),
-            "/feedback" => Ok(self.cmd_feedback(user, text).await?.map(Into::into)),
-            _ => Ok(None),
+        let Some(command) = Command::parse(text) else {
+            return Ok(None);
+        };
+        match command {
+            Command::Start => Ok(Some(View::notice(Self::cmd_start(user)).into())),
+            Command::Help => Ok(Some(View::notice(Self::cmd_help(user)).into())),
+            Command::Status => Ok(Some(self.cmd_status(user).await?.into())),
+            Command::History => Ok(Some(View::History(self.cmd_history(user).await?).into())),
+            Command::Exercises => Ok(Some(View::Catalog(self.cmd_exercises()).into())),
+            Command::Clear => Ok(Some(View::notice(self.cmd_clear(user, platform).await?).into())),
+            Command::Timers => Ok(Some(self.cmd_timers(user).await?)),
+            Command::Philosophy => Ok(Some(self.cmd_philosophy_start(user, platform).await?.into())),
+            Command::NextWorkout => Ok(Some(self.cmd_next_workout(user, text).await?.into())),
+            Command::Cancel => Ok(Some(self.cmd_cancel(user, platform).await?.into())),
+            Command::Feedback => Ok(self.cmd_feedback(user, text).await?.map(Into::into)),
         }
     }
 
@@ -547,51 +552,34 @@ impl AssistantHandler {
         out
     }
 
-    fn cmd_start(&self, user: &User) -> String {
-        let mut msg = format!(
+    /// The command list both `/start` and `/help` show, one command per line,
+    /// filtered to what this user may run and prefixed with `bullet`.
+    fn command_list(user: &User, bullet: &str) -> String {
+        commands::visible_to(user).map(|spec| format!("{bullet}{}", spec.help_line())).collect::<Vec<_>>().join("\n")
+    }
+
+    fn cmd_start(user: &User) -> String {
+        format!(
             "You're already registered, {}! Here's what I can help with:\n\
              - Tell me about your exercises and I'll log them\n\
-             - /status -- see your current session\n\
-             - /history -- recent workout summaries\n\
-             - /exercises -- available exercises\n\
-             - /philosophy -- build or refine your training philosophy\n\
-             - /nextworkout -- design a workout for today\n\
-             - /clear -- clear conversation context\n\
-             - /timers -- toggle rest timers between sets\n",
-            user.name
-        );
-        if user.beta_tester {
-            msg.push_str("- /feedback -- file a bug report or feature request\n");
-        }
-        msg.push_str("- /help -- all commands");
-        msg
+             {}",
+            user.name,
+            Self::command_list(user, "- ")
+        )
     }
 
     fn cmd_help(user: &User) -> String {
-        let mut msg = "Available commands:\n\
-         /start -- Introduction and registration\n\
-         /status -- Current session and today's stats\n\
-         /history -- Last 5 workout summaries\n\
-         /exercises -- List available exercises by muscle group\n\
-         /philosophy -- Build or refine your training philosophy (multi-turn)\n\
-         /nextworkout -- Design a tailored workout for today (logs nothing)\n\
-         /cancel -- Cancel an in-progress interview (e.g. /philosophy)\n\
-         /clear -- Clear conversation context (fresh start)\n\
-         /timers -- Toggle the rest timer between sets (on by default)\n"
-            .to_string();
-        if user.beta_tester {
-            msg.push_str("/feedback <text> -- File a bug report or feature request\n");
-        }
-        msg.push_str(
-            "/help -- This message\n\n\
+        format!(
+            "Available commands:\n\
+             {}\n\n\
              You can also just chat naturally:\n\
              - \"3 sets of bench press, 80kg, 8 reps\"\n\
              - \"I ran 5km in 25 minutes\"\n\
              - \"My shoulder is sore\"\n\
              - \"End my session\"\n\
              - \"What did I do today?\"",
-        );
-        msg
+            Self::command_list(user, "")
+        )
     }
 
     async fn cmd_status(&self, user: &User) -> anyhow::Result<View> {
@@ -2837,6 +2825,53 @@ mod tests {
         assert!(body.starts_with("the squat rack is broken"));
         assert!(body.contains("Reported by: Alice"));
         assert!(body.contains("telegram_id: 999"));
+    }
+
+    // ─── command lists ────────────────────────────────────────────────────────
+
+    fn command_list_user(beta_tester: bool) -> User {
+        User { id: 7, name: "Alice".into(), telegram_id: None, signal_id: None, pubkey: None, timezone: "UTC".into(),
+            created_at: String::new(), updated_at: String::new(), beta_tester, timers_enabled: true }
+    }
+
+    #[test]
+    fn help_lists_every_command_the_user_can_run() {
+        let msg = AssistantHandler::cmd_help(&command_list_user(false));
+        assert!(msg.starts_with("Available commands:\n/start -- Introduction and registration\n"));
+        assert!(msg.contains("\n/cancel -- Cancel an in-progress interview (e.g. /philosophy)\n"));
+        assert!(msg.contains("\n/help -- This message\n\n"));
+        assert!(msg.ends_with("- \"What did I do today?\""));
+    }
+
+    /// `/start` used to omit `/cancel` because it kept its own copy of the list.
+    /// Both surfaces now render the same table, so they cannot drift again.
+    #[test]
+    fn start_and_help_name_the_same_commands() {
+        let user = command_list_user(false);
+        let names = |msg: &str| {
+            msg.lines()
+                .filter_map(|line| line.trim_start_matches("- ").split_whitespace().next())
+                .filter(|word| word.starts_with('/'))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&AssistantHandler::cmd_start(&user)), names(&AssistantHandler::cmd_help(&user)));
+        assert!(AssistantHandler::cmd_start(&user).contains("- /cancel -- "));
+    }
+
+    #[test]
+    fn only_beta_testers_are_shown_feedback() {
+        assert!(!AssistantHandler::cmd_help(&command_list_user(false)).contains("/feedback"));
+        assert!(!AssistantHandler::cmd_start(&command_list_user(false)).contains("/feedback"));
+        assert!(AssistantHandler::cmd_help(&command_list_user(true)).contains("/feedback <text> -- File a bug report"));
+        assert!(AssistantHandler::cmd_start(&command_list_user(true)).contains("- /feedback <text> -- File a bug report"));
+    }
+
+    #[test]
+    fn start_keeps_its_greeting_and_logging_hint() {
+        let msg = AssistantHandler::cmd_start(&command_list_user(false));
+        assert!(msg.starts_with("You're already registered, Alice! Here's what I can help with:\n"));
+        assert!(msg.contains("- Tell me about your exercises and I'll log them\n"));
     }
 
     // ─── get_last_exercise ────────────────────────────────────────────────────

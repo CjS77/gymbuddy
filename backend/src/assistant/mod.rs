@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod commands;
 pub mod handler;
 pub mod matching;
 pub mod parser;

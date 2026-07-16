@@ -15,6 +15,7 @@ use futures::StreamExt as _;
 use gymbuddy_proto::{ClientRequest, ServerResponse, decode_request, encode_response};
 
 use crate::assistant::AssistantHandler;
+use crate::assistant::commands;
 use crate::config::ConfideConfig;
 
 /// A bound confide endpoint, ready to accept sessions.
@@ -124,6 +125,13 @@ async fn dispatch(handler: &AssistantHandler, pubkey: &str, req: ClientRequest) 
                 Ok(reply) => ServerResponse::Reply { view: reply.view, timer: reply.timer },
                 Err(e) => error_response(e),
             },
+            Ok(None) => ServerResponse::NeedsRegistration,
+            Err(e) => error_response(e),
+        },
+        // Resolved per request rather than cached at connect: the set is computed
+        // from the user's current beta flag, which can be granted mid-session.
+        ClientRequest::ListCommands => match handler.ensure_user_by_pubkey(pubkey).await {
+            Ok(Some(user)) => ServerResponse::Commands { commands: commands::advertised_to(&user) },
             Ok(None) => ServerResponse::NeedsRegistration,
             Err(e) => error_response(e),
         },

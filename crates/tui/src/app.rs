@@ -259,6 +259,9 @@ impl App {
                 self.push(Speaker::System, format!("Error: {message}"));
                 None
             }
+            // Advertised by the server ([C2.1]) but not yet asked for or used —
+            // [T1.3] is what turns this into tab completion.
+            ServerResponse::Commands { .. } => None,
         }
     }
 

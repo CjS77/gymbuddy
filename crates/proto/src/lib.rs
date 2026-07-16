@@ -21,6 +21,12 @@ pub const KIND: &str = "gymbuddy/v1";
 ///
 /// Chat is sequential, so no request id is carried yet; later structured queries
 /// (progress, goals, …) can add one when correlation becomes necessary.
+///
+/// **Append new variants; never reorder or extend an existing one.** postcard is
+/// non-self-describing and positional: enum tags are varint discriminants assigned
+/// by declaration order, and struct fields carry no names on the wire. Appending a
+/// variant is safe in both directions — an old decoder fails cleanly on an unknown
+/// tag — whereas adding a field to an existing variant silently misparses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientRequest {
     /// "Who am I?" — resolves this peer's pubkey to a [`ServerResponse::Welcome`]
@@ -31,11 +37,20 @@ pub enum ClientRequest {
     /// Free-form chat text — the main path into the assistant. Server-side slash
     /// commands (`/status`, `/history`, …) travel as plain chat text here too.
     Chat { text: String },
+    /// "What can I run?" — asks for the slash commands available to this user,
+    /// answered with [`ServerResponse::Commands`].
+    ///
+    /// A request rather than a connect-time snapshot because the answer is
+    /// per-user and can change mid-session (a user can be granted beta access
+    /// while connected), so a client that cares may re-issue it.
+    ListCommands,
 }
 
 /// A response sent from the server to a client.
 ///
 /// Not `Eq`: [`View`] carries floating-point set values.
+///
+/// Append-only, for the postcard reasons spelled out on [`ClientRequest`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ServerResponse {
     /// The pubkey is a known, registered user.
@@ -53,6 +68,25 @@ pub enum ServerResponse {
     Reply { view: View, timer: Option<TimerSignal> },
     /// The server could not process the request.
     Error { message: String },
+    /// The slash commands this user may run, in help order — the answer to
+    /// [`ClientRequest::ListCommands`].
+    ///
+    /// The set is per-user and lists only what the user can actually run, so a
+    /// client may offer every entry without disclosing a command that isn't
+    /// theirs.
+    Commands { commands: Vec<CommandInfo> },
+}
+
+/// One slash command as advertised to a client.
+///
+/// Enough to complete the word at a prompt and to say what it does; the server
+/// keeps the handler and the help text, and clients never hardcode the set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandInfo {
+    /// The command word, leading slash included, e.g. `/status`.
+    pub name: String,
+    /// One-line description of what the command does.
+    pub description: String,
 }
 
 /// A rest-timer directive attached to a [`ServerResponse::Reply`].
@@ -111,6 +145,7 @@ mod tests {
         roundtrip_request(ClientRequest::Hello);
         roundtrip_request(ClientRequest::Register { name: "Alice".into(), timezone: "Europe/London".into() });
         roundtrip_request(ClientRequest::Chat { text: "3 sets of bench press, 80kg, 8 reps".into() });
+        roundtrip_request(ClientRequest::ListCommands);
     }
 
     #[test]
@@ -123,6 +158,35 @@ mod tests {
             timer: Some(TimerSignal::Arm { duration_secs: 300, exercise: "Bench Press".into() }),
         });
         roundtrip_response(ServerResponse::Error { message: "unknown user".into() });
+        roundtrip_response(ServerResponse::Commands {
+            commands: vec![CommandInfo { name: "/status".into(), description: "Current session and today's stats".into() }],
+        });
+        roundtrip_response(ServerResponse::Commands { commands: vec![] });
+    }
+
+    /// The variants added for [C2.1] must sit at the end of their enums: postcard
+    /// tags are declaration-order varints, so inserting one ahead of an existing
+    /// variant silently reinterprets every old message that carries it.
+    #[test]
+    fn appended_variants_did_not_shift_existing_discriminants() {
+        assert_eq!(encode_request(&ClientRequest::Hello).unwrap()[0], 0);
+        assert_eq!(encode_request(&ClientRequest::ListCommands).unwrap()[0], 3);
+        assert_eq!(encode_response(&ServerResponse::NeedsRegistration).unwrap()[0], 1);
+        assert_eq!(encode_response(&ServerResponse::Commands { commands: vec![] }).unwrap()[0], 4);
+    }
+
+    /// A server that predates [C2.1] has no tag 3, so its decoder rejects the
+    /// request outright instead of misreading it as a `Chat`.
+    #[test]
+    fn an_old_decoder_rejects_a_new_variant_rather_than_misparsing_it() {
+        let bytes = encode_request(&ClientRequest::ListCommands).unwrap();
+        #[derive(Debug, Serialize, Deserialize)]
+        enum OldClientRequest {
+            Hello,
+            Register { name: String, timezone: String },
+            Chat { text: String },
+        }
+        assert!(postcard::from_bytes::<OldClientRequest>(&bytes).is_err());
     }
 
     #[test]

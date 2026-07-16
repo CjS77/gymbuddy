@@ -113,3 +113,62 @@ async fn register_then_chat_logs_sets_over_confide() {
     assert_eq!(sets.len(), 3, "three sets should be logged");
     assert!(sets.iter().all(|s| s.count == Some(8) && (s.value - 80.0).abs() < 1e-6));
 }
+
+/// [C2.1] over the real transport: a client asks for its command set, and the
+/// answer tracks the user's beta flag flipping mid-session — which is the whole
+/// reason this is a request rather than something carried on `Welcome`.
+#[tokio::test]
+async fn list_commands_advertises_the_per_user_set_over_confide() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let db = Arc::new(Mutex::new(Database::open(&dir.path().join("gym.db")).unwrap()));
+    let llm: Box<dyn LlmProvider> = Box::new(StubLlm { response: LOG_THREE_SETS.to_string() });
+    let handler = Arc::new(AssistantHandler::new(db.clone(), llm, test_config()).await.unwrap());
+
+    let cfg = ConfideConfig { keystore_path: dir.path().join("server.key"), allowed_pubkeys: vec![], relay: false };
+    let server = ConfideServer::bind(&cfg).await.unwrap();
+    let server_pubkey = server.pubkey_hex();
+    let server_addrs = dialable(server.direct_addresses());
+    tokio::spawn(server.run(handler.clone()));
+
+    let opts = ConnectOptions {
+        server_pubkey_hex: server_pubkey,
+        relay: false,
+        server_addrs,
+        keystore_path: dir.path().join("client.key"),
+    };
+    let (client, mut responses) =
+        tokio::time::timeout(Duration::from_secs(10), GymClient::connect(opts)).await.expect("connect timed out").expect("connect");
+
+    // An unregistered pubkey has no command set to speak of.
+    let resp = client.request(&mut responses, &ClientRequest::ListCommands).await.unwrap();
+    assert!(matches!(resp, ServerResponse::NeedsRegistration), "got {resp:?}");
+
+    client
+        .request(&mut responses, &ClientRequest::Register { name: "Alice".into(), timezone: "UTC".into() })
+        .await
+        .unwrap();
+
+    let names = |resp: ServerResponse| {
+        let ServerResponse::Commands { commands } = resp else { panic!("expected Commands, got {resp:?}") };
+        commands.into_iter().map(|c| c.name).collect::<Vec<_>>()
+    };
+
+    let plain = names(client.request(&mut responses, &ClientRequest::ListCommands).await.unwrap());
+    assert!(plain.contains(&"/status".to_string()), "got {plain:?}");
+    assert!(plain.contains(&"/help".to_string()), "got {plain:?}");
+    // The beta-only command is not merely unrunnable for Alice — it is unnamed,
+    // so its existence can't be inferred from what she was offered.
+    assert!(!plain.contains(&"/feedback".to_string()), "/feedback leaked to a non-tester: {plain:?}");
+
+    // Grant beta access on the live server and ask again on the same connection.
+    let user_id = {
+        let db = db.lock().await;
+        db.get_user_by_pubkey(client.my_pubkey_hex()).unwrap().expect("registered user").id
+    };
+    db.lock().await.set_beta_tester(user_id, true).unwrap();
+
+    let beta = names(client.request(&mut responses, &ClientRequest::ListCommands).await.unwrap());
+    assert!(beta.contains(&"/feedback".to_string()), "/feedback missing after beta grant: {beta:?}");
+    assert_eq!(beta.len(), plain.len() + 1, "beta grant should add exactly /feedback: {beta:?}");
+}
