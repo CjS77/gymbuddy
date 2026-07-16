@@ -17,6 +17,7 @@
 # On exit (Ctrl-C or process end), both containers are stopped automatically.
 set -euo pipefail
 
+export RUST_LOG=warn,gymbuddy=debug,gymbuddy:*=debug
 DEV_MODE=0
 PASSTHROUGH_ARGS=()
 while [[ $# -gt 0 ]]; do
