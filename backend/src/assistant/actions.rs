@@ -149,6 +149,14 @@ pub enum AssistantAction {
         #[serde(alias = "content")]
         note: String,
     },
+    /// Record a today-only override the user voices mid-workout (e.g. "I don't feel
+    /// like bench today, let's do flys"). Applies ONLY to the plan in flight — it is
+    /// stored on that plan, never written to the philosophy, and gone by the next
+    /// design. Use this for one-offs; use AppendPhilosophyNote for durable changes.
+    SetSessionOverride {
+        #[serde(alias = "content", alias = "override")]
+        note: String,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -440,6 +448,16 @@ mod tests {
         match action {
             AssistantAction::AppendPhilosophyNote { note } => assert!(note.contains("goblet")),
             _ => panic!("expected AppendPhilosophyNote"),
+        }
+    }
+
+    #[test]
+    fn parse_set_session_override() {
+        let json = r#"{"type": "set_session_override", "note": "no bench today, do flys instead"}"#;
+        let action: AssistantAction = serde_json::from_str(json).unwrap();
+        match action {
+            AssistantAction::SetSessionOverride { note } => assert!(note.contains("flys")),
+            _ => panic!("expected SetSessionOverride"),
         }
     }
 

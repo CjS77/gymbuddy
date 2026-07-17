@@ -55,8 +55,9 @@ fn row_to_plan(row: &rusqlite::Row) -> rusqlite::Result<WorkoutPlan> {
         philosophy_id: row.get(4)?,
         status: PlanStatus::from_str_loose(&row.get::<_, String>(5)?),
         session_id: row.get(6)?,
-        created_at: row.get(7)?,
-        updated_at: row.get(8)?,
+        override_note: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
     })
 }
 
@@ -77,7 +78,7 @@ fn row_to_plan_exercise(row: &rusqlite::Row) -> rusqlite::Result<WorkoutPlanExer
 const SELECT_PHILOSOPHY: &str = "SELECT id, user_id, content, source, created_at FROM workout_philosophy";
 
 const SELECT_PLAN: &str = "\
-    SELECT id, user_id, title, rationale, philosophy_id, status, session_id, created_at, updated_at \
+    SELECT id, user_id, title, rationale, philosophy_id, status, session_id, override_note, created_at, updated_at \
     FROM workout_plans";
 
 const SELECT_PLAN_EXERCISE: &str = "\
@@ -209,6 +210,33 @@ impl Database {
         let rows = self.conn().execute(
             "UPDATE workout_plans SET session_id = ?1, status = 'active', updated_at = datetime('now') WHERE id = ?2",
             params![session_id, plan_id],
+        )?;
+        anyhow::ensure!(rows > 0, "Workout plan with id {plan_id} not found");
+        Ok(())
+    }
+
+    /// The plan currently in flight for the user: the active (guided) plan if one is
+    /// bound to a live session, otherwise the most recently proposed-but-unstarted
+    /// design. This is the target a mid-workout, today-only override attaches to.
+    pub fn inflight_plan_for_user(&self, user_id: i64) -> anyhow::Result<Option<WorkoutPlan>> {
+        match self.active_plan_for_user(user_id)? {
+            Some(plan) => Ok(Some(plan)),
+            None => self.latest_proposed_plan(user_id),
+        }
+    }
+
+    /// Append a today-only override (e.g. "no bench today, do flys instead") to a
+    /// plan as a new `"- {note}"` bullet. Scoped to the plan row, so it expires when
+    /// the plan completes or is superseded and NEVER reaches the philosophy.
+    pub fn append_plan_override(&self, plan_id: i64, note: &str) -> anyhow::Result<()> {
+        let existing: Option<String> = self.get_plan(plan_id)?.and_then(|p| p.override_note);
+        let combined = match existing.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(base) => format!("{base}\n- {note}"),
+            None => format!("- {note}"),
+        };
+        let rows = self.conn().execute(
+            "UPDATE workout_plans SET override_note = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![combined, plan_id],
         )?;
         anyhow::ensure!(rows > 0, "Workout plan with id {plan_id} not found");
         Ok(())
@@ -461,6 +489,36 @@ mod tests {
 
         db.set_plan_status(plan_id, PlanStatus::Completed).unwrap();
         assert!(db.active_plan_for_user(user_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn plan_override_appends_and_does_not_carry_to_next_plan() {
+        let (db, user_id) = test_db();
+        let first = db.create_plan(user_id, "Push", None, None).unwrap();
+
+        assert!(db.get_plan(first).unwrap().unwrap().override_note.is_none());
+        db.append_plan_override(first, "no bench today, do flys").unwrap();
+        db.append_plan_override(first, "skip the last set").unwrap();
+        let note = db.get_plan(first).unwrap().unwrap().override_note.unwrap();
+        assert!(note.contains("- no bench today, do flys"));
+        assert!(note.contains("- skip the last set"));
+
+        // A fresh design starts clean — the one-off is scoped to its own plan.
+        let second = db.create_plan(user_id, "Pull", None, None).unwrap();
+        assert!(db.get_plan(second).unwrap().unwrap().override_note.is_none());
+    }
+
+    #[test]
+    fn inflight_plan_prefers_active_then_latest_proposed() {
+        let (db, user_id) = test_db();
+        assert!(db.inflight_plan_for_user(user_id).unwrap().is_none());
+
+        let proposed = db.create_plan(user_id, "Ready", None, None).unwrap();
+        assert_eq!(db.inflight_plan_for_user(user_id).unwrap().unwrap().id, proposed);
+
+        let session = db.start_session(user_id, None).unwrap();
+        db.bind_plan_to_session(proposed, session.id).unwrap();
+        assert_eq!(db.inflight_plan_for_user(user_id).unwrap().unwrap().id, proposed, "active plan is the in-flight one");
     }
 
     #[test]

@@ -67,6 +67,9 @@ pub struct WorkoutPlanProgress {
     pub next: Option<PrescribedExercise>,
     /// How many prescribed exercises remain.
     pub remaining: usize,
+    /// Today-only overrides the user voiced for THIS plan ("no bench today, do flys
+    /// instead"). Applies to the plan in flight only; never folded into the philosophy.
+    pub override_note: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -152,7 +155,13 @@ before→after summary to your reply.\n\
   Appends a lasting preference the user voices mid-workout (e.g. \"always prefer \
 goblet squats to barbell\", \"keep deadlifts light, my back is fragile\") to their \
 training philosophy so FUTURE /nextworkout designs respect it. Use it only for \
-durable preferences — not one-off changes to today's set.\n\
+durable, FROM-NOW-ON preferences — never for a one-off change to today's workout.\n\
+- {{\"type\": \"set_session_override\", \"note\": \"<today-only change to the plan in flight>\"}}\n\
+  Records a one-off, TODAY-ONLY override the user voices for the current workout \
+(e.g. \"I don't feel like bench today, let's do flys\", \"skip legs this session\"). \
+It attaches to the workout in flight only, is honoured for the rest of THIS session, \
+and never touches the philosophy — so it will NOT ban or change anything in future \
+designs. Use this, NOT append_philosophy_note, whenever the change is scoped to today.\n\
 - {{\"type\": \"get_last_exercise\", \"exercise\": \"<EXACT or fuzzy name>\"}}\n\
   Looks up the user's most recent exercise_entry for the named exercise and \
 appends a summary (resolved exercise name, start time, every set) to your reply. \
@@ -258,9 +267,18 @@ NEXT prescribed set — name, target weight and reps — with a short motivating
 drawn from their history (e.g. \"last time 55kg felt easy, so let's go 60kg\"). State \
 the prescription; do not ask \"what next?\". If the user reports pain, log_health and \
 offer a lighter or substitute movement that hits the same muscles within their \
-equipment. When they voice a durable preference (\"I always prefer goblet squats\"), \
-emit append_philosophy_note so future designs honour it. The user still reports what \
-they ACTUALLY did — adjust like a real trainer if it differs from the prescription.\n\
+equipment. The user still reports what they ACTUALLY did — adjust like a real \
+trainer if it differs from the prescription.\n\
+- OVERRIDES vs DURABLE PREFERENCES: When the user wants to change what they train, \
+decide the SCOPE before recording anything. A TODAY-ONLY change to the workout in \
+flight (\"I don't feel like bench today, let's do flys\", \"skip legs this session\") \
+is a one-off: emit set_session_override and coach the swap for the rest of this \
+session ONLY. A durable, FROM-NOW-ON change (\"I always prefer goblet squats\", \
+\"stop giving me barbell bench\") is a lasting preference: emit append_philosophy_note. \
+Never write a one-off into the philosophy — that would silently ban the movement \
+forever. When the scope is genuinely unclear (e.g. \"I hate bench press\" could mean \
+either), do NOT guess and do NOT emit either action: ask whether they mean just for \
+today or from now on, then act on their answer.\n\
 - Keep responses concise -- this is a chat interface\n\
 - Be encouraging but not patronizing\n\
 - All action fields use metric units (weight_kg, distance_m). If the user specifies \
@@ -645,6 +663,11 @@ fn format_active_workout_plan(plan: &Option<WorkoutPlanProgress>) -> String {
             s.push_str(&format!("- first up when they start: {}\n", format_prescription(next)));
         }
         s.push_str("- when the user starts their workout, walk them through it set by set\n");
+    }
+    if let Some(note) = plan.override_note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        s.push_str(&format!(
+            "- TODAY-ONLY OVERRIDES for this workout (honour them now; do NOT save to philosophy):\n{note}\n"
+        ));
     }
     s.push('\n');
     s

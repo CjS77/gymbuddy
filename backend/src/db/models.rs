@@ -755,6 +755,10 @@ pub struct WorkoutPlan {
     pub philosophy_id: Option<i64>,
     pub status: PlanStatus,
     pub session_id: Option<i64>,
+    /// A one-off, today-only override the user voiced mid-workout (e.g. "no bench
+    /// today, do flys instead"). Scoped to THIS plan: it never touches the
+    /// philosophy and expires when the plan completes or is superseded.
+    pub override_note: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

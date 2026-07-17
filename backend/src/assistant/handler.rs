@@ -879,7 +879,7 @@ impl AssistantHandler {
             }
         }
         let remaining = exercises.len().saturating_sub(done.len());
-        Ok(WorkoutPlanProgress { title: plan.title.clone(), started, done, next, remaining })
+        Ok(WorkoutPlanProgress { title: plan.title.clone(), started, done, next, remaining, override_note: plan.override_note.clone() })
     }
 
     async fn call_llm(&self, system_prompt: &str, history: &[crate::db::ConversationMessage], user_text: &str) -> anyhow::Result<String> {
@@ -1085,6 +1085,19 @@ impl AssistantHandler {
             AssistantAction::AppendPhilosophyNote { note } => {
                 self.db.lock().await.append_philosophy_note(user.id, note)?;
                 Ok(Some("Noted for future workouts.".to_string()).into())
+            }
+            AssistantAction::SetSessionOverride { note } => {
+                let db = self.db.lock().await;
+                // A one-off attaches to the plan in flight so it expires with that plan
+                // and never touches the philosophy. With no plan in flight there is
+                // nothing to scope it to, so drop it rather than leak it anywhere durable.
+                match db.inflight_plan_for_user(user.id)? {
+                    Some(plan) => {
+                        db.append_plan_override(plan.id, note)?;
+                        Ok(Some("Got it -- just for this workout.".to_string()).into())
+                    }
+                    None => Ok(Some("There's no workout in progress to apply that to right now.".to_string()).into()),
+                }
             }
             AssistantAction::Unknown => {
                 tracing::debug!("Ignoring unknown action type from LLM");
@@ -3182,6 +3195,54 @@ mod tests {
         let db = handler.db.lock().await;
         assert!(db.active_plan_for_user(user.id).unwrap().is_none());
         assert_eq!(db.get_plan(plan_id).unwrap().unwrap().status, crate::db::PlanStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn one_off_override_scopes_to_plan_and_spares_philosophy() {
+        let (handler, llm) = setup_handler("").await;
+        let msg = make_message(12345, "hello");
+        let user = start_guided_workout(&handler, &llm, &msg).await;
+        let plan_id = handler.db.lock().await.active_plan_for_user(user.id).unwrap().unwrap().id;
+
+        // A one-off voiced mid-workout attaches to the plan in flight, NOT the philosophy.
+        llm.set_response(
+            r#"{"message": "Sure, flys today.", "actions": [{"type": "set_session_override", "note": "no bench today, do flys instead"}]}"#,
+        );
+        let reply = handler.handle_text_message(&msg, "I don't feel like bench today, let's do flys").await.unwrap();
+        assert!(shown(&reply).contains("just for this workout"));
+
+        {
+            let db = handler.db.lock().await;
+            let plan = db.get_plan(plan_id).unwrap().unwrap();
+            assert!(plan.override_note.as_deref().unwrap().contains("flys"), "override stored on the plan");
+            // The philosophy must be untouched — a one-off there would ban bench forever.
+            let latest = db.latest_philosophy(user.id).unwrap().unwrap();
+            assert_eq!(latest.source, "interview", "no philosophy note should have been appended");
+            assert!(!latest.content.contains("bench"), "one-off must not reach the philosophy");
+        }
+
+        // On the next turn the override surfaces in the coaching prompt for the plan in flight.
+        llm.set_response(r#"{"message": "ok", "actions": []}"#);
+        let _ = handler.handle_text_message(&msg, "what's next?").await.unwrap();
+        let last = llm.recorded_requests().pop().unwrap();
+        let system = &last.messages[0].content;
+        assert!(system.contains("TODAY-ONLY OVERRIDES"), "override must reach the coaching prompt");
+        assert!(system.contains("flys"));
+
+        // End the session, then design a fresh plan: the one-off does NOT carry over.
+        llm.set_response(r#"{"message": "Done!", "actions": [{"type": "end_session"}]}"#);
+        let _ = handler.handle_text_message(&msg, "done").await.unwrap();
+        llm.set_response(
+            r#"{"message": "New plan.", "actions": [{"type": "propose_workout", "title": "Pull", "exercises": [
+                {"exercise": "Bench Press", "target_sets": 3, "target_reps": 6, "target_weight_kg": 60.0}
+            ]}]}"#,
+        );
+        let _ = handler.handle_text_message(&msg, "/nextworkout").await.unwrap();
+
+        let db = handler.db.lock().await;
+        let fresh = db.latest_proposed_plan(user.id).unwrap().unwrap();
+        assert_ne!(fresh.id, plan_id, "a new plan was designed");
+        assert!(fresh.override_note.is_none(), "the one-off must not survive into the next design");
     }
 
     #[test]
