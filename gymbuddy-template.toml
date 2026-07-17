@@ -20,6 +20,13 @@ db_path = "data/gym-tracker.db"       # relative to data_dir
 max_message_length = 2000             # truncate user messages beyond this before sending to LLM
 session_timeout_hours = 4             # auto-close stale sessions older than this
 
+ [gym.designer_history]             # how /nextworkout reads training history
+ token_budget = 1500                 # approx token cap on the whole history block
+ full_sessions = 6                   # most-recent sessions rendered in full detail
+ max_sessions = 40                   # hard cap on how far back to load at all
+ goal_trend_points = 8               # trend points kept per goal-relevant lift (older sessions)
+ accessory_trend_points = 2          # trend points kept per incidental exercise (older sessions)
+
  [gym.voice]                        # optional voice pipeline (requires whisper + piper sidecars)
  stt_enabled = true                  # enable speech-to-text
  stt_url = "http://localhost:5005"   # whisper.cpp server endpoint

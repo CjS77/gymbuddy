@@ -37,6 +37,10 @@ pub struct GymConfig {
     /// omitted) so the feature is on out of the box.
     #[serde(default)]
     pub rest_timer: RestTimerConfig,
+    /// How much training history the `/nextworkout` designer reads and how it is
+    /// summarised. Always present (defaults applied when the block is omitted).
+    #[serde(default)]
+    pub designer_history: DesignerHistoryConfig,
 }
 
 /// Rest-timer durations (seconds) keyed by the perceived difficulty of the last
@@ -90,6 +94,48 @@ impl RestTimerConfig {
             Difficulty::Medium => self.medium_secs,
             Difficulty::Hard => self.hard_secs,
             Difficulty::Failure => self.failure_secs,
+        }
+    }
+}
+
+/// Controls the `/nextworkout` designer's history window: how far back to read,
+/// how many recent sessions to render in full, and — for the older sessions that
+/// collapse to per-exercise trend lines — how much depth a goal-relevant lift keeps
+/// versus an incidental accessory. The whole block is bounded by `token_budget`
+/// rather than a raw session count, so a goal lift trained weekly can show a long
+/// progression without the prompt growing without bound.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct DesignerHistoryConfig {
+    /// Approximate upper bound (in estimated tokens) on the whole history block.
+    /// Recent full sessions are kept first; older trend lines fill the remainder,
+    /// goal-relevant lifts before incidental accessories.
+    #[serde(default = "default_history_token_budget")]
+    pub token_budget: usize,
+    /// Most-recent sessions rendered in full (every exercise with all its sets).
+    #[serde(default = "default_full_sessions")]
+    pub full_sessions: usize,
+    /// Hard cap on how many sessions to load at all — bounds memory and query cost
+    /// so "entire history" never becomes literal at scale.
+    #[serde(default = "default_max_sessions")]
+    pub max_sessions: usize,
+    /// Trend points kept per goal-relevant lift in the older-sessions summary — the
+    /// "depth" a lift central to a goal earns over an incidental accessory.
+    #[serde(default = "default_goal_trend_points")]
+    pub goal_trend_points: usize,
+    /// Trend points kept per incidental (non-goal) exercise in the older-sessions
+    /// summary. Deliberately small: depth on goal lifts is preferred over breadth.
+    #[serde(default = "default_accessory_trend_points")]
+    pub accessory_trend_points: usize,
+}
+
+impl Default for DesignerHistoryConfig {
+    fn default() -> Self {
+        Self {
+            token_budget: default_history_token_budget(),
+            full_sessions: default_full_sessions(),
+            max_sessions: default_max_sessions(),
+            goal_trend_points: default_goal_trend_points(),
+            accessory_trend_points: default_accessory_trend_points(),
         }
     }
 }
@@ -254,6 +300,26 @@ fn default_failure_secs() -> u32 {
 
 fn default_superset_secs() -> u32 {
     60
+}
+
+fn default_history_token_budget() -> usize {
+    1500
+}
+
+fn default_full_sessions() -> usize {
+    6
+}
+
+fn default_max_sessions() -> usize {
+    40
+}
+
+fn default_goal_trend_points() -> usize {
+    8
+}
+
+fn default_accessory_trend_points() -> usize {
+    2
 }
 
 impl GymConfig {
@@ -525,6 +591,37 @@ mod tests {
         // Unspecified fields keep their defaults.
         assert_eq!(config.rest_timer.medium_secs, 180);
         assert_eq!(config.rest_timer.hard_secs, 300);
+    }
+
+    #[test]
+    fn designer_history_defaults_when_absent() {
+        let val = minimal_gym_toml("");
+        let config: GymConfig = val.try_into().unwrap();
+        assert_eq!(config.designer_history, DesignerHistoryConfig::default());
+        assert_eq!(config.designer_history.full_sessions, 6);
+        assert_eq!(config.designer_history.token_budget, 1500);
+        assert_eq!(config.designer_history.goal_trend_points, 8);
+        assert_eq!(config.designer_history.accessory_trend_points, 2);
+        assert_eq!(config.designer_history.max_sessions, 40);
+    }
+
+    #[test]
+    fn designer_history_custom_values_parse() {
+        let val = minimal_gym_toml(
+            r#"
+            [designer_history]
+            token_budget = 800
+            full_sessions = 3
+            goal_trend_points = 12
+            "#,
+        );
+        let config: GymConfig = val.try_into().unwrap();
+        assert_eq!(config.designer_history.token_budget, 800);
+        assert_eq!(config.designer_history.full_sessions, 3);
+        assert_eq!(config.designer_history.goal_trend_points, 12);
+        // Unspecified fields keep their defaults.
+        assert_eq!(config.designer_history.accessory_trend_points, 2);
+        assert_eq!(config.designer_history.max_sessions, 40);
     }
 
     #[test]

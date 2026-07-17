@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Context as _;
@@ -5,11 +6,11 @@ use chrono::{NaiveDateTime, Utc};
 use corre_core::app::{LlmMessage, LlmProvider, LlmRequest, LlmRole};
 use tokio::sync::Mutex;
 
-use crate::config::GymConfig;
+use crate::config::{DesignerHistoryConfig, GymConfig};
 use crate::db::{
-    ConversationRole, Database, Difficulty, ExerciseEntry, ExerciseSet, ExerciseTypeWithAncestry, InterviewState, MeasurementType, Session,
-    SessionWithSets, SetEdit, SetEditError, User, WorkoutPhilosophy, WorkoutPlanExercise, new_conversation_message, new_exercise_entry_at,
-    new_exercise_goal, new_exercise_set, new_health_entry, new_user, new_user_with_pubkey,
+    ConversationRole, Database, Difficulty, EntryWithSets, ExerciseEntry, ExerciseSet, ExerciseTypeWithAncestry, GoalProgress, InterviewState,
+    MeasurementType, Session, SessionWithSets, SetEdit, SetEditError, User, WorkoutPhilosophy, WorkoutPlanExercise, new_conversation_message,
+    new_exercise_entry_at, new_exercise_goal, new_exercise_set, new_health_entry, new_user, new_user_with_pubkey,
 };
 use crate::github::IssueReporter;
 use crate::telegram::Message as TgMessage;
@@ -449,14 +450,19 @@ impl AssistantHandler {
     async fn cmd_next_workout(&self, user: &User, text: &str) -> anyhow::Result<View> {
         let guidance = text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
 
-        let (philosophy, sessions, recovery, goals, injuries) = {
+        let (philosophy, sessions, recovery, goals, injuries, goal_ids) = {
             let db = self.db.lock().await;
+            let goals = db.goal_progress_report(user.id, None, None)?;
+            let goal_ids = goal_relevant_exercise_ids(&db, &goals)?;
+            // Pull a generous window (bounded by config); the summariser decides how
+            // much of it survives into the prompt under the token budget.
             (
                 db.latest_philosophy(user.id)?,
-                db.recent_sessions_with_sets(user.id, 3)?,
+                db.recent_sessions_with_sets(user.id, self.config.designer_history.max_sessions)?,
                 db.muscle_recovery(user.id)?,
-                db.goal_progress_report(user.id, None, None)?,
+                goals,
                 db.list_active_health_entries(user.id)?,
+                goal_ids,
             )
         };
 
@@ -468,7 +474,7 @@ impl AssistantHandler {
             ));
         };
 
-        let history_block = self.format_designer_history(&sessions);
+        let history_block = self.format_designer_history(&sessions, &goal_ids);
         let recovery_block = format_muscle_recovery(&recovery, chrono::Utc::now().date_naive());
         let prompt = build_designer_prompt(&philosophy.content, &history_block, &recovery_block, &goals, &injuries, &self.catalogue);
         let user_text = if guidance.trim().is_empty() { "Design my next workout.".to_string() } else { guidance };
@@ -548,23 +554,12 @@ impl AssistantHandler {
         Ok(View::Workout(WorkoutView { title, rationale, exercises: planned, notes }))
     }
 
-    /// Format recent sessions (each exercise with its sets and effort) for the
-    /// designer prompt, e.g. "Bench Press (60kg x 8 easy, 65kg x 6 medium)".
-    fn format_designer_history(&self, sessions: &[SessionWithSets]) -> String {
-        if sessions.is_empty() {
-            return "RECENT HISTORY: none logged yet.\n".to_string();
-        }
-        let mut out = "RECENT HISTORY (most recent first):\n".to_string();
-        for (session, entries) in sessions {
-            out.push_str(&format!("- Session {}:\n", session.started_at));
-            for (_entry, sets) in entries {
-                let Some(first) = sets.first() else { continue };
-                let name = self.exercise_name(first.exercise_type_id);
-                let set_descs = sets.iter().map(format_set_desc).collect::<Vec<_>>().join(", ");
-                out.push_str(&format!("    {name} ({set_descs})\n"));
-            }
-        }
-        out
+    /// Build the designer's history block: the most recent sessions in full, older
+    /// sessions collapsed to per-exercise trend lines, the whole thing bounded by the
+    /// configured token budget with goal-relevant lifts favoured over incidental ones.
+    /// See [`summarise_designer_history`].
+    fn format_designer_history(&self, sessions: &[SessionWithSets], goal_ids: &HashSet<i64>) -> String {
+        summarise_designer_history(sessions, goal_ids, &self.config.designer_history, &|id| self.exercise_name(id))
     }
 
     /// The command list both `/start` and `/help` show, one command per line,
@@ -1659,6 +1654,132 @@ going in the existing session — and I'll log that set accordingly."
     }
 }
 
+/// The set of exercise-type ids that count as "goal-relevant": every goal's target
+/// exercise plus all of its taxonomy descendants, so a goal on a parent node (e.g.
+/// "Bench Press") pulls in its variations too. Used to give those lifts more history
+/// depth in the designer prompt than incidental accessories.
+fn goal_relevant_exercise_ids(db: &Database, goals: &[GoalProgress]) -> anyhow::Result<HashSet<i64>> {
+    goals.iter().try_fold(HashSet::new(), |mut acc, g| {
+        acc.extend(db.descendant_ids_inclusive(g.goal.exercise_type_id)?);
+        Ok(acc)
+    })
+}
+
+/// Header for the older-sessions summary appended after the full recent block.
+const EARLIER_TRENDS_HEADER: &str = "EARLIER TRENDS (older sessions, oldest to newest; * = goal-relevant):\n";
+
+/// Rough token estimate for budgeting the history block: ~4 chars per token. Only
+/// needs to be monotonic and in the right ballpark, not exact.
+fn estimate_tokens(s: &str) -> usize {
+    s.len().div_ceil(4)
+}
+
+/// The representative set of an entry for a trend line: the heaviest/longest by
+/// `value` (ties keep the earliest). This is the "top set" the designer reasons
+/// about when tracking progression.
+fn top_set(sets: &[ExerciseSet]) -> Option<&ExerciseSet> {
+    sets.iter().reduce(|best, s| if s.value > best.value { s } else { best })
+}
+
+/// One session rendered in full: every exercise with all its sets, exactly as the
+/// designer read history before summarisation was introduced.
+fn format_full_session(session: &Session, entries: &[EntryWithSets], name_of: &impl Fn(i64) -> String) -> String {
+    let mut out = format!("- Session {}:\n", session.started_at);
+    for (_entry, sets) in entries {
+        let Some(first) = sets.first() else { continue };
+        let name = name_of(first.exercise_type_id);
+        let set_descs = sets.iter().map(format_set_desc).collect::<Vec<_>>().join(", ");
+        out.push_str(&format!("    {name} ({set_descs})\n"));
+    }
+    out
+}
+
+/// Collapse the older sessions into one trend line per exercise, priority-ordered:
+/// goal-relevant lifts first (each keeping up to `goal_trend_points` points), then
+/// incidental exercises (up to `accessory_trend_points`). Within a group, lines are
+/// sorted by name for stable output. Points read oldest → newest, e.g.
+/// "    Bench Press*: 55kg x 8 easy (2026-05-01) -> 60kg x 6 medium (2026-05-15)".
+fn build_trend_lines(older: &[SessionWithSets], goal_ids: &HashSet<i64>, cfg: &DesignerHistoryConfig, name_of: &impl Fn(i64) -> String) -> Vec<String> {
+    // Gather each exercise's top set per session. `older` is most-recent-first, so we
+    // push in that order and read the tail (most recent points) when rendering.
+    let mut points: BTreeMap<i64, Vec<(String, String)>> = BTreeMap::new();
+    for (session, entries) in older {
+        let date = session.started_at.get(..10).unwrap_or(&session.started_at).to_string();
+        for (_entry, sets) in entries {
+            if let Some(set) = top_set(sets) {
+                points.entry(set.exercise_type_id).or_default().push((date.clone(), format_set_desc(set)));
+            }
+        }
+    }
+
+    // `series` is most-recent-first; keep the freshest `keep` points and present them
+    // oldest → newest so the designer reads a left-to-right progression.
+    let render = |id: i64, series: &[(String, String)], keep: usize| -> String {
+        let marker = if goal_ids.contains(&id) { "*" } else { "" };
+        let steps = series.iter().take(keep.max(1)).rev().map(|(date, desc)| format!("{desc} ({date})")).collect::<Vec<_>>().join(" -> ");
+        format!("    {}{marker}: {steps}\n", name_of(id))
+    };
+
+    let (mut goal, mut accessory): (Vec<_>, Vec<_>) = points.iter().partition(|(id, _)| goal_ids.contains(id));
+    let key = |(id, _): &(&i64, &Vec<(String, String)>)| name_of(**id);
+    goal.sort_by_key(key);
+    accessory.sort_by_key(key);
+
+    let goal_lines = goal.into_iter().map(|(id, series)| render(*id, series, cfg.goal_trend_points));
+    let accessory_lines = accessory.into_iter().map(|(id, series)| render(*id, series, cfg.accessory_trend_points));
+    goal_lines.chain(accessory_lines).collect()
+}
+
+/// Format the `/nextworkout` designer's training-history block. The most recent
+/// `full_sessions` sessions are rendered in full (every exercise and set); older
+/// sessions collapse to per-exercise trend lines. The block is bounded by
+/// `token_budget`: recent full sessions are kept first, then trend lines are appended
+/// in priority order (goal-relevant lifts before incidental accessories) until the
+/// budget is reached, so depth on goal lifts is preferred over breadth. `sessions`
+/// must be most-recent-first (as `recent_sessions_with_sets` returns them).
+fn summarise_designer_history(
+    sessions: &[SessionWithSets],
+    goal_ids: &HashSet<i64>,
+    cfg: &DesignerHistoryConfig,
+    name_of: &impl Fn(i64) -> String,
+) -> String {
+    if sessions.is_empty() {
+        return "RECENT HISTORY: none logged yet.\n".to_string();
+    }
+
+    let full_count = cfg.full_sessions.min(sessions.len());
+    let (recent, older) = sessions.split_at(full_count);
+
+    // Recent sessions in full: always included — they are the point of the block.
+    let mut out = "RECENT HISTORY (most recent first):\n".to_string();
+    out.extend(recent.iter().map(|(session, entries)| format_full_session(session, entries, name_of)));
+    let mut used = estimate_tokens(&out);
+
+    // Older sessions as trend lines, filled greedily under the remaining budget in
+    // priority order. A line that would overflow stops the fill (the rest are lower
+    // priority), so goal lifts are never dropped to fit an incidental accessory.
+    let trend_lines = build_trend_lines(older, goal_ids, cfg, name_of);
+    let mut emitted = 0usize;
+    for line in &trend_lines {
+        let header_cost = if emitted == 0 { estimate_tokens(EARLIER_TRENDS_HEADER) } else { 0 };
+        if used + header_cost + estimate_tokens(line) > cfg.token_budget {
+            break;
+        }
+        if emitted == 0 {
+            out.push_str(EARLIER_TRENDS_HEADER);
+        }
+        out.push_str(line);
+        used += header_cost + estimate_tokens(line);
+        emitted += 1;
+    }
+
+    let dropped = trend_lines.len() - emitted;
+    if dropped > 0 {
+        out.push_str(&format!("    (+{dropped} older exercise trend(s) omitted to fit the history budget)\n"));
+    }
+    out
+}
+
 /// One logged set as the designer prompt reads it, e.g. "60kg x 8 easy" or
 /// "60s hard". Effort is the perceived difficulty so the designer can progress or
 /// back off the load.
@@ -1957,6 +2078,7 @@ mod tests {
             github: None,
             confide: None,
             rest_timer: crate::config::RestTimerConfig::default(),
+            designer_history: crate::config::DesignerHistoryConfig::default(),
         }
     }
 
@@ -3292,5 +3414,128 @@ mod tests {
         assert!(!proposed_plan_within_window("2026-06-19 00:00:00", now));
         // Unparseable timestamp fails open (we just wrote it).
         assert!(proposed_plan_within_window("not a date", now));
+    }
+
+    // ── Designer history window ───────────────────────────────────────────────
+
+    /// Insert one session at `started_at`, each exercise in its own entry (as real
+    /// logging does) so per-exercise trends resolve independently.
+    fn seed_dated_session(db: &Database, user_id: i64, started_at: &str, exercises: &[(i64, f64, i32)]) {
+        db.conn()
+            .execute("INSERT INTO sessions (user_id, started_at) VALUES (?1, ?2)", rusqlite::params![user_id, started_at])
+            .unwrap();
+        let session_id = db.conn().last_insert_rowid();
+        for (et_id, weight, count) in exercises {
+            let entry_id = db.insert_entry(&new_exercise_entry_at(user_id, Some(session_id), None, started_at)).unwrap();
+            let mut s = new_exercise_set(entry_id, *et_id, MeasurementType::WeightReps, *weight);
+            s.count = Some(*count);
+            s.logged_at = started_at.to_string();
+            db.insert_set(&s).unwrap();
+        }
+    }
+
+    /// Insert an active goal whose `start_date` is a past date-only string so the
+    /// date-windowed `goal_progress_report` returns it (its default now-datetime
+    /// start would sort after today's date-only bound and be filtered out).
+    fn seed_goal(db: &Database, user_id: i64, exercise_type_id: i64) {
+        let mut goal = new_exercise_goal(user_id, exercise_type_id, 100.0);
+        goal.start_date = "2026-01-01".into();
+        db.insert_goal(&goal).unwrap();
+    }
+
+    /// A name resolver over the seeded catalogue, matching what the handler passes in.
+    fn name_resolver(db: &Database) -> impl Fn(i64) -> String {
+        let names: std::collections::HashMap<i64, String> =
+            db.list_exercise_types_with_ancestry().unwrap().into_iter().map(|e| (e.exercise_type.id, e.exercise_type.name)).collect();
+        move |id| names.get(&id).cloned().unwrap_or_else(|| "unknown".to_string())
+    }
+
+    #[test]
+    fn goal_relevant_ids_include_goal_exercise_and_descendants() {
+        let db = Database::open_in_memory().unwrap();
+        let user_id = db.insert_user(&new_user("Tester", None, "UTC")).unwrap();
+        let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+        let variation = db.get_exercise_type_by_name("Flat Barbell Bench Press").unwrap().unwrap();
+        let curl = db.get_exercise_type_by_name("Bicep Curl").unwrap().unwrap();
+
+        seed_goal(&db, user_id, bench.id);
+        let goals = db.goal_progress_report(user_id, None, None).unwrap();
+        let ids = goal_relevant_exercise_ids(&db, &goals).unwrap();
+
+        assert!(ids.contains(&bench.id), "the goal exercise itself is goal-relevant");
+        assert!(ids.contains(&variation.id), "descendant variations roll up under a parent-node goal");
+        assert!(!ids.contains(&curl.id), "unrelated exercises are not goal-relevant");
+    }
+
+    #[test]
+    fn designer_history_keeps_recent_full_and_collapses_older_to_trends() {
+        let db = Database::open_in_memory().unwrap();
+        let user_id = db.insert_user(&new_user("Tester", None, "UTC")).unwrap();
+        let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+        let curl = db.get_exercise_type_by_name("Bicep Curl").unwrap().unwrap();
+
+        // Six sessions, oldest → newest, each training the goal lift and an accessory.
+        for (i, day) in (1..=6).enumerate() {
+            let weight = 50.0 + i as f64 * 2.5;
+            seed_dated_session(&db, user_id, &format!("2026-05-0{day} 10:00:00"), &[(bench.id, weight, 8), (curl.id, 15.0 + i as f64, 10)]);
+        }
+        seed_goal(&db, user_id, bench.id);
+
+        let goals = db.goal_progress_report(user_id, None, None).unwrap();
+        let goal_ids = goal_relevant_exercise_ids(&db, &goals).unwrap();
+        let sessions = db.recent_sessions_with_sets(user_id, 40).unwrap();
+        let name_of = name_resolver(&db);
+
+        let cfg = DesignerHistoryConfig { token_budget: 100_000, full_sessions: 2, max_sessions: 40, goal_trend_points: 5, accessory_trend_points: 1 };
+        let out = summarise_designer_history(&sessions, &goal_ids, &cfg, &name_of);
+
+        // Only the two most recent sessions render in full; the rest collapse to trends.
+        assert_eq!(out.matches("- Session ").count(), 2, "only the 2 most recent sessions are full:\n{out}");
+        assert!(out.contains("2026-05-06") && out.contains("2026-05-05"), "the two newest sessions are present in full");
+        assert!(out.contains("EARLIER TRENDS"), "older sessions collapse under a trends header:\n{out}");
+
+        // Depth over breadth: the goal lift keeps several trend points (arrows), the
+        // incidental accessory collapses to a single point.
+        let bench_trend = out.lines().find(|l| l.trim_start().starts_with("Bench Press*:")).expect("goal lift trend, marked *");
+        let curl_trend = out.lines().find(|l| l.trim_start().starts_with("Bicep Curl:")).expect("accessory trend line");
+        assert!(bench_trend.matches("->").count() >= 2, "goal lift retains more history: {bench_trend}");
+        assert_eq!(curl_trend.matches("->").count(), 0, "accessory collapses to one point: {curl_trend}");
+    }
+
+    #[test]
+    fn designer_history_token_budget_prefers_goal_lift_over_accessory() {
+        let db = Database::open_in_memory().unwrap();
+        let user_id = db.insert_user(&new_user("Tester", None, "UTC")).unwrap();
+        let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+        let curl = db.get_exercise_type_by_name("Bicep Curl").unwrap().unwrap();
+
+        // Older sessions train both lifts; the newest (the single full session) is
+        // bench-only, so the accessory can only ever appear as a trend line.
+        for (i, day) in (1..=3).enumerate() {
+            seed_dated_session(&db, user_id, &format!("2026-05-0{day} 10:00:00"), &[(bench.id, 50.0 + i as f64, 8), (curl.id, 15.0, 10)]);
+        }
+        seed_dated_session(&db, user_id, "2026-05-04 10:00:00", &[(bench.id, 55.0, 8)]);
+        seed_goal(&db, user_id, bench.id);
+
+        let goals = db.goal_progress_report(user_id, None, None).unwrap();
+        let goal_ids = goal_relevant_exercise_ids(&db, &goals).unwrap();
+        let sessions = db.recent_sessions_with_sets(user_id, 40).unwrap();
+        let name_of = name_resolver(&db);
+
+        let mut cfg = DesignerHistoryConfig { token_budget: usize::MAX, full_sessions: 1, max_sessions: 40, goal_trend_points: 5, accessory_trend_points: 3 };
+
+        // Size the budget to fit the recent block + trends header + the first (goal)
+        // trend line exactly — leaving no room for the accessory line that follows.
+        let (recent, older) = sessions.split_at(cfg.full_sessions);
+        let mut recent_block = "RECENT HISTORY (most recent first):\n".to_string();
+        recent_block.extend(recent.iter().map(|(s, e)| format_full_session(s, e, &name_of)));
+        let lines = build_trend_lines(older, &goal_ids, &cfg, &name_of);
+        assert!(lines[0].trim_start().starts_with("Bench Press*:"), "goal lift sorts ahead of the accessory: {lines:?}");
+        cfg.token_budget = estimate_tokens(&recent_block) + estimate_tokens(EARLIER_TRENDS_HEADER) + estimate_tokens(&lines[0]);
+
+        let out = summarise_designer_history(&sessions, &goal_ids, &cfg, &name_of);
+        assert!(out.contains("Bench Press*:"), "the goal lift trend survives the budget:\n{out}");
+        assert!(!out.contains("Bicep Curl"), "the accessory trend is dropped under budget:\n{out}");
+        assert!(out.contains("omitted to fit the history budget"), "a truncation note is emitted:\n{out}");
     }
 }
