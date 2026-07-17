@@ -487,8 +487,16 @@ impl AssistantHandler {
         });
 
         let Some((title, rationale, exercises)) = proposal else {
-            // No structured plan came back — surface the prose so the turn is not a dead end.
-            return Ok(View::message(crate::text::strip_markdown(&parsed.message)));
+            // The designer returned something that isn't a valid `propose_workout`
+            // (unparseable JSON, or valid JSON without the required action). FAIL LOUD:
+            // do NOT render the prose as if a workout were created, and persist nothing.
+            // Rendering the fallback prose here used to silently mislead — the user saw a
+            // "workout" that was never saved. See ticket C1.7.
+            tracing::warn!(user_id = user.id, response = %llm_response, "workout designer returned no valid propose_workout");
+            return Ok(View::notice(
+                "I couldn't design a valid workout this time. Please try /nextworkout again, \
+                 optionally adding a hint like /nextworkout upper body.",
+            ));
         };
 
         self.persist_and_view_workout(user, &philosophy, title, rationale, exercises).await
@@ -910,6 +918,13 @@ impl AssistantHandler {
 
         messages.push(LlmMessage { role: LlmRole::User, content: user_text.to_string() });
 
+        // NOTE: `json_mode` is best-effort and currently a no-op. corre's
+        // `OpenAiCompatProvider` ignores this field entirely (it hardcodes
+        // `response_format: None`), so NO JSON mode is negotiated with the provider.
+        // Our JSON contract is instead enforced by the prompt text (see prompts.rs)
+        // plus the tolerant `parse_assistant_response` extractor. We still set it to
+        // `true` to record intent, so JSON mode engages automatically if/when the
+        // provider learns to honour it upstream. See ticket C1.7.
         let request =
             LlmRequest { messages, temperature: Some(temperature), max_completion_tokens: Some(max_tokens), json_mode: true };
 
@@ -3126,6 +3141,27 @@ mod tests {
         let db = handler.db.lock().await;
         let plan = db.latest_proposed_plan(user.id).unwrap().unwrap();
         assert_eq!(db.list_plan_exercises(plan.id).unwrap().len(), 1, "only the resolved exercise is persisted");
+    }
+
+    #[tokio::test]
+    async fn nextworkout_without_valid_proposal_fails_loud_and_persists_nothing() {
+        // The designer replies with prose but never emits a `propose_workout` action.
+        // The old behaviour rendered that prose as if a workout had been created while
+        // saving nothing; now it must fail loudly and persist no plan (ticket C1.7).
+        let (handler, _) = setup_handler("Here's a great session: heavy bench and some squats. Have fun!").await;
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
+        let user = { handler.db.lock().await.get_user_by_telegram_id("12345").unwrap().unwrap() };
+        {
+            handler.db.lock().await.insert_philosophy(user.id, "general fitness", "interview").unwrap();
+        }
+
+        let reply = handler.handle_text_message(&msg, "/nextworkout").await.unwrap();
+        let text = shown(&reply).to_lowercase();
+        assert!(text.contains("couldn't design a valid workout"), "should surface a clear retry notice, got: {text}");
+
+        let db = handler.db.lock().await;
+        assert!(db.latest_proposed_plan(user.id).unwrap().is_none(), "no phantom plan may be persisted on a failed design");
     }
 
     /// Register a user, give them a philosophy, design a one-exercise workout, then

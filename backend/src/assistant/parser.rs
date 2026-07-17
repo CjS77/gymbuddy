@@ -1,45 +1,69 @@
 use super::actions::AssistantResponse;
 
-/// Extract a JSON object from LLM output that may contain markdown fencing
-/// or surrounding prose. Prioritizes `{...}` objects over `[...]` arrays
-/// since our response format is always a JSON object.
+/// Extract the JSON object from raw LLM output.
+///
+/// This tolerance is the DELIBERATE, load-bearing strategy for reliable structured
+/// output — not a lucky accident. The current provider does not negotiate a JSON
+/// response format with the model (the `json_mode` flag on `LlmRequest` is ignored
+/// by `corre`'s `OpenAiCompatProvider`; see the note in `handler::call_llm_with`),
+/// so the "respond with ONLY a JSON object" prompt contract is actually recovered
+/// HERE, by peeling off the wrapping models habitually add:
+///   - markdown code fences (```` ```json … ``` ```` or bare ```` ``` … ``` ````), and
+///   - surrounding prose ("Sure! Here you go: { … } hope that helps").
+///
+/// Our response schema is always a JSON *object*, so once any fence is stripped we
+/// narrow to the outermost `{ … }` and ignore stray `[…]` or prose on either side.
+/// Extraction is best-effort and never errors; callers that need a strict yes/no on
+/// whether the model actually produced a valid response use
+/// [`try_parse_assistant_response`].
 fn extract_json_object(text: &str) -> &str {
     let trimmed = text.trim();
 
-    // Strip ```json ... ``` fences
-    if let Some(start) = trimmed.find("```json") {
-        let after_fence = &trimmed[start + 7..];
-        if let Some(end) = after_fence.find("```") {
-            return after_fence[..end].trim();
-        }
-    }
-    if let Some(start) = trimmed.find("```") {
-        let after_fence = &trimmed[start + 3..];
-        if let Some(end) = after_fence.find("```") {
-            return after_fence[..end].trim();
-        }
-    }
+    // If the model fenced its reply, continue inside the first fenced block.
+    let unfenced = strip_code_fence(trimmed).unwrap_or(trimmed);
 
-    // Find outermost { } first (our response is always an object)
-    if let Some(start) = trimmed.find('{') {
-        if let Some(end) = trimmed.rfind('}') {
-            return &trimmed[start..=end];
-        }
+    // The schema is a single object: narrow to the outermost braces.
+    match (unfenced.find('{'), unfenced.rfind('}')) {
+        (Some(start), Some(end)) if start <= end => &unfenced[start..=end],
+        _ => unfenced,
     }
-
-    trimmed
 }
 
-/// Parse an LLM response string into an `AssistantResponse`.
-///
-/// Handles markdown-fenced JSON, raw JSON, and falls back to treating the
-/// entire response as a plain-text message with no actions.
-pub fn parse_assistant_response(raw: &str) -> AssistantResponse {
-    let json_str = extract_json_object(raw);
-    tracing::debug!(raw_len = raw.len(), json_len = json_str.len(), "Parsing LLM response");
-    tracing::debug!(json = json_str, "Extracted JSON");
+/// Return the trimmed contents of the first ```` ```json ```` (preferred) or bare
+/// ```` ``` ```` fenced block. Returns `None` when there is no opening or no closing
+/// fence, leaving the caller to work with the unfenced text.
+fn strip_code_fence(trimmed: &str) -> Option<&str> {
+    let after_open =
+        trimmed.find("```json").map(|i| &trimmed[i + 7..]).or_else(|| trimmed.find("```").map(|i| &trimmed[i + 3..]))?;
+    let end = after_open.find("```")?;
+    Some(after_open[..end].trim())
+}
 
-    match serde_json::from_str::<AssistantResponse>(json_str) {
+/// Strictly parse raw LLM output into an [`AssistantResponse`], returning the serde
+/// error when the extracted text is not a valid response.
+///
+/// This is the honest yes/no: it distinguishes "the model produced a real structured
+/// response" from "the model produced prose". [`parse_assistant_response`] wraps this
+/// with the tolerant plain-text fallback the free-form chat path relies on; callers
+/// with a hard structured-output requirement can use this directly to fail loudly.
+pub fn try_parse_assistant_response(raw: &str) -> Result<AssistantResponse, serde_json::Error> {
+    serde_json::from_str::<AssistantResponse>(extract_json_object(raw))
+}
+
+/// Parse raw LLM output into an [`AssistantResponse`], tolerating the wrapping models
+/// add (markdown fences, surrounding prose) and, as a last resort, degrading to a
+/// plain-text message with no actions.
+///
+/// The tolerance here is intentional and load-bearing (see [`extract_json_object`]):
+/// because the provider does not enforce a JSON response format, this is where the
+/// prompt's "ONLY a JSON object" contract is recovered. The plain-text fallback is
+/// the RIGHT behaviour for a free-form chat turn — a conversational reply is shown
+/// as-is rather than erroring. But callers with a hard structured-output requirement
+/// (e.g. the `/nextworkout` designer) must NOT treat that fallback as success: they
+/// check for the specific action they demanded and fail loudly when it is absent,
+/// instead of rendering the fallback prose as if it were the result.
+pub fn parse_assistant_response(raw: &str) -> AssistantResponse {
+    match try_parse_assistant_response(raw) {
         Ok(parsed) => {
             tracing::debug!(message_len = parsed.message.len(), actions = parsed.actions.len(), "Parsed response");
             for (i, action) in parsed.actions.iter().enumerate() {
@@ -96,6 +120,33 @@ mod tests {
     #[test]
     fn fallback_on_malformed_json() {
         let raw = "I'm not sure what you mean. Could you try again?";
+        let resp = parse_assistant_response(raw);
+        assert_eq!(resp.message, raw);
+        assert!(resp.actions.is_empty());
+    }
+
+    #[test]
+    fn extracts_json_from_surrounding_prose_and_fences() {
+        // Fenced JSON with chatty prose on both sides — the shape models love to emit.
+        let raw = "Sure, here's the plan!\n```json\n{\"message\": \"Ready\", \"actions\": [{\"type\": \"start_session\"}]}\n```\nHope that helps.";
+        let resp = parse_assistant_response(raw);
+        assert_eq!(resp.message, "Ready");
+        assert_eq!(resp.actions.len(), 1);
+        assert!(matches!(resp.actions[0], AssistantAction::StartSession { .. }));
+
+        // A bare object embedded in prose, no fences at all.
+        let raw = "Here you go: {\"message\": \"Hi\", \"actions\": []} -- anything else?";
+        let resp = parse_assistant_response(raw);
+        assert_eq!(resp.message, "Hi");
+        assert!(resp.actions.is_empty());
+    }
+
+    #[test]
+    fn non_json_input_is_reported_as_parse_failure() {
+        let raw = "I'm sorry, I really can't help with that request.";
+        // The strict parser REPORTS the failure rather than silently swallowing it...
+        assert!(try_parse_assistant_response(raw).is_err());
+        // ...and the tolerant wrapper degrades to a plain message with NO fabricated actions.
         let resp = parse_assistant_response(raw);
         assert_eq!(resp.message, raw);
         assert!(resp.actions.is_empty());
