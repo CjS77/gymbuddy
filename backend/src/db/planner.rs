@@ -3,11 +3,16 @@
 //! plans. Designing or storing a plan never logs a set — that stays on the
 //! sessions/exercise_entry/sets path.
 
+use std::collections::{HashMap, HashSet};
+
 use anyhow::Context as _;
 use rusqlite::params;
 
 use super::database::Database;
-use super::models::{ExerciseEntry, ExerciseSet, InterviewState, PlanStatus, Session, WorkoutPlan, WorkoutPlanExercise, WorkoutPhilosophy};
+use super::models::{
+    ExerciseDelta, ExerciseEntry, ExerciseSet, InterviewState, MeasurementType, PerformedRollup, PlanStatus, PlanVsActual, Session,
+    SkippedExercise, UnplannedExercise, WorkoutPlan, WorkoutPlanExercise, WorkoutPhilosophy,
+};
 
 /// An exercise entry paired with the sets logged into it.
 pub type EntryWithSets = (ExerciseEntry, Vec<ExerciseSet>);
@@ -15,6 +20,10 @@ pub type EntryWithSets = (ExerciseEntry, Vec<ExerciseSet>);
 /// A session paired with its entries and their sets — how the `/nextworkout`
 /// designer reads recent history.
 pub type SessionWithSets = (Session, Vec<EntryWithSets>);
+
+/// A session's logged sets grouped by `exercise_type_id`, for rolling performance
+/// up per exercise to diff against a plan's prescription.
+type PerformedSets = HashMap<i64, Vec<ExerciseSet>>;
 
 fn row_to_philosophy(row: &rusqlite::Row) -> rusqlite::Result<WorkoutPhilosophy> {
     Ok(WorkoutPhilosophy {
@@ -227,6 +236,128 @@ impl Database {
             })
             .collect()
     }
+
+    // ── Prescribed vs actual ──────────────────────────────────────────────────────
+
+    /// Compare a plan's prescription against what its bound session actually
+    /// performed. The plan carries the `session_id` binding (see
+    /// [`bind_plan_to_session`](Self::bind_plan_to_session)); performed sets are
+    /// rolled up per exercise_type and diffed against the plan's per-exercise
+    /// targets. See [`PlanVsActual`] / [`ExerciseDelta`] for the signed-deviation
+    /// semantics: deltas are `performed − prescribed`, and deviation is signal, not
+    /// error. Errors if the plan is unknown or not yet bound to a session.
+    pub fn plan_vs_actual(&self, plan_id: i64) -> anyhow::Result<PlanVsActual> {
+        let plan = self.get_plan(plan_id)?.with_context(|| format!("Workout plan {plan_id} not found"))?;
+        let session_id = plan.session_id.with_context(|| format!("Workout plan {plan_id} is not bound to a session"))?;
+
+        let planned = self.list_plan_exercises(plan_id)?;
+        let planned_ids: HashSet<i64> = planned.iter().map(|pe| pe.exercise_type_id).collect();
+        let (performed, performed_order) = self.performed_by_exercise(session_id)?;
+
+        let matched = planned
+            .iter()
+            .filter_map(|pe| performed.get(&pe.exercise_type_id).map(|sets| self.exercise_delta(pe, sets)))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let skipped = planned
+            .iter()
+            .filter(|pe| !performed.contains_key(&pe.exercise_type_id))
+            .map(|pe| self.skipped_exercise(pe))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let unplanned = performed_order
+            .iter()
+            .filter(|type_id| !planned_ids.contains(type_id))
+            .map(|&type_id| self.unplanned_exercise(type_id, &performed[&type_id]))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        Ok(PlanVsActual { plan_id, session_id, matched, skipped, unplanned })
+    }
+
+    /// Every set logged in `session_id`, grouped by `exercise_type_id`, plus the
+    /// exercise_type ids in the order they were first logged (so the unplanned list
+    /// keeps a stable, session-chronological order).
+    fn performed_by_exercise(&self, session_id: i64) -> anyhow::Result<(PerformedSets, Vec<i64>)> {
+        let sets = self
+            .list_entries_for_session(session_id)?
+            .iter()
+            .map(|entry| self.list_sets_for_entry(entry.id))
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten();
+
+        let mut grouped: PerformedSets = HashMap::new();
+        let mut order: Vec<i64> = Vec::new();
+        sets.for_each(|set| {
+            let type_id = set.exercise_type_id;
+            if !grouped.contains_key(&type_id) {
+                order.push(type_id);
+            }
+            grouped.entry(type_id).or_default().push(set);
+        });
+        Ok((grouped, order))
+    }
+
+    fn exercise_delta(&self, pe: &WorkoutPlanExercise, sets: &[ExerciseSet]) -> anyhow::Result<ExerciseDelta> {
+        let measurement_type = sets.first().map(|s| s.measurement_type).unwrap_or(MeasurementType::WeightReps);
+        let performed = rollup(sets, measurement_type);
+        Ok(ExerciseDelta {
+            exercise_name: self.exercise_name(pe.exercise_type_id)?,
+            measurement_type,
+            sets_delta: pe.target_sets.map(|t| performed.performed_sets - i64::from(t)),
+            reps_delta: signed_delta(performed.avg_reps, pe.target_reps.map(f64::from)),
+            weight_delta_kg: signed_delta(performed.avg_weight_kg, pe.target_weight_kg),
+            secs_delta: signed_delta(performed.avg_secs, pe.target_secs.map(f64::from)),
+            prescribed: pe.clone(),
+            performed,
+        })
+    }
+
+    fn skipped_exercise(&self, pe: &WorkoutPlanExercise) -> anyhow::Result<SkippedExercise> {
+        Ok(SkippedExercise { exercise_name: self.exercise_name(pe.exercise_type_id)?, prescribed: pe.clone() })
+    }
+
+    fn unplanned_exercise(&self, exercise_type_id: i64, sets: &[ExerciseSet]) -> anyhow::Result<UnplannedExercise> {
+        let measurement_type = sets.first().map(|s| s.measurement_type).unwrap_or(MeasurementType::WeightReps);
+        Ok(UnplannedExercise {
+            exercise_type_id,
+            exercise_name: self.exercise_name(exercise_type_id)?,
+            measurement_type,
+            performed: rollup(sets, measurement_type),
+        })
+    }
+
+    fn exercise_name(&self, exercise_type_id: i64) -> anyhow::Result<String> {
+        Ok(self
+            .get_exercise_type(exercise_type_id)?
+            .map(|et| et.name)
+            .unwrap_or_else(|| format!("exercise {exercise_type_id}")))
+    }
+}
+
+/// Mean of the values, or `None` when there are none (so an absent dimension
+/// reads as "unspecified", never a misleading `0.0`).
+fn mean(values: &[f64]) -> Option<f64> {
+    (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+}
+
+/// Signed `performed − prescribed`, defined only when both sides are present.
+fn signed_delta(performed: Option<f64>, prescribed: Option<f64>) -> Option<f64> {
+    performed.zip(prescribed).map(|(p, t)| p - t)
+}
+
+/// Roll a session's sets for one exercise up into a single performance to diff
+/// against the plan's per-exercise prescription. `value` is interpreted per the
+/// measurement type: weight for weight_reps, seconds for time_based; other types
+/// have no weight/secs prescription to compare against, so both stay `None`.
+fn rollup(sets: &[ExerciseSet], measurement_type: MeasurementType) -> PerformedRollup {
+    let reps: Vec<f64> = sets.iter().filter_map(|s| s.count).map(f64::from).collect();
+    let values: Vec<f64> = sets.iter().map(|s| s.value).collect();
+    let avg_value = mean(&values);
+    let (avg_weight_kg, avg_secs) = match measurement_type {
+        MeasurementType::WeightReps => (avg_value, None),
+        MeasurementType::TimeBased => (None, avg_value),
+        _ => (None, None),
+    };
+    PerformedRollup { performed_sets: sets.len() as i64, avg_reps: mean(&reps), avg_weight_kg, avg_secs }
 }
 
 #[cfg(test)]
@@ -362,5 +493,115 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].1.len(), 1);
         assert_eq!(entries[0].1[0].value, 60.0);
+    }
+
+    /// Log `reps`×`weight` `n` times against `exercise_type_id` in one entry.
+    fn log_sets(db: &Database, user_id: i64, session_id: i64, exercise_type_id: i64, n: usize, reps: i32, weight: f64) {
+        let entry = db.insert_entry(&new_exercise_entry(user_id, Some(session_id), None)).unwrap();
+        (0..n).for_each(|_| {
+            let mut set = new_exercise_set(entry, exercise_type_id, MeasurementType::WeightReps, weight);
+            set.count = Some(reps);
+            db.insert_set(&set).unwrap();
+        });
+    }
+
+    #[test]
+    fn plan_vs_actual_matches_skips_and_flags_unplanned() {
+        let (db, user_id) = test_db();
+        let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+        let squat = db.get_exercise_type_by_name("Squat").unwrap().unwrap();
+        let deadlift = db.get_exercise_type_by_name("Deadlift").unwrap().unwrap();
+
+        let plan_id = db.create_plan(user_id, "Lower + press", None, None).unwrap();
+        db.add_plan_exercise(&WorkoutPlanExercise {
+            id: 0,
+            plan_id,
+            exercise_type_id: bench.id,
+            order_idx: 0,
+            target_sets: Some(3),
+            target_reps: Some(6),
+            target_weight_kg: Some(65.0),
+            target_secs: None,
+            notes: None,
+        })
+        .unwrap();
+        db.add_plan_exercise(&WorkoutPlanExercise {
+            id: 0,
+            plan_id,
+            exercise_type_id: squat.id,
+            order_idx: 1,
+            target_sets: Some(3),
+            target_reps: Some(5),
+            target_weight_kg: Some(100.0),
+            target_secs: None,
+            notes: None,
+        })
+        .unwrap();
+
+        let session = db.start_session(user_id, None).unwrap();
+        db.bind_plan_to_session(plan_id, session.id).unwrap();
+
+        // Bench: 4 sets @ 6 reps @ 70kg — beat the prescription on sets and weight, met reps.
+        log_sets(&db, user_id, session.id, bench.id, 4, 6, 70.0);
+        // Squat: prescribed but never performed → skipped.
+        // Deadlift: performed but never prescribed → unplanned.
+        log_sets(&db, user_id, session.id, deadlift.id, 2, 5, 120.0);
+
+        let cmp = db.plan_vs_actual(plan_id).unwrap();
+        assert_eq!(cmp.plan_id, plan_id);
+        assert_eq!(cmp.session_id, session.id);
+
+        assert_eq!(cmp.matched.len(), 1);
+        let bench_delta = &cmp.matched[0];
+        assert_eq!(bench_delta.exercise_name, "Bench Press");
+        assert_eq!(bench_delta.performed.performed_sets, 4);
+        assert_eq!(bench_delta.sets_delta, Some(1)); // 4 − 3, exceeded
+        assert_eq!(bench_delta.reps_delta, Some(0.0)); // 6 − 6, met
+        assert_eq!(bench_delta.weight_delta_kg, Some(5.0)); // 70 − 65, exceeded
+
+        assert_eq!(cmp.skipped.len(), 1);
+        assert_eq!(cmp.skipped[0].exercise_name, "Squat");
+        assert_eq!(cmp.skipped[0].prescribed.target_weight_kg, Some(100.0));
+
+        assert_eq!(cmp.unplanned.len(), 1);
+        assert_eq!(cmp.unplanned[0].exercise_name, "Deadlift");
+        assert_eq!(cmp.unplanned[0].performed.performed_sets, 2);
+        assert_eq!(cmp.unplanned[0].performed.avg_weight_kg, Some(120.0));
+    }
+
+    #[test]
+    fn plan_vs_actual_signs_shortfalls_negative_and_requires_a_binding() {
+        let (db, user_id) = test_db();
+        let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+
+        let plan_id = db.create_plan(user_id, "Press", None, None).unwrap();
+        db.add_plan_exercise(&WorkoutPlanExercise {
+            id: 0,
+            plan_id,
+            exercise_type_id: bench.id,
+            order_idx: 0,
+            target_sets: Some(4),
+            target_reps: Some(8),
+            target_weight_kg: Some(80.0),
+            target_secs: None,
+            notes: None,
+        })
+        .unwrap();
+
+        // A proposed-but-unbound plan has no session to compare against.
+        assert!(db.plan_vs_actual(plan_id).is_err());
+
+        let session = db.start_session(user_id, None).unwrap();
+        db.bind_plan_to_session(plan_id, session.id).unwrap();
+        // 2 of 4 sets, lighter and fewer reps than prescribed — a shortfall on every dimension.
+        log_sets(&db, user_id, session.id, bench.id, 2, 6, 72.5);
+
+        let cmp = db.plan_vs_actual(plan_id).unwrap();
+        assert!(cmp.skipped.is_empty());
+        assert!(cmp.unplanned.is_empty());
+        let delta = &cmp.matched[0];
+        assert_eq!(delta.sets_delta, Some(-2)); // 2 − 4, missed
+        assert_eq!(delta.reps_delta, Some(-2.0)); // 6 − 8, missed
+        assert_eq!(delta.weight_delta_kg, Some(-7.5)); // 72.5 − 80, missed
     }
 }

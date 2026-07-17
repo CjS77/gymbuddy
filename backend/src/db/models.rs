@@ -774,3 +774,80 @@ pub struct WorkoutPlanExercise {
     pub target_secs: Option<i32>,
     pub notes: Option<String>,
 }
+
+// ── Prescribed vs actual ───────────────────────────────────────────────────────
+
+/// What a session actually logged for one exercise_type, rolled up over its sets
+/// so it can be compared against a single per-exercise prescription. `avg_reps`
+/// averages the recorded rep counts; `avg_weight_kg` / `avg_secs` average the set
+/// value under the weight_reps / time_based interpretation respectively (only one
+/// is populated, per the exercise's measurement type).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerformedRollup {
+    pub performed_sets: i64,
+    pub avg_reps: Option<f64>,
+    pub avg_weight_kg: Option<f64>,
+    pub avg_secs: Option<f64>,
+}
+
+/// The gap between what a plan prescribed and what a session performed for one
+/// exercise present on both sides.
+///
+/// Every `*_delta` is signed `performed − prescribed`: **positive means the
+/// athlete exceeded the prescription, negative means they fell short, zero means
+/// they hit it.** Deviation is signal, not failure — a consistent overshoot means
+/// the plan under-prescribes, a consistent shortfall means it over-prescribes — so
+/// consumers (the post-session report, the next-run designer, progression) must
+/// read the sign and magnitude, never treat a non-zero delta as an error. A delta
+/// is `None` when the prescription or the performance left that dimension unset.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExerciseDelta {
+    pub exercise_name: String,
+    pub measurement_type: MeasurementType,
+    /// The plan's prescription for this exercise (targets, order, notes).
+    pub prescribed: WorkoutPlanExercise,
+    /// The session's rolled-up performance for this exercise.
+    pub performed: PerformedRollup,
+    /// `performed_sets − target_sets`.
+    pub sets_delta: Option<i64>,
+    /// `avg_reps − target_reps`.
+    pub reps_delta: Option<f64>,
+    /// `avg_weight_kg − target_weight_kg`.
+    pub weight_delta_kg: Option<f64>,
+    /// `avg_secs − target_secs`.
+    pub secs_delta: Option<f64>,
+}
+
+/// An exercise the plan prescribed that the session never performed
+/// (planned-not-performed). Skipping is signal too, not an error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkippedExercise {
+    pub exercise_name: String,
+    pub prescribed: WorkoutPlanExercise,
+}
+
+/// An exercise the session performed that the plan never prescribed
+/// (performed-not-planned) — an improvised addition, not an error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnplannedExercise {
+    pub exercise_type_id: i64,
+    pub exercise_name: String,
+    pub measurement_type: MeasurementType,
+    pub performed: PerformedRollup,
+}
+
+/// The full prescribed-vs-actual comparison for a plan bound to a session: the
+/// matched exercises with their signed deltas, the prescribed exercises that were
+/// skipped, and the performed exercises that were never planned. Closes the loop
+/// between what the plan asked for and what the session did.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanVsActual {
+    pub plan_id: i64,
+    pub session_id: i64,
+    /// Prescribed and performed, in plan order, with signed deltas.
+    pub matched: Vec<ExerciseDelta>,
+    /// Prescribed but not performed, in plan order.
+    pub skipped: Vec<SkippedExercise>,
+    /// Performed but not prescribed, in the order first logged.
+    pub unplanned: Vec<UnplannedExercise>,
+}
