@@ -235,7 +235,11 @@ impl AssistantHandler {
             self.store_conversation_on_platform(user.id, platform, text, &llm_response).await?;
         }
 
-        self.db.lock().await.prune_old_messages(user.id, self.config.conversation_history_limit * 2)?;
+        // Prune the platform we just wrote to, matching the per-platform read path.
+        // Retain twice the read window (`conversation_history_limit`): the read filters
+        // out `exclude_from_context` rows while pruning keeps rows by recency alone, so
+        // the extra headroom stops excluded turns from shrinking the visible history.
+        self.db.lock().await.prune_old_messages_for_platform(user.id, platform, self.config.conversation_history_limit * 2)?;
 
         // The conversational follow-ups (`suffixes`) and any action `failures` ride
         // alongside the prose as structured `notes`/`failures`; each client decides
