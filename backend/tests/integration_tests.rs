@@ -17,7 +17,7 @@ fn fixture_loads_completely() {
     let set_count: i64 = db.conn().query_row("SELECT COUNT(*) FROM sets", [], |r| r.get(0)).unwrap();
     assert!(set_count >= 100);
 
-    let goal_count: i64 = db.conn().query_row("SELECT COUNT(*) FROM exercise_goals", [], |r| r.get(0)).unwrap();
+    let goal_count: i64 = db.conn().query_row("SELECT COUNT(*) FROM goals", [], |r| r.get(0)).unwrap();
     assert_eq!(goal_count, 3);
 }
 

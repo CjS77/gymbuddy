@@ -24,7 +24,7 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         MIGRATIONS.to_latest(&mut conn).expect("up to latest failed");
         let after_up: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(after_up, 9);
+        assert_eq!(after_up, 10);
 
         MIGRATIONS.to_version(&mut conn, 0).expect("down to 0 failed");
         let after_down: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
@@ -36,7 +36,7 @@ mod tests {
 
         MIGRATIONS.to_latest(&mut conn).expect("re-apply up failed");
         let after_redo: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(after_redo, 9);
+        assert_eq!(after_redo, 10);
     }
 
     #[test]

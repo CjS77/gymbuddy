@@ -49,7 +49,7 @@ mod tests {
             .conn()
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN \
-                 ('exercise_types', 'users', 'groups', 'group_members', 'exercise_goals', \
+                 ('exercise_types', 'users', 'groups', 'group_members', 'goals', \
                   'sessions', 'exercise_entry', 'sets', 'schedules', 'schedule_exercises', \
                   'health_entries', 'conversation_history', 'measurement_types')",
                 [],
@@ -93,6 +93,6 @@ mod tests {
     fn user_version_set_to_latest() {
         let db = Database::open_in_memory().unwrap();
         let version: i64 = db.conn().query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
     }
 }

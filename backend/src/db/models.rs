@@ -315,6 +315,79 @@ impl fmt::Display for ConversationRole {
     }
 }
 
+/// What a goal measures. `strength` and `endurance` raise/lower a single
+/// exercise's number; `bodyweight` / `body_composition` / `habit` are denominated
+/// in a free-text `metric` rather than an exercise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalKind {
+    Strength,
+    Endurance,
+    Bodyweight,
+    BodyComposition,
+    Habit,
+}
+
+impl GoalKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Strength => "strength",
+            Self::Endurance => "endurance",
+            Self::Bodyweight => "bodyweight",
+            Self::BodyComposition => "body_composition",
+            Self::Habit => "habit",
+        }
+    }
+
+    pub fn from_str_loose(s: &str) -> Self {
+        match s.to_lowercase().replace('-', "_").as_str() {
+            "endurance" => Self::Endurance,
+            "bodyweight" | "body_weight" => Self::Bodyweight,
+            "body_composition" | "bodycomposition" | "composition" => Self::BodyComposition,
+            "habit" => Self::Habit,
+            _ => Self::Strength,
+        }
+    }
+}
+
+impl fmt::Display for GoalKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Which way progress runs. `increase` (the default) means bigger is better;
+/// `decrease` inverts it — a weightloss or faster-time goal succeeds as the value
+/// falls. Progress and goal-status computations key off this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalDirection {
+    Increase,
+    Decrease,
+}
+
+impl GoalDirection {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Increase => "increase",
+            Self::Decrease => "decrease",
+        }
+    }
+
+    pub fn from_str_loose(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "decrease" | "down" | "lower" | "reduce" => Self::Decrease,
+            _ => Self::Increase,
+        }
+    }
+}
+
+impl fmt::Display for GoalDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GoalStatus {
@@ -386,14 +459,28 @@ pub struct GroupMember {
     pub granted_at: String,
 }
 
+/// A per-user goal. Generalised beyond a single exercise's single number: `kind`
+/// says what it measures, `direction` which way progress runs, and `priority` ranks
+/// competing goals. Exercise goals carry an `exercise_type_id`; non-exercise goals
+/// (bodyweight / body_composition / habit) carry a free-text `metric` instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExerciseGoal {
+pub struct Goal {
     pub id: i64,
     pub user_id: i64,
-    pub exercise_type_id: i64,
+    pub kind: GoalKind,
+    /// The exercise this goal tracks, or NULL for a metric-denominated goal.
+    pub exercise_type_id: Option<i64>,
+    /// Free-text metric for non-exercise goals (e.g. "bodyweight_kg",
+    /// "sessions_per_week"). NULL when `exercise_type_id` is set.
+    pub metric: Option<String>,
     pub target_value: f64,
+    pub direction: GoalDirection,
+    /// Ranking when goals compete; higher wins. Defaults to 0.
+    pub priority: i64,
     pub start_date: String,
-    pub end_date: Option<String>,
+    /// The date the user aims to reach the target by. NULL = open-ended. A past
+    /// target_date on an unachieved goal derives to `Failed`.
+    pub target_date: Option<String>,
     pub achieved: bool,
     pub notes: Option<String>,
     pub created_at: String,
@@ -508,7 +595,9 @@ pub struct TimeSeries {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GoalProgress {
-    pub goal: ExerciseGoal,
+    pub goal: Goal,
+    /// Human label for the goal's subject: the exercise name for exercise goals,
+    /// otherwise the `metric`.
     pub exercise_name: String,
     pub status: GoalStatus,
     pub current_value: Option<f64>,
@@ -638,20 +727,37 @@ pub fn new_exercise_set(exercise_entry_id: i64, exercise_type_id: i64, measureme
     }
 }
 
-pub fn new_exercise_goal(user_id: i64, exercise_type_id: i64, target_value: f64) -> ExerciseGoal {
+pub fn new_goal(
+    user_id: i64,
+    kind: GoalKind,
+    exercise_type_id: Option<i64>,
+    metric: Option<String>,
+    target_value: f64,
+    direction: GoalDirection,
+) -> Goal {
     let now = now_str();
-    ExerciseGoal {
+    Goal {
         id: 0,
         user_id,
+        kind,
         exercise_type_id,
+        metric,
         target_value,
+        direction,
+        priority: 0,
         start_date: now.clone(),
-        end_date: None,
+        target_date: None,
         achieved: false,
         notes: None,
         created_at: now.clone(),
         updated_at: now,
     }
+}
+
+/// Convenience for the pre-generalisation shape: a strength goal that raises a
+/// single exercise's number (bigger is better).
+pub fn new_exercise_goal(user_id: i64, exercise_type_id: i64, target_value: f64) -> Goal {
+    new_goal(user_id, GoalKind::Strength, Some(exercise_type_id), None, target_value, GoalDirection::Increase)
 }
 
 pub fn new_health_entry(user_id: i64, entry_type: HealthEntryType, description: &str) -> HealthEntry {

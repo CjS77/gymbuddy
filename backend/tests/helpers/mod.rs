@@ -146,20 +146,20 @@ fn seed_goals(db: &Database, alice: i64, bob: i64, bench: i64, deadlift: i64) {
     // Alice: achieved bench goal (90 kg)
     let mut achieved = new_exercise_goal(alice, bench, 90.0);
     achieved.start_date = "2025-01-01".into();
-    achieved.end_date = Some("2025-12-31".into());
+    achieved.target_date = Some("2025-12-31".into());
     achieved.achieved = true;
     db.insert_goal(&achieved).unwrap();
 
-    // Alice: failed deadlift goal (target way too high, end_date in past)
+    // Alice: failed deadlift goal (target way too high, target_date in past)
     let mut failed = new_exercise_goal(alice, deadlift, 500.0);
     failed.start_date = "2024-01-01".into();
-    failed.end_date = Some("2024-06-01".into());
+    failed.target_date = Some("2024-06-01".into());
     db.insert_goal(&failed).unwrap();
 
     // Bob: active goal
     let mut active = new_exercise_goal(bob, bench, 100.0);
     active.start_date = "2025-01-01".into();
-    active.end_date = Some("2026-12-31".into());
+    active.target_date = Some("2026-12-31".into());
     db.insert_goal(&active).unwrap();
 }
 

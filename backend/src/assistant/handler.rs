@@ -8,9 +8,10 @@ use tokio::sync::Mutex;
 
 use crate::config::{DesignerHistoryConfig, GymConfig};
 use crate::db::{
-    ConversationRole, Database, Difficulty, EntryWithSets, ExerciseEntry, ExerciseSet, ExerciseTypeWithAncestry, GoalProgress, InterviewState,
-    MeasurementType, Session, SessionWithSets, SetEdit, SetEditError, User, WorkoutPhilosophy, WorkoutPlanExercise, new_conversation_message,
-    new_exercise_entry_at, new_exercise_goal, new_exercise_set, new_health_entry, new_user, new_user_with_pubkey,
+    ConversationRole, Database, Difficulty, EntryWithSets, ExerciseEntry, ExerciseSet, ExerciseTypeWithAncestry, GoalDirection, GoalKind,
+    GoalProgress, InterviewState, MeasurementType, Session, SessionWithSets, SetEdit, SetEditError, User, WorkoutPhilosophy,
+    WorkoutPlanExercise, new_conversation_message, new_exercise_entry_at, new_exercise_set, new_goal, new_health_entry, new_user,
+    new_user_with_pubkey,
 };
 use crate::github::IssueReporter;
 use crate::telegram::Message as TgMessage;
@@ -1067,11 +1068,25 @@ impl AssistantHandler {
                 }
                 Ok(ActionOutcome::none())
             }
-            AssistantAction::SetGoal { exercise, target_value, end_date } => {
-                let et = find_exercise_type(&self.catalogue, exercise).ok_or_else(|| anyhow::anyhow!("Unknown exercise: {exercise}"))?;
-                let mut goal = new_exercise_goal(user.id, et.exercise_type.id, *target_value);
-                goal.end_date = end_date.clone();
-                tracing::debug!(exercise = %et.exercise_type.name, target = %target_value, end_date = ?end_date, "Inserting goal");
+            AssistantAction::SetGoal { exercise, metric, kind, target_value, direction, priority, target_date } => {
+                // Resolve the exercise (if named) to its taxonomy id; otherwise the goal
+                // is denominated in a free-text metric.
+                let exercise_type_id = match exercise {
+                    Some(name) => {
+                        let et = find_exercise_type(&self.catalogue, name).ok_or_else(|| anyhow::anyhow!("Unknown exercise: {name}"))?;
+                        Some(et.exercise_type.id)
+                    }
+                    None => None,
+                };
+                anyhow::ensure!(exercise_type_id.is_some() || metric.is_some(), "set_goal needs either an exercise or a metric");
+
+                // Default kind from whether an exercise is named; direction defaults to increase.
+                let kind = kind.unwrap_or(if exercise_type_id.is_some() { GoalKind::Strength } else { GoalKind::Habit });
+                let direction = direction.unwrap_or(GoalDirection::Increase);
+                let mut goal = new_goal(user.id, kind, exercise_type_id, metric.clone(), *target_value, direction);
+                goal.priority = priority.unwrap_or(0);
+                goal.target_date = target_date.clone();
+                tracing::debug!(%kind, ?exercise_type_id, ?metric, target = %target_value, %direction, "Inserting goal");
                 self.db.lock().await.insert_goal(&goal)?;
                 Ok(ActionOutcome::none())
             }
@@ -1657,10 +1672,11 @@ going in the existing session — and I'll log that set accordingly."
 /// The set of exercise-type ids that count as "goal-relevant": every goal's target
 /// exercise plus all of its taxonomy descendants, so a goal on a parent node (e.g.
 /// "Bench Press") pulls in its variations too. Used to give those lifts more history
-/// depth in the designer prompt than incidental accessories.
+/// depth in the designer prompt than incidental accessories. Metric-denominated goals
+/// (bodyweight, habit) name no exercise and so contribute nothing here.
 fn goal_relevant_exercise_ids(db: &Database, goals: &[GoalProgress]) -> anyhow::Result<HashSet<i64>> {
-    goals.iter().try_fold(HashSet::new(), |mut acc, g| {
-        acc.extend(db.descendant_ids_inclusive(g.goal.exercise_type_id)?);
+    goals.iter().filter_map(|g| g.goal.exercise_type_id).try_fold(HashSet::new(), |mut acc, et_id| {
+        acc.extend(db.descendant_ids_inclusive(et_id)?);
         Ok(acc)
     })
 }
@@ -2009,7 +2025,7 @@ fn build_leaked_view(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Database;
+    use crate::db::{Database, new_exercise_goal};
     use crate::render::Telegram;
     use corre_core::app::{LlmRequest, LlmResponse};
     use gymbuddy_proto::Render as _;

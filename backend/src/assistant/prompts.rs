@@ -140,8 +140,14 @@ AMBIGUOUS EXERCISE / SUPERSET DETECTION below).\n\
 - {{\"type\": \"log_health\", \"entry_type\": \"injury|illness|wellbeing\", \
 \"body_part\": \"<optional>\", \"severity\": \"mild|moderate|severe\", \"description\": \"...\"}}\n\
 - {{\"type\": \"resolve_health\", \"description\": \"match by description substring\"}}\n\
-- {{\"type\": \"set_goal\", \"exercise\": \"<EXACT NAME>\", \"target_value\": N.N, \
-\"end_date\": \"<optional YYYY-MM-DD>\"}}\n\
+- {{\"type\": \"set_goal\", \"exercise\": \"<EXACT NAME, for exercise goals>\", \
+\"metric\": \"<free-text, for non-exercise goals e.g. bodyweight_kg / sessions_per_week>\", \
+\"kind\": \"strength|endurance|bodyweight|body_composition|habit\", \"target_value\": N.N, \
+\"direction\": \"increase|decrease\", \"priority\": <optional int, higher = more important>, \
+\"target_date\": \"<optional YYYY-MM-DD>\"}}\n\
+  Provide EITHER `exercise` (strength/endurance targets on one movement) OR `metric` \
+(weightloss, a weekly-frequency habit — no single exercise). Use \"decrease\" for goals \
+where smaller is better (losing weight, a faster time).\n\
 - {{\"type\": \"edit_set\", \"exercise\": \"<EXACT NAME, optional — the set's CURRENT exercise>\", \
 \"new_exercise\": \"<EXACT NAME, optional — change the exercise TO this>\", \"new_reps\": N, \
 \"new_value\": N.N, \"new_difficulty\": \"easy|medium|hard|failure\"}}\n\
@@ -332,10 +338,13 @@ history to reconstruct the context. Do not ask for information already provided.
 \n\
 You may log partial data only when the user explicitly says to skip a field.\n\
 \n\
-GOALS: The same collect-before-emitting rule applies to set_goal. You need: exercise name, \
-target value (e.g. target weight), and optionally an end date. If the user says \"I want to \
-hit 100kg on bench\", ask by when they want to achieve it before emitting the action. If \
-they say they don't have a deadline, emit with no end_date. Do not guess dates.\n\
+GOALS: The same collect-before-emitting rule applies to set_goal. A goal is denominated \
+EITHER by an exercise (e.g. \"hit 100kg on bench\" -> exercise + target_value, direction \
+increase) OR by a metric for goals not about one movement (\"lose 5kg\" -> metric \
+bodyweight_kg + direction decrease; \"train 4x a week\" -> metric sessions_per_week). Pick \
+`kind` accordingly and set `direction` to decrease whenever a smaller number is the win \
+(weightloss, a faster time). Ask by when they want to achieve it before emitting; if they \
+say there is no deadline, emit with no target_date. Do not guess dates.\n\
 \n\
 EDITING A LOGGED SET: When the user corrects a set they already logged (\"change my \
 last set to 40kg\", \"that was barbell flies not bench press\", \"the last exercise \
@@ -804,8 +813,12 @@ pub fn format_active_goals(goals: &[GoalProgress]) -> String {
     let mut result = "ACTIVE GOALS:\n".to_string();
     for gp in goals {
         let current = gp.current_value.map(|v| format!("{v:.1}")).unwrap_or_else(|| "N/A".to_string());
-        let end = gp.goal.end_date.as_deref().map(|d| format!(" by {d}")).unwrap_or_default();
-        result.push_str(&format!("- {}: {current}/{:.1}{end} ({:.0}%)\n", gp.exercise_name, gp.goal.target_value, gp.percentage,));
+        let by = gp.goal.target_date.as_deref().map(|d| format!(" by {d}")).unwrap_or_default();
+        let dir = match gp.goal.direction {
+            crate::db::GoalDirection::Increase => "",
+            crate::db::GoalDirection::Decrease => " (lower is better)",
+        };
+        result.push_str(&format!("- {}: {current}/{:.1}{by}{dir} ({:.0}%)\n", gp.exercise_name, gp.goal.target_value, gp.percentage));
     }
     result
 }
@@ -821,8 +834,8 @@ pub fn capitalize(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{ExerciseGoal, GoalStatus};
-    use crate::db::{ExerciseLevel, ExerciseType, GoalProgress, HealthEntry, HealthEntryType, MeasurementType, Session};
+    use crate::db::{ExerciseLevel, ExerciseType, Goal, GoalDirection, GoalKind, GoalProgress, GoalStatus};
+    use crate::db::{HealthEntry, HealthEntryType, MeasurementType, Session};
 
     fn make_exercise_type(id: i64, name: &str, aliases: &str, muscle_group: &str, mt: MeasurementType) -> ExerciseTypeWithAncestry {
         ExerciseTypeWithAncestry {
@@ -971,13 +984,17 @@ mod tests {
     #[test]
     fn format_goals() {
         let goals = vec![GoalProgress {
-            goal: ExerciseGoal {
+            goal: Goal {
                 id: 1,
                 user_id: 1,
-                exercise_type_id: 1,
+                kind: GoalKind::Strength,
+                exercise_type_id: Some(1),
+                metric: None,
                 target_value: 100.0,
+                direction: GoalDirection::Increase,
+                priority: 0,
                 start_date: "2026-01-01".to_string(),
-                end_date: Some("2026-06-01".to_string()),
+                target_date: Some("2026-06-01".to_string()),
                 achieved: false,
                 notes: None,
                 created_at: "2026-01-01".to_string(),

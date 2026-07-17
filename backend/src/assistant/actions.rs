@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use crate::db::{Difficulty, HealthEntryType};
+use crate::db::{Difficulty, GoalDirection, GoalKind, HealthEntryType};
 
 #[derive(Debug, Deserialize)]
 pub struct AssistantResponse {
@@ -93,10 +93,25 @@ pub enum AssistantAction {
     ResolveHealth {
         description: String,
     },
+    /// Set a goal. Exercise goals name an `exercise` (bigger-is-better strength /
+    /// endurance targets); non-exercise goals (weightloss, "train 4x a week") name a
+    /// `metric` instead. `direction` inverts progress for goals where smaller is
+    /// better (weightloss, a faster time). `kind` and `direction` default sensibly
+    /// when omitted; `end_date` is accepted as an alias for `target_date`.
     SetGoal {
-        exercise: String,
+        #[serde(default)]
+        exercise: Option<String>,
+        #[serde(default)]
+        metric: Option<String>,
+        #[serde(default)]
+        kind: Option<GoalKind>,
         target_value: f64,
-        end_date: Option<String>,
+        #[serde(default)]
+        direction: Option<GoalDirection>,
+        #[serde(default)]
+        priority: Option<i64>,
+        #[serde(default, alias = "end_date")]
+        target_date: Option<String>,
     },
     /// Correct a previously-logged set. The host resolves WHICH set/entry by
     /// recency, so no numeric id is carried. `exercise` is a resolution filter
@@ -312,9 +327,39 @@ mod tests {
 
     #[test]
     fn parse_set_goal() {
+        // `end_date` is still accepted as an alias for `target_date`.
         let json = r#"{"type": "set_goal", "exercise": "Bench Press", "target_value": 100.0, "end_date": "2026-06-01"}"#;
         let action: AssistantAction = serde_json::from_str(json).unwrap();
-        assert!(matches!(action, AssistantAction::SetGoal { target_value, .. } if target_value == 100.0));
+        match action {
+            AssistantAction::SetGoal { exercise, target_value, target_date, kind, direction, metric, priority } => {
+                assert_eq!(exercise.as_deref(), Some("Bench Press"));
+                assert_eq!(target_value, 100.0);
+                assert_eq!(target_date.as_deref(), Some("2026-06-01"));
+                assert_eq!(kind, None);
+                assert_eq!(direction, None);
+                assert_eq!(metric, None);
+                assert_eq!(priority, None);
+            }
+            _ => panic!("expected SetGoal"),
+        }
+    }
+
+    #[test]
+    fn parse_set_goal_metric_decrease() {
+        let json = r#"{"type": "set_goal", "kind": "body_composition", "metric": "bodyweight_kg", "target_value": 80.0, "direction": "decrease", "priority": 5, "target_date": "2026-01-01"}"#;
+        let action: AssistantAction = serde_json::from_str(json).unwrap();
+        match action {
+            AssistantAction::SetGoal { exercise, metric, kind, direction, priority, target_value, target_date } => {
+                assert_eq!(exercise, None);
+                assert_eq!(metric.as_deref(), Some("bodyweight_kg"));
+                assert_eq!(kind, Some(GoalKind::BodyComposition));
+                assert_eq!(direction, Some(GoalDirection::Decrease));
+                assert_eq!(priority, Some(5));
+                assert_eq!(target_value, 80.0);
+                assert_eq!(target_date.as_deref(), Some("2026-01-01"));
+            }
+            _ => panic!("expected SetGoal"),
+        }
     }
 
     #[test]

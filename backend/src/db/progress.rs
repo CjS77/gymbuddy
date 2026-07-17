@@ -2,7 +2,23 @@ use anyhow::Context as _;
 use rusqlite::{OptionalExtension as _, params};
 
 use super::database::Database;
-use super::models::{ExerciseGoal, GoalProgress, GoalStatus, MeasurementType, MuscleRecovery, TimeSeries, TimeSeriesPoint};
+use super::models::{Goal, GoalDirection, GoalKind, GoalProgress, GoalStatus, MeasurementType, MuscleRecovery, TimeSeries, TimeSeriesPoint};
+
+/// Fraction of the target reached, as a percentage, honouring `direction`. For an
+/// increase goal this is `current / target`; for a decrease goal (weightloss, a
+/// faster time) it inverts to `target / current`, reaching 100% as the value falls
+/// to the target. `None` current or a zero target yields 0%.
+fn goal_percentage(direction: GoalDirection, current: Option<f64>, target: f64) -> f64 {
+    let Some(cv) = current else { return 0.0 };
+    if target == 0.0 {
+        return 0.0;
+    }
+    match direction {
+        GoalDirection::Increase => (cv / target) * 100.0,
+        GoalDirection::Decrease if cv <= target => 100.0,
+        GoalDirection::Decrease => (target / cv) * 100.0,
+    }
+}
 
 impl Database {
     /// Time series of best-set value per day for a single exercise_type.
@@ -101,10 +117,10 @@ impl Database {
 
         let mut stmt = self.conn().prepare(
             "SELECT DISTINCT et.id, et.name, et.measurement_type_id \
-             FROM exercise_goals g \
+             FROM goals g \
              JOIN exercise_types et ON g.exercise_type_id = et.id \
              WHERE g.user_id = ?1 \
-               AND g.start_date <= ?3 AND (g.end_date IS NULL OR g.end_date >= ?2)",
+               AND g.start_date <= ?3 AND (g.target_date IS NULL OR g.target_date >= ?2)",
         )?;
 
         let exercise_info: Vec<(i64, String, Option<i64>)> = stmt
@@ -130,54 +146,63 @@ impl Database {
         let to_str = to.unwrap_or(&default_to);
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
+        // LEFT JOIN so non-exercise goals (metric-denominated) still surface; their
+        // exercise_type_id is NULL and et.* comes back NULL.
         let mut stmt = self.conn().prepare(
-            "SELECT g.id, g.user_id, g.exercise_type_id, g.target_value, g.start_date, g.end_date, \
-                    g.achieved, g.notes, g.created_at, g.updated_at, \
-                    et.name AS exercise_name, et.measurement_type_id \
-             FROM exercise_goals g \
-             JOIN exercise_types et ON g.exercise_type_id = et.id \
+            "SELECT g.id, g.user_id, g.kind, g.exercise_type_id, g.metric, g.target_value, g.direction, \
+                    g.priority, g.start_date, g.target_date, g.achieved, g.notes, g.created_at, g.updated_at, \
+                    et.name AS exercise_name \
+             FROM goals g \
+             LEFT JOIN exercise_types et ON g.exercise_type_id = et.id \
              WHERE g.user_id = ?1 \
-               AND g.start_date <= ?3 AND (g.end_date IS NULL OR g.end_date >= ?2) \
-             ORDER BY g.start_date",
+               AND g.start_date <= ?3 AND (g.target_date IS NULL OR g.target_date >= ?2) \
+             ORDER BY g.priority DESC, g.start_date",
         )?;
 
-        let goals_with_info: Vec<(ExerciseGoal, String, MeasurementType)> = stmt
+        let goals_with_info: Vec<(Goal, String)> = stmt
             .query_map(params![user_id, from_str, to_str], |row| {
-                let goal = ExerciseGoal {
+                let goal = Goal {
                     id: row.get(0)?,
                     user_id: row.get(1)?,
-                    exercise_type_id: row.get(2)?,
-                    target_value: row.get(3)?,
-                    start_date: row.get(4)?,
-                    end_date: row.get(5)?,
-                    achieved: row.get::<_, i32>(6)? != 0,
-                    notes: row.get(7)?,
-                    created_at: row.get(8)?,
-                    updated_at: row.get(9)?,
+                    kind: GoalKind::from_str_loose(&row.get::<_, String>(2)?),
+                    exercise_type_id: row.get(3)?,
+                    metric: row.get(4)?,
+                    target_value: row.get(5)?,
+                    direction: GoalDirection::from_str_loose(&row.get::<_, String>(6)?),
+                    priority: row.get(7)?,
+                    start_date: row.get(8)?,
+                    target_date: row.get(9)?,
+                    achieved: row.get::<_, i32>(10)? != 0,
+                    notes: row.get(11)?,
+                    created_at: row.get(12)?,
+                    updated_at: row.get(13)?,
                 };
-                let exercise_name: String = row.get(10)?;
-                let mt_id: Option<i64> = row.get(11)?;
-                let mt = mt_id.map(MeasurementType::from_id).unwrap_or(MeasurementType::WeightReps);
-                Ok((goal, exercise_name, mt))
+                // Subject label: the exercise name, else the metric, else the kind.
+                let exercise_name: Option<String> = row.get(14)?;
+                let label = exercise_name.or_else(|| goal.metric.clone()).unwrap_or_else(|| goal.kind.to_string());
+                Ok((goal, label))
             })?
             .collect::<Result<Vec<_>, _>>()
             .context("Failed to query goals")?;
 
         goals_with_info
             .into_iter()
-            .map(|(goal, exercise_name, _mt)| {
-                let goal_end = goal.end_date.as_deref().unwrap_or(to_str);
-                let current_value = self.best_value_for_exercise_type(user_id, goal.exercise_type_id, &goal.start_date, goal_end)?;
-
-                let percentage = match (current_value, goal.target_value) {
-                    (_, 0.0) => 0.0,
-                    (Some(cv), tv) => (cv / tv) * 100.0,
-                    (None, _) => 0.0,
+            .map(|(goal, exercise_name)| {
+                // Only exercise goals have a sets-derived current value; metric goals
+                // report None until a metric source is wired up.
+                let current_value = match goal.exercise_type_id {
+                    Some(et_id) => {
+                        let goal_end = goal.target_date.as_deref().unwrap_or(to_str);
+                        self.relevant_value_for_exercise_type(user_id, et_id, goal.direction, &goal.start_date, goal_end)?
+                    }
+                    None => None,
                 };
+
+                let percentage = goal_percentage(goal.direction, current_value, goal.target_value);
 
                 let status = if goal.achieved || percentage >= 100.0 {
                     GoalStatus::Achieved
-                } else if goal.end_date.as_deref().is_some_and(|ed| ed < today.as_str()) {
+                } else if goal.target_date.as_deref().is_some_and(|td| td < today.as_str()) {
                     GoalStatus::Failed
                 } else {
                     GoalStatus::Active
@@ -221,28 +246,45 @@ impl Database {
             .collect()
     }
 
-    fn best_value_for_exercise_type(&self, user_id: i64, exercise_type_id: i64, from: &str, to: &str) -> anyhow::Result<Option<f64>> {
-        // Roll up descendants so a goal on a parent node reflects sets logged at any depth.
-        let sql = "WITH RECURSIVE tree(id) AS ( \
-                       SELECT id FROM exercise_types WHERE id = ?2 \
-                       UNION ALL \
-                       SELECT et.id FROM exercise_types et JOIN tree t ON et.parent_id = t.id \
-                   ) \
-                   SELECT MAX(s.value) FROM sets s \
-                   JOIN exercise_entry ee ON s.exercise_entry_id = ee.id \
-                   WHERE ee.user_id = ?1 AND s.exercise_type_id IN (SELECT id FROM tree) \
-                     AND s.logged_at >= ?3 AND s.logged_at <= ?4";
+    /// The value a goal is judged against, rolled up over the exercise's subtree so a
+    /// goal on a parent node reflects sets logged at any depth. Increase goals take the
+    /// MAX (best is highest); decrease goals take the MIN (best is lowest).
+    fn relevant_value_for_exercise_type(
+        &self,
+        user_id: i64,
+        exercise_type_id: i64,
+        direction: GoalDirection,
+        from: &str,
+        to: &str,
+    ) -> anyhow::Result<Option<f64>> {
+        let agg = match direction {
+            GoalDirection::Increase => "MAX",
+            GoalDirection::Decrease => "MIN",
+        };
+        let sql = format!(
+            "WITH RECURSIVE tree(id) AS ( \
+                 SELECT id FROM exercise_types WHERE id = ?2 \
+                 UNION ALL \
+                 SELECT et.id FROM exercise_types et JOIN tree t ON et.parent_id = t.id \
+             ) \
+             SELECT {agg}(s.value) FROM sets s \
+             JOIN exercise_entry ee ON s.exercise_entry_id = ee.id \
+             WHERE ee.user_id = ?1 AND s.exercise_type_id IN (SELECT id FROM tree) \
+               AND s.logged_at >= ?3 AND s.logged_at <= ?4"
+        );
         self.conn()
-            .query_row(sql, params![user_id, exercise_type_id, from, to], |row| row.get(0))
+            .query_row(&sql, params![user_id, exercise_type_id, from, to], |row| row.get(0))
             .optional()
-            .context("Failed to query best value")
+            .context("Failed to query relevant value")
             .map(|v| v.flatten())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::models::{MeasurementType, new_exercise_entry, new_exercise_goal, new_exercise_set, new_user};
+    use super::super::models::{
+        GoalDirection, GoalKind, MeasurementType, new_exercise_entry, new_exercise_goal, new_exercise_set, new_goal, new_user,
+    };
     use super::*;
 
     fn test_db() -> Database {
@@ -324,7 +366,7 @@ mod tests {
 
         let mut goal = new_exercise_goal(user_id, bp.id, 100.0);
         goal.start_date = "2025-01-01".into();
-        goal.end_date = Some("2025-12-31".into());
+        goal.target_date = Some("2025-12-31".into());
         db.insert_goal(&goal).unwrap();
 
         log_weight_set(&db, user_id, bp.id, "2025-06-01 10:00:00", 80.0);
@@ -343,13 +385,13 @@ mod tests {
 
         let mut achieved = new_exercise_goal(user_id, bp.id, 100.0);
         achieved.start_date = "2025-01-01".into();
-        achieved.end_date = Some("2025-12-31".into());
+        achieved.target_date = Some("2025-12-31".into());
         achieved.achieved = true;
         db.insert_goal(&achieved).unwrap();
 
         let mut failed = new_exercise_goal(user_id, dl.id, 200.0);
         failed.start_date = "2024-01-01".into();
-        failed.end_date = Some("2024-06-01".into());
+        failed.target_date = Some("2024-06-01".into());
         db.insert_goal(&failed).unwrap();
 
         let report = db.goal_progress_report(user_id, Some("2024-01-01"), Some("2025-12-31")).unwrap();
@@ -406,5 +448,70 @@ mod tests {
         let report = db.goal_progress_report(user_id, Some("2025-01-01"), Some("2025-12-31")).unwrap();
         assert_eq!(report.len(), 1);
         assert_eq!(report[0].percentage, 0.0);
+    }
+
+    #[test]
+    fn decrease_goal_reports_progress_from_the_low_side() {
+        // A faster-time goal on a timed exercise: target 60s, currently best (lowest) 75s.
+        // Progress must be target/current = 80%, and the MIN — not the MAX — is taken.
+        let db = test_db();
+        let user_id = db.insert_user(&new_user("Tester", None, "UTC")).unwrap();
+        let plank = db.get_exercise_type_by_name("Plank").unwrap().unwrap();
+
+        for (day, secs) in [(1, 90.0), (2, 75.0), (3, 100.0)] {
+            let entry_id = db.insert_entry(&new_exercise_entry(user_id, None, None)).unwrap();
+            let mut s = new_exercise_set(entry_id, plank.id, MeasurementType::TimeBased, secs);
+            s.logged_at = format!("2025-06-{day:02} 10:00:00");
+            db.insert_set(&s).unwrap();
+        }
+
+        let mut goal = new_goal(user_id, GoalKind::Endurance, Some(plank.id), None, 60.0, GoalDirection::Decrease);
+        goal.start_date = "2025-01-01".into();
+        goal.target_date = Some("2027-12-31".into()); // future deadline, so status stays Active
+        db.insert_goal(&goal).unwrap();
+
+        let report = db.goal_progress_report(user_id, Some("2025-01-01"), Some("2027-12-31")).unwrap();
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].current_value, Some(75.0), "decrease goal should use the lowest logged value");
+        assert!((report[0].percentage - 80.0).abs() < 0.01, "expected 80%, got {}", report[0].percentage);
+        assert_eq!(report[0].status, GoalStatus::Active);
+    }
+
+    #[test]
+    fn decrease_goal_is_achieved_once_value_falls_to_target() {
+        let db = test_db();
+        let user_id = db.insert_user(&new_user("Tester", None, "UTC")).unwrap();
+        let plank = db.get_exercise_type_by_name("Plank").unwrap().unwrap();
+
+        let entry_id = db.insert_entry(&new_exercise_entry(user_id, None, None)).unwrap();
+        let mut s = new_exercise_set(entry_id, plank.id, MeasurementType::TimeBased, 55.0);
+        s.logged_at = "2025-06-01 10:00:00".into();
+        db.insert_set(&s).unwrap();
+
+        let mut goal = new_goal(user_id, GoalKind::Endurance, Some(plank.id), None, 60.0, GoalDirection::Decrease);
+        goal.start_date = "2025-01-01".into();
+        db.insert_goal(&goal).unwrap();
+
+        let report = db.goal_progress_report(user_id, Some("2025-01-01"), Some("2025-12-31")).unwrap();
+        assert_eq!(report.len(), 1);
+        assert!(report[0].percentage >= 100.0);
+        assert_eq!(report[0].status, GoalStatus::Achieved);
+    }
+
+    #[test]
+    fn metric_goal_surfaces_without_an_exercise() {
+        // A bodyweight goal has no exercise; it must still appear, with no derived value.
+        let db = test_db();
+        let user_id = db.insert_user(&new_user("Tester", None, "UTC")).unwrap();
+
+        let mut goal = new_goal(user_id, GoalKind::BodyComposition, None, Some("bodyweight_kg".into()), 80.0, GoalDirection::Decrease);
+        goal.start_date = "2025-01-01".into();
+        db.insert_goal(&goal).unwrap();
+
+        let report = db.goal_progress_report(user_id, Some("2025-01-01"), Some("2025-12-31")).unwrap();
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].exercise_name, "bodyweight_kg");
+        assert_eq!(report[0].current_value, None);
+        assert_eq!(report[0].status, GoalStatus::Active);
     }
 }
