@@ -1,4 +1,8 @@
-use crate::db::{ExerciseSet, ExerciseTypeWithAncestry, GoalProgress, HealthEntry, MeasurementType, Schedule, Session, SessionSummary};
+use chrono::NaiveDate;
+
+use crate::db::{
+    ExerciseSet, ExerciseTypeWithAncestry, GoalProgress, HealthEntry, MeasurementType, MuscleRecovery, Schedule, Session, SessionSummary,
+};
 
 pub struct PromptContext {
     pub user_name: String,
@@ -411,6 +415,7 @@ to save, keep `actions` empty and ask the next question.",
 pub fn build_designer_prompt(
     philosophy: &str,
     history: &str,
+    recovery: &str,
     goals: &[GoalProgress],
     health_entries: &[HealthEntry],
     catalogue: &[ExerciseTypeWithAncestry],
@@ -432,6 +437,9 @@ or equipment they do not have.\n\
 - Use RECENT HISTORY to pick what to train today (rotate muscle groups, respect recovery, avoid \
 repeating yesterday's heavy work) and to set weights: if the last sets of an exercise were easy, \
 progress the load; if they were hard or to failure, hold or back off.\n\
+- Use MUSCLE RECOVERY as the rest signal: it lists every muscle group ordered longest-rested first. \
+Prefer groups that have rested longest, and treat one shown as never trained (or not trained in a \
+long time) as a strong candidate for today.\n\
 - Respect ACTIVE HEALTH ISSUES: substitute away from movements that load an injured area (e.g. \
 swap heavy spinal-loading deadlifts/squats for a focused one-arm row when the lower back is \
 flaring), and say why in the rationale.\n\
@@ -440,6 +448,7 @@ and a target weight within the user's equipment limits. Add a short per-exercise
 \n\
 {philosophy_section}\n\
 {history}\n\
+{recovery}\n\
 {goals_section}\n\
 {health_section}\n\
 RESPONSE FORMAT: You MUST respond with ONLY a JSON object. No text before or after.\n\
@@ -463,6 +472,40 @@ AVAILABLE EXERCISES:\n\
 {exercise_list}",
         philosophy_section = format_philosophy_section(philosophy),
     )
+}
+
+/// The MUSCLE RECOVERY section for the designer prompt: every muscle group, ordered
+/// longest-rested first, so a group not trained in a while — or never — reads as the
+/// obvious candidate for today. `today` is passed in rather than read from the clock,
+/// keeping the rendering deterministic and testable.
+pub fn format_muscle_recovery(recovery: &[MuscleRecovery], today: NaiveDate) -> String {
+    if recovery.is_empty() {
+        return "MUSCLE RECOVERY: no muscle groups on record.\n".to_string();
+    }
+
+    // Whole days since a group was last trained; `None` (never trained) is the
+    // strongest signal and sorts ahead of any finite rest.
+    let days_since = |r: &MuscleRecovery| -> Option<i64> {
+        let last = r.last_trained.as_deref()?;
+        let date = NaiveDate::parse_from_str(last, "%Y-%m-%d").ok()?;
+        Some((today - date).num_days())
+    };
+
+    let mut ranked: Vec<(&MuscleRecovery, Option<i64>)> = recovery.iter().map(|r| (r, days_since(r))).collect();
+    ranked.sort_by(|a, b| match (a.1, b.1) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(x), Some(y)) => y.cmp(&x),
+    });
+
+    let lines = ranked.into_iter().map(|(r, days)| match days {
+        None => format!("- {}: never trained", r.muscle_group),
+        Some(d) if d <= 0 => format!("- {}: last trained today ({} sets)", r.muscle_group, r.last_volume_sets),
+        Some(1) => format!("- {}: last trained 1d ago ({} sets)", r.muscle_group, r.last_volume_sets),
+        Some(d) => format!("- {}: last trained {d}d ago ({} sets)", r.muscle_group, r.last_volume_sets),
+    });
+    format!("MUSCLE RECOVERY (longest-rested first):\n{}\n", lines.collect::<Vec<_>>().join("\n"))
 }
 
 /// The philosophy block for the designer prompt, with a clear placeholder when the
@@ -919,6 +962,33 @@ mod tests {
     fn format_no_goals() {
         let text = format_active_goals(&[]);
         assert!(text.contains("ACTIVE GOALS: None"));
+    }
+
+    #[test]
+    fn format_muscle_recovery_orders_longest_rested_first() {
+        let today = NaiveDate::from_ymd_opt(2026, 1, 20).unwrap();
+        let recovery = vec![
+            MuscleRecovery { muscle_group: "Chest".into(), last_trained: Some("2026-01-18".into()), last_volume_sets: 12 },
+            MuscleRecovery { muscle_group: "Back".into(), last_trained: None, last_volume_sets: 0 },
+            MuscleRecovery { muscle_group: "Legs".into(), last_trained: Some("2026-01-05".into()), last_volume_sets: 9 },
+        ];
+        let text = format_muscle_recovery(&recovery, today);
+
+        // Never-trained first, then most-rested (Legs, 15d) before least (Chest, 2d).
+        let back = text.find("Back").unwrap();
+        let legs = text.find("Legs").unwrap();
+        let chest = text.find("Chest").unwrap();
+        assert!(back < legs && legs < chest, "expected order Back, Legs, Chest:\n{text}");
+
+        assert!(text.contains("- Back: never trained"));
+        assert!(text.contains("- Legs: last trained 15d ago (9 sets)"));
+        assert!(text.contains("- Chest: last trained 2d ago (12 sets)"));
+    }
+
+    #[test]
+    fn format_muscle_recovery_handles_empty() {
+        let today = NaiveDate::from_ymd_opt(2026, 1, 20).unwrap();
+        assert!(format_muscle_recovery(&[], today).contains("no muscle groups on record"));
     }
 
     #[test]

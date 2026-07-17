@@ -21,6 +21,7 @@ use super::parser::parse_assistant_response;
 use super::prompts::{
     ActivePlanView, EntryView, PlanExerciseView, PrescribedExercise, PromptContext, SESSION_CONTINUITY_ASK_HOURS,
     SESSION_CONTINUITY_HOURS, WorkoutPlanProgress, build_designer_prompt, build_philosophy_prompt, build_system_prompt,
+    format_muscle_recovery,
 };
 use gymbuddy_proto::{
     CatalogEntry, CatalogGroup, CatalogView, ExerciseLog, HealthNote, HistoryView, Measurement, PlannedExerciseView, SessionSummaryView,
@@ -444,11 +445,12 @@ impl AssistantHandler {
     async fn cmd_next_workout(&self, user: &User, text: &str) -> anyhow::Result<View> {
         let guidance = text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
 
-        let (philosophy, sessions, goals, injuries) = {
+        let (philosophy, sessions, recovery, goals, injuries) = {
             let db = self.db.lock().await;
             (
                 db.latest_philosophy(user.id)?,
                 db.recent_sessions_with_sets(user.id, 3)?,
+                db.muscle_recovery(user.id)?,
                 db.goal_progress_report(user.id, None, None)?,
                 db.list_active_health_entries(user.id)?,
             )
@@ -463,7 +465,8 @@ impl AssistantHandler {
         };
 
         let history_block = self.format_designer_history(&sessions);
-        let prompt = build_designer_prompt(&philosophy.content, &history_block, &goals, &injuries, &self.catalogue);
+        let recovery_block = format_muscle_recovery(&recovery, chrono::Utc::now().date_naive());
+        let prompt = build_designer_prompt(&philosophy.content, &history_block, &recovery_block, &goals, &injuries, &self.catalogue);
         let user_text = if guidance.trim().is_empty() { "Design my next workout.".to_string() } else { guidance };
 
         // The design overruns the default token cap; logging is impossible here

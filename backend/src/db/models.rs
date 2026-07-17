@@ -515,6 +515,19 @@ pub struct GoalProgress {
     pub percentage: f64,
 }
 
+/// Per-muscle-group recovery signal for the session designer: when a group was
+/// last trained (any exercise in its subtree) and how many sets that most-recent
+/// day involved. `last_trained == None` means never trained — the strongest
+/// possible rest signal, which is why untrained groups are surfaced, not omitted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MuscleRecovery {
+    pub muscle_group: String,
+    /// Date (`YYYY-MM-DD`) the group was last trained, or `None` if never.
+    pub last_trained: Option<String>,
+    /// Sets logged for the group on its most-recent training day; `0` if never trained.
+    pub last_volume_sets: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub session: Session,

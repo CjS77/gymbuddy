@@ -2,7 +2,7 @@ use anyhow::Context as _;
 use rusqlite::{OptionalExtension as _, params};
 
 use super::database::Database;
-use super::models::{ExerciseGoal, GoalProgress, GoalStatus, MeasurementType, TimeSeries, TimeSeriesPoint};
+use super::models::{ExerciseGoal, GoalProgress, GoalStatus, MeasurementType, MuscleRecovery, TimeSeries, TimeSeriesPoint};
 
 impl Database {
     /// Time series of best-set value per day for a single exercise_type.
@@ -188,6 +188,39 @@ impl Database {
             .collect()
     }
 
+    /// Per top-level muscle group: when it was last trained (any exercise in its
+    /// subtree, rolled up via [`Database::descendant_ids_inclusive`]) and how many
+    /// sets that most-recent day involved. Every muscle group appears — one never
+    /// trained comes back with `last_trained: None`, the strongest rest signal for
+    /// the session designer (see `build_designer_prompt`). Volume is counted per
+    /// calendar day, matching the daily grain the other aggregates here use.
+    pub fn muscle_recovery(&self, user_id: i64) -> anyhow::Result<Vec<MuscleRecovery>> {
+        self.list_top_level_groups()?
+            .into_iter()
+            .map(|group| {
+                let ids = self.descendant_ids_inclusive(group.id)?;
+                let placeholders = vec!["?"; ids.len()].join(",");
+                let sql = format!(
+                    "WITH g_days(d) AS ( \
+                         SELECT date(s.logged_at) \
+                         FROM sets s JOIN exercise_entry ee ON s.exercise_entry_id = ee.id \
+                         WHERE ee.user_id = ? AND s.exercise_type_id IN ({placeholders}) \
+                     ) \
+                     SELECT (SELECT MAX(d) FROM g_days) AS last_trained, \
+                            (SELECT COUNT(*) FROM g_days WHERE d = (SELECT MAX(d) FROM g_days)) AS vol"
+                );
+                let args: Vec<i64> = std::iter::once(user_id).chain(ids).collect();
+                let (last_trained, last_volume_sets) = self
+                    .conn()
+                    .query_row(&sql, rusqlite::params_from_iter(args.iter()), |row| {
+                        Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .context("Failed to query muscle recovery")?;
+                Ok(MuscleRecovery { muscle_group: group.name, last_trained, last_volume_sets })
+            })
+            .collect()
+    }
+
     fn best_value_for_exercise_type(&self, user_id: i64, exercise_type_id: i64, from: &str, to: &str) -> anyhow::Result<Option<f64>> {
         // Roll up descendants so a goal on a parent node reflects sets logged at any depth.
         let sql = "WITH RECURSIVE tree(id) AS ( \
@@ -322,6 +355,42 @@ mod tests {
         let report = db.goal_progress_report(user_id, Some("2024-01-01"), Some("2025-12-31")).unwrap();
         assert!(report.iter().any(|r| r.status == GoalStatus::Achieved));
         assert!(report.iter().any(|r| r.status == GoalStatus::Failed));
+    }
+
+    #[test]
+    fn muscle_recovery_lists_every_group_including_untrained() {
+        let db = test_db();
+        let user_id = db.insert_user(&new_user("Tester", None, "UTC")).unwrap();
+
+        let recovery = db.muscle_recovery(user_id).unwrap();
+        assert_eq!(recovery.len(), 7, "all seven muscle groups must appear, trained or not");
+        assert!(
+            recovery.iter().all(|r| r.last_trained.is_none() && r.last_volume_sets == 0),
+            "an untrained user leaves every group with no last-trained date and zero volume",
+        );
+    }
+
+    #[test]
+    fn muscle_recovery_reports_last_day_and_its_volume() {
+        let db = test_db();
+        let user_id = db.insert_user(&new_user("Tester", None, "UTC")).unwrap();
+        let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+
+        // One set two days earlier, two sets on the most recent day — Bench Press
+        // rolls up to Chest via the ancestry helper.
+        log_weight_set(&db, user_id, bench.id, "2025-06-01 10:00:00", 60.0);
+        log_weight_set(&db, user_id, bench.id, "2025-06-03 10:00:00", 62.0);
+        log_weight_set(&db, user_id, bench.id, "2025-06-03 10:05:00", 62.0);
+
+        let recovery = db.muscle_recovery(user_id).unwrap();
+        let chest = recovery.iter().find(|r| r.muscle_group == "Chest").unwrap();
+        assert_eq!(chest.last_trained.as_deref(), Some("2025-06-03"));
+        assert_eq!(chest.last_volume_sets, 2, "volume counts only the most-recent training day");
+
+        // A group never trained stays a strong rest signal, not an omission.
+        let back = recovery.iter().find(|r| r.muscle_group == "Back").unwrap();
+        assert!(back.last_trained.is_none());
+        assert_eq!(back.last_volume_sets, 0);
     }
 
     #[test]
