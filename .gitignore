@@ -1,17 +1,24 @@
 /target
 /target-cross
 Cargo.lock
+dist/
+
+# Secrets
 .env
 **/.env
+*.key
+
 *.swp
 *.swo
 .idea/
+
+# Planning
 todos.md
-dist/
 mcp-registry/site/
 plans/
 # local data
 data/
 .minesweeper/
 gymbuddy.toml
-*.key
+*.key.claude
+.claude/

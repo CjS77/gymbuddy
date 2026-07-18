@@ -1,0 +1,4 @@
+{
+  "max_workers": 5,
+  "idle_time": 60
+}

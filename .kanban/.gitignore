@@ -1,0 +1,5 @@
+# claude-kanban runtime artifacts — machine-local, never committed. (board.json and this file ARE committed.)
+.lock
+*.tmp
+serve.pid
+claims.json
