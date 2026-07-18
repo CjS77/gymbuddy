@@ -10,7 +10,7 @@ use rusqlite::params;
 
 use super::database::Database;
 use super::goals::{SELECT_GOAL, row_to_goal};
-use super::models::{Goal, Program, ProgramBlock, ProgramSlot, ProgramStatus, SlotStatus, WorkoutPlan};
+use super::models::{Goal, Program, ProgramBlock, ProgramSlot, ProgramStatus, SlotStatus, TrainingMode, WorkoutPlan};
 use super::planner::{SELECT_PLAN, row_to_plan};
 
 fn row_to_program(row: &rusqlite::Row) -> rusqlite::Result<Program> {
@@ -200,6 +200,46 @@ impl Database {
         Ok(())
     }
 
+    /// The slot a new `/nextworkout` design targets: the earliest cell (week,
+    /// day order) not yet conclusively resolved. A slot is unresolved while it
+    /// is `pending`, and also while it is `filled` but no plan bound to it has
+    /// ever been executed (`active`/`completed`) — so redesigning re-targets the
+    /// same slot instead of burning the next one, including when an earlier
+    /// design went stale and was abandoned. `missed` and `skipped` slots are
+    /// settled history and never come back.
+    pub fn next_design_slot(&self, program_id: i64) -> anyhow::Result<Option<ProgramSlot>> {
+        let sql = format!(
+            "{SELECT_SLOT} WHERE program_id = ?1 AND (status = 'pending' \
+                OR (status = 'filled' AND NOT EXISTS ( \
+                    SELECT 1 FROM workout_plans p WHERE p.program_slot_id = program_slots.id AND p.status IN ('active', 'completed')))) \
+             ORDER BY week_idx, day_idx LIMIT 1"
+        );
+        let mut stmt = self.conn().prepare(&sql)?;
+        let mut rows = stmt.query_map(params![program_id], row_to_slot)?;
+        rows.next().transpose().context("Failed to read next design slot")
+    }
+
+    // ── Training mode ([C1.4]) ────────────────────────────────────────────────────
+
+    /// Resolve the [`TrainingMode`] a new session design runs in. With no active
+    /// programme the mode is plain ad-hoc — exactly the pre-programme behaviour.
+    /// With one, the design targets the programme's next unresolved slot, unless
+    /// `force_ad_hoc` records the user's explicit "leave my programme alone" (or
+    /// the grid has no designable slot left): then the programme is reported but
+    /// no slot is targeted, so adherence can never mutate.
+    pub fn training_mode_for_design(&self, user_id: i64, force_ad_hoc: bool) -> anyhow::Result<TrainingMode> {
+        let Some(program) = self.active_program_for_user(user_id)? else {
+            return Ok(TrainingMode::AdHoc { program: None });
+        };
+        if force_ad_hoc {
+            return Ok(TrainingMode::AdHoc { program: Some(program) });
+        }
+        match self.next_design_slot(program.id)? {
+            Some(slot) => Ok(TrainingMode::Program { program, slot }),
+            None => Ok(TrainingMode::AdHoc { program: Some(program) }),
+        }
+    }
+
     // ── Plan ↔ slot join ──────────────────────────────────────────────────────────
 
     /// Stamp a designed plan with the programme slot it fills and mark the slot
@@ -224,7 +264,7 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use super::super::models::{new_exercise_goal, new_program, new_program_block, new_program_slot, new_user};
+    use super::super::models::{PlanStatus, new_exercise_goal, new_program, new_program_block, new_program_slot, new_user};
     use super::*;
 
     fn test_db() -> (Database, i64) {
@@ -367,6 +407,94 @@ mod tests {
         assert_eq!(db.get_plan(plan_id).unwrap().unwrap().program_slot_id, Some(slot_id));
         assert_eq!(db.get_program_slot(slot_id).unwrap().unwrap().status, SlotStatus::Filled);
         assert_eq!(db.plan_for_slot(slot_id).unwrap().unwrap().id, plan_id);
+    }
+
+    /// An active programme with a 2×2 grid, returning (program_id, slot ids in
+    /// (week, day) order).
+    fn active_program_with_grid(db: &Database, user_id: i64) -> (i64, Vec<i64>) {
+        let program_id = draft_program(db, user_id, "12-week hypertrophy");
+        db.activate_program(program_id).unwrap();
+        let slots = [(1, 1, "upper"), (1, 2, "lower"), (2, 1, "upper"), (2, 2, "lower")]
+            .iter()
+            .map(|(w, d, focus)| db.add_program_slot(&new_program_slot(program_id, *w, *d, focus)).unwrap())
+            .collect();
+        (program_id, slots)
+    }
+
+    #[test]
+    fn next_design_slot_walks_the_grid_and_retargets_unexecuted_fills() {
+        let (db, user_id) = test_db();
+        let (program_id, slots) = active_program_with_grid(&db, user_id);
+
+        assert_eq!(db.next_design_slot(program_id).unwrap().unwrap().id, slots[0]);
+
+        // A merely-proposed (or later abandoned) plan does not resolve the slot:
+        // a redesign re-targets it rather than burning the next one.
+        let proposed = db.create_plan(user_id, "W1D1 upper", None, None).unwrap();
+        db.bind_plan_to_slot(proposed, slots[0]).unwrap();
+        assert_eq!(db.next_design_slot(program_id).unwrap().unwrap().id, slots[0]);
+
+        // Executing the plan resolves the slot; design moves on.
+        let session = db.start_session(user_id, None).unwrap();
+        db.bind_plan_to_session(proposed, session.id).unwrap();
+        assert_eq!(db.next_design_slot(program_id).unwrap().unwrap().id, slots[1]);
+
+        // Missed and skipped slots are settled history.
+        db.set_slot_status(slots[1], SlotStatus::Missed).unwrap();
+        db.set_slot_status(slots[2], SlotStatus::Skipped).unwrap();
+        assert_eq!(db.next_design_slot(program_id).unwrap().unwrap().id, slots[3]);
+
+        db.set_slot_status(slots[3], SlotStatus::Filled).unwrap();
+        let last = db.create_plan(user_id, "W2D2 lower", None, None).unwrap();
+        db.bind_plan_to_slot(last, slots[3]).unwrap();
+        db.set_plan_status(last, PlanStatus::Completed).unwrap();
+        assert!(db.next_design_slot(program_id).unwrap().is_none(), "a fully resolved grid has no design slot");
+    }
+
+    #[test]
+    fn training_mode_without_a_programme_is_plain_ad_hoc() {
+        let (db, user_id) = test_db();
+        // No programme at all, and also a draft one: neither puts the user in programme mode.
+        assert!(matches!(db.training_mode_for_design(user_id, false).unwrap(), TrainingMode::AdHoc { program: None }));
+        draft_program(&db, user_id, "still a draft");
+        assert!(matches!(db.training_mode_for_design(user_id, false).unwrap(), TrainingMode::AdHoc { program: None }));
+    }
+
+    #[test]
+    fn training_mode_with_active_programme_targets_the_current_slot() {
+        let (db, user_id) = test_db();
+        let (program_id, slots) = active_program_with_grid(&db, user_id);
+
+        match db.training_mode_for_design(user_id, false).unwrap() {
+            TrainingMode::Program { program, slot } => {
+                assert_eq!(program.id, program_id);
+                assert_eq!(slot.id, slots[0]);
+            }
+            other => panic!("expected programme mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forced_ad_hoc_reports_the_programme_but_targets_no_slot() {
+        let (db, user_id) = test_db();
+        let (program_id, _) = active_program_with_grid(&db, user_id);
+
+        match db.training_mode_for_design(user_id, true).unwrap() {
+            TrainingMode::AdHoc { program: Some(program) } => assert_eq!(program.id, program_id),
+            other => panic!("expected ad-hoc-with-programme, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exhausted_grid_falls_back_to_ad_hoc_with_the_programme_reported() {
+        let (db, user_id) = test_db();
+        let (program_id, slots) = active_program_with_grid(&db, user_id);
+        slots.iter().for_each(|slot| db.set_slot_status(*slot, SlotStatus::Skipped).unwrap());
+
+        match db.training_mode_for_design(user_id, false).unwrap() {
+            TrainingMode::AdHoc { program: Some(program) } => assert_eq!(program.id, program_id),
+            other => panic!("expected ad-hoc fallback, got {other:?}"),
+        }
     }
 
     #[test]

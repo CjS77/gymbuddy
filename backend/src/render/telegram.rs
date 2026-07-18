@@ -3,7 +3,7 @@
 //! Reproduces the exact output the handler emitted before the view refactor, so
 //! the Telegram bot is visually unchanged — locked down by golden tests below.
 
-use gymbuddy_proto::{CatalogView, HistoryView, Render, SetLine, StatusView, View, WorkoutView};
+use gymbuddy_proto::{CatalogView, HistoryView, Render, SetLine, StatusView, TrainingModeView, View, WorkoutView};
 
 /// The Telegram renderer. `Output` is `(text, parse_mode)` — `parse_mode` is
 /// `Some("HTML")` for the rich `/status` and `/exercises` views, `None` otherwise.
@@ -19,7 +19,8 @@ impl Render for Telegram {
             View::History(history) => (render_history(history), None),
             View::Status(status) => (render_status(status), Some("HTML")),
             View::Catalog(catalog) => (render_catalog(catalog), Some("HTML")),
-            View::Workout(workout) => (render_workout(workout), Some("HTML")),
+            View::Workout(workout) => (render_workout(workout, None), Some("HTML")),
+            View::ProgramWorkout { workout, mode } => (render_workout(workout, Some(mode)), Some("HTML")),
             View::Timers { enabled } => (format!("Rest timers are now {}.", if *enabled { "on" } else { "off" }), None),
             // `View` is `#[non_exhaustive]`: a variant from a newer server lands here.
             // Degrade to plain text rather than sending Telegram an empty message
@@ -122,8 +123,16 @@ fn render_history(history: &HistoryView) -> String {
     parts.join("\n")
 }
 
-fn render_workout(workout: &WorkoutView) -> String {
+/// Render a designed workout; `mode` (present only when a programme is active,
+/// [C1.4]) adds one italic line under the title saying whether this fills the
+/// programme's current slot or deliberately sidesteps it. `None` — ad-hoc with no
+/// programme — keeps the golden pre-programme layout untouched.
+fn render_workout(workout: &WorkoutView, mode: Option<&TrainingModeView>) -> String {
     let mut result = format!("<b>{}</b>\n", escape_html(&workout.title));
+
+    if let Some(mode) = mode {
+        result.push_str(&format!("<i>{}</i>\n", escape_html(&mode.summary())));
+    }
 
     if let Some(rationale) = &workout.rationale
         && !rationale.trim().is_empty()
@@ -298,5 +307,52 @@ mod tests {
                         - Skipped deadlift to protect your lower back.\n\
                         \nThis is just a plan -- log your sets as you go and I'll adjust.";
         assert_eq!(html, expected);
+    }
+
+    fn one_exercise_workout() -> WorkoutView {
+        use gymbuddy_proto::PlannedExerciseView;
+        WorkoutView {
+            title: "Upper".into(),
+            rationale: None,
+            exercises: vec![PlannedExerciseView {
+                name: "Bench Press".into(),
+                target_sets: Some(3),
+                target_reps: Some(6),
+                target_weight_kg: Some(65.0),
+                target_secs: None,
+                cue: None,
+            }],
+            notes: vec![],
+        }
+    }
+
+    /// [C1.4]: a programme-slot design carries an italic mode line under the title;
+    /// the rest of the layout is the untouched ad-hoc one.
+    #[test]
+    fn program_workout_html_names_the_slot() {
+        let view = View::ProgramWorkout {
+            workout: one_exercise_workout(),
+            mode: TrainingModeView::Program { program_title: "12-week <plan>".into(), week: 2, day: 1, focus: "upper".into() },
+        };
+        let (html, mode) = Telegram.render(&view);
+        assert_eq!(mode, Some("HTML"));
+        let expected = "<b>Upper</b>\n\
+                        <i>Programme: 12-week &lt;plan&gt; — week 2, day 1: upper</i>\n\
+                        \n\
+                        1. <b>Bench Press</b> — 3 sets × 6 reps @ 65kg\n\
+                        \nThis is just a plan -- log your sets as you go and I'll adjust.";
+        assert_eq!(html, expected);
+    }
+
+    /// [C1.4]: an explicit one-off during an active programme says so, and says the
+    /// programme is untouched.
+    #[test]
+    fn ad_hoc_workout_under_a_programme_says_it_is_untouched() {
+        let view = View::ProgramWorkout {
+            workout: one_exercise_workout(),
+            mode: TrainingModeView::AdHoc { program_title: "12-week hypertrophy".into() },
+        };
+        let (html, _) = Telegram.render(&view);
+        assert!(html.contains("<i>Ad-hoc session — 12-week hypertrophy is untouched</i>\n"), "got: {html}");
     }
 }

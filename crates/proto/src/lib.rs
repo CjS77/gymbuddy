@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 pub mod view;
 pub use view::{
     CatalogEntry, CatalogGroup, CatalogView, ExerciseLog, HealthNote, HistoryView, Measurement, PlannedExerciseView, Render,
-    SessionSummaryView, SessionView, SetLine, StatusView, View, WorkoutView,
+    SessionSummaryView, SessionView, SetLine, StatusView, TrainingModeView, View, WorkoutView,
 };
 
 /// Discriminator placed in confide's `Message::Custom { kind, .. }` so the peer
@@ -215,9 +215,32 @@ mod tests {
             View::History(view::HistoryView {
                 sessions: vec![view::SessionSummaryView { started_at: "2026-06-16 10:00:00".into(), status: "done".into(), entries: 3, minutes: Some(45) }],
             }),
+            View::ProgramWorkout {
+                workout: view::WorkoutView { title: "Upper".into(), rationale: Some("push it".into()), exercises: vec![], notes: vec![] },
+                mode: view::TrainingModeView::AdHoc { program_title: "12-week hypertrophy".into() },
+            },
+            View::ProgramWorkout {
+                workout: view::WorkoutView { title: "Upper".into(), rationale: None, exercises: vec![], notes: vec![] },
+                mode: view::TrainingModeView::Program { program_title: "12-week".into(), week: 1, day: 2, focus: "upper".into() },
+            },
         ] {
             roundtrip_response(ServerResponse::Reply { view, timer: None });
         }
+    }
+
+    /// [C1.4] appended `View::ProgramWorkout` — appended, because postcard tags are
+    /// declaration-order varints: an ad-hoc design with no programme still encodes
+    /// as the original `Workout` tag, byte-identical to the pre-programme protocol.
+    #[test]
+    fn program_workout_variant_is_appended_not_inserted() {
+        let plain = View::Workout(view::WorkoutView { title: "Push".into(), rationale: None, exercises: vec![], notes: vec![] });
+        let moded = View::ProgramWorkout {
+            workout: view::WorkoutView { title: "Push".into(), rationale: None, exercises: vec![], notes: vec![] },
+            mode: view::TrainingModeView::AdHoc { program_title: "12-week".into() },
+        };
+        let tag = |view: &View| postcard::to_allocvec(view).unwrap()[0];
+        assert_eq!(tag(&plain), 6, "Workout keeps its pre-[C1.4] discriminant");
+        assert_eq!(tag(&moded), 7, "ProgramWorkout sits after every existing variant");
     }
 
     #[test]

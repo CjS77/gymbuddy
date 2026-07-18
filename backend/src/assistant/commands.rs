@@ -106,8 +106,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         command: Command::NextWorkout,
         name: "/nextworkout",
-        args: None,
-        description: "Design a tailored workout for today (logs nothing)",
+        args: Some("[adhoc]"),
+        description: "Design a tailored workout for today (logs nothing; 'adhoc' leaves your programme untouched)",
         visibility: Visibility::Everyone,
     },
     CommandSpec {

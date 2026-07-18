@@ -1183,6 +1183,23 @@ pub struct ProgramSlot {
     pub updated_at: String,
 }
 
+/// The mode a session design runs in ([C1.4]). Ad-hoc is the first-class
+/// default: it never requires a programme, and it stays available while one is
+/// active as a deliberate one-off that leaves every slot untouched. Resolved by
+/// [`Database::training_mode_for_design`](super::Database), read at the
+/// `/nextworkout` entry point, and surfaced to the user via
+/// [`gymbuddy_proto::TrainingModeView`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TrainingMode {
+    /// A one-off design. `program` is the active programme deliberately sat out
+    /// (or already fully resolved), `None` when the user has no programme at all —
+    /// in which case behaviour is exactly the pre-programme one.
+    AdHoc { program: Option<Program> },
+    /// The design fills `slot` of the active `program`; persisting it stamps the
+    /// plan's `program_slot_id` and marks the slot filled.
+    Program { program: Program, slot: ProgramSlot },
+}
+
 pub fn new_program(user_id: i64, title: &str, days_per_week: i32, split: &str, progression_policy: &str) -> Program {
     let now = now_str();
     Program {

@@ -40,6 +40,14 @@ pub enum View {
     /// prescribed exercises and target sets. Nothing here is logged — the user still
     /// logs sets the normal way.
     Workout(WorkoutView),
+    /// A designed workout produced while the user has an active programme ([C1.4]):
+    /// either it fills the programme's current slot, or it is a deliberate one-off
+    /// that leaves the programme untouched — `mode` says which. Designs with no
+    /// programme in play keep travelling as plain [`View::Workout`], byte-identical
+    /// to the pre-programme protocol (postcard is positional, so extending
+    /// [`WorkoutView`] itself would silently reshape existing messages — see the
+    /// append-only rule on the envelope enums).
+    ProgramWorkout { workout: WorkoutView, mode: TrainingModeView },
 }
 
 impl View {
@@ -71,6 +79,7 @@ impl View {
             View::Catalog(_) => "Here's the exercise catalogue.".to_string(),
             View::History(_) => "Here's your recent workout history.".to_string(),
             View::Workout(w) => format!("Here's a workout: {}.", w.title),
+            View::ProgramWorkout { workout, mode } => format!("Here's a workout: {} ({}).", workout.title, mode.summary()),
         }
     }
 }
@@ -212,6 +221,34 @@ pub struct WorkoutView {
     pub notes: Vec<String>,
 }
 
+/// The training mode that produced a designed workout ([C1.4]), for workouts
+/// designed while a programme is active. Plain ad-hoc with no programme in play
+/// has no mode to report and travels as [`View::Workout`], so "no programme"
+/// is deliberately unrepresentable here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TrainingModeView {
+    /// A deliberate one-off during an active programme ("travelling, dumbbells
+    /// only"): the named programme's slots are left completely untouched.
+    AdHoc { program_title: String },
+    /// The workout fills the active programme's current slot.
+    Program { program_title: String, week: u32, day: u32, focus: String },
+}
+
+impl TrainingModeView {
+    /// One-line description of the mode, shared by every client renderer, e.g.
+    /// `Programme: 12-week hypertrophy — week 2, day 1: upper` or
+    /// `Ad-hoc session — 12-week hypertrophy is untouched`. Plain text; styling
+    /// and escaping stay at the renderer.
+    pub fn summary(&self) -> String {
+        match self {
+            Self::AdHoc { program_title } => format!("Ad-hoc session — {program_title} is untouched"),
+            Self::Program { program_title, week, day, focus } => {
+                format!("Programme: {program_title} — week {week}, day {day}: {focus}")
+            }
+        }
+    }
+}
+
 /// One prescribed exercise in a [`WorkoutView`]. The target fields are
 /// presentation hints; `(target_reps, target_weight_kg)` cover the weight_reps
 /// case and `target_secs` covers timed work.
@@ -274,10 +311,25 @@ mod tests {
             View::Catalog(CatalogView { groups: vec![] }),
             View::History(HistoryView { sessions: vec![] }),
             View::Workout(WorkoutView { title: "Push focus".into(), rationale: None, exercises: vec![], notes: vec![] }),
+            View::ProgramWorkout {
+                workout: WorkoutView { title: "Upper".into(), rationale: None, exercises: vec![], notes: vec![] },
+                mode: TrainingModeView::Program { program_title: "12-week".into(), week: 1, day: 1, focus: "upper".into() },
+            },
         ];
         for view in &views {
             assert!(!view.fallback_text().is_empty(), "empty fallback for {view:?}");
         }
+    }
+
+    /// The mode summary is what every renderer surfaces, so both modes must name
+    /// the programme and the programme mode must place the user in the grid.
+    #[test]
+    fn training_mode_summary_names_the_programme() {
+        let ad_hoc = TrainingModeView::AdHoc { program_title: "12-week hypertrophy".into() };
+        assert_eq!(ad_hoc.summary(), "Ad-hoc session — 12-week hypertrophy is untouched");
+
+        let slot = TrainingModeView::Program { program_title: "12-week hypertrophy".into(), week: 2, day: 1, focus: "upper".into() };
+        assert_eq!(slot.summary(), "Programme: 12-week hypertrophy — week 2, day 1: upper");
     }
 
     fn set(measurement: Measurement, count: Option<u32>, value: f64) -> SetLine {

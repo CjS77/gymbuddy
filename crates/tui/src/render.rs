@@ -4,7 +4,7 @@
 //! headings, bullets, and space-aligned columns (no bordered `Table` widget,
 //! which clashes with the flowing transcript).
 
-use gymbuddy_proto::{CatalogView, ExerciseLog, HistoryView, SetLine, StatusView, View, WorkoutView};
+use gymbuddy_proto::{CatalogView, ExerciseLog, HistoryView, SetLine, StatusView, TrainingModeView, View, WorkoutView};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -23,7 +23,8 @@ pub fn render_view(view: &View) -> Vec<Line<'static>> {
         View::Status(status) => render_status(status),
         View::Catalog(catalog) => render_catalog(catalog),
         View::History(history) => render_history(history),
-        View::Workout(workout) => render_workout(workout),
+        View::Workout(workout) => render_workout(workout, None),
+        View::ProgramWorkout { workout, mode } => render_workout(workout, Some(mode)),
         View::Timers { enabled } => vec![Line::from(Span::styled(
             format!("Rest timers {}", if *enabled { "on" } else { "off" }),
             Style::default().fg(if *enabled { SUCCESS } else { MUTED }).add_modifier(Modifier::BOLD),
@@ -130,8 +131,16 @@ fn render_history(history: &HistoryView) -> Vec<Line<'static>> {
     lines
 }
 
-fn render_workout(workout: &WorkoutView) -> Vec<Line<'static>> {
+/// Render a designed workout; `mode` (present only when a programme is active,
+/// [C1.4]) adds one muted line under the title saying whether this fills the
+/// programme's current slot or deliberately sidesteps it. `None` — ad-hoc with no
+/// programme — keeps the pre-programme layout untouched.
+fn render_workout(workout: &WorkoutView, mode: Option<&TrainingModeView>) -> Vec<Line<'static>> {
     let mut lines = vec![heading(workout.title.clone())];
+
+    if let Some(mode) = mode {
+        lines.push(muted(mode.summary()));
+    }
 
     if let Some(rationale) = &workout.rationale
         && !rationale.trim().is_empty()
@@ -263,6 +272,23 @@ mod tests {
         assert!(text.contains("Push the weight."));
         assert!(text.contains("Skipped deadlift for your back."));
         assert!(!text.contains('<'), "no HTML markup should appear: {text}");
+    }
+
+    /// [C1.4]: a workout designed under an active programme carries its mode line;
+    /// both modes name the programme so the user always knows what today counts for.
+    #[test]
+    fn program_workout_renders_the_mode_line() {
+        use gymbuddy_proto::WorkoutView;
+        let workout = WorkoutView { title: "Upper".into(), rationale: None, exercises: vec![], notes: vec![] };
+
+        let slot = View::ProgramWorkout {
+            workout: workout.clone(),
+            mode: TrainingModeView::Program { program_title: "12-week".into(), week: 2, day: 1, focus: "upper".into() },
+        };
+        assert!(flat(&render_view(&slot)).contains("Programme: 12-week — week 2, day 1: upper"));
+
+        let ad_hoc = View::ProgramWorkout { workout, mode: TrainingModeView::AdHoc { program_title: "12-week".into() } };
+        assert!(flat(&render_view(&ad_hoc)).contains("Ad-hoc session — 12-week is untouched"));
     }
 
     #[test]

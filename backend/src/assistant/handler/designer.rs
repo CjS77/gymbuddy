@@ -13,29 +13,36 @@ use crate::assistant::parser::parse_assistant_response;
 use crate::assistant::prompts::{build_designer_prompt, format_muscle_recovery, format_session_outcome};
 use crate::config::DesignerHistoryConfig;
 use crate::db::{
-    Database, EntryWithSets, ExerciseSet, GoalProgress, MeasurementType, Session, SessionWithSets, User, WorkoutPhilosophy,
+    Database, EntryWithSets, ExerciseSet, GoalProgress, MeasurementType, Session, SessionWithSets, TrainingMode, User, WorkoutPhilosophy,
     WorkoutPlanExercise,
 };
 
 use super::AssistantHandler;
 use super::continuity::parse_sqlite_datetime;
-use gymbuddy_proto::{PlannedExerciseView, View, WorkoutView};
+use gymbuddy_proto::{PlannedExerciseView, TrainingModeView, View, WorkoutView};
 
 impl AssistantHandler {
     /// Design a tailored workout from the user's philosophy, recent history, goals,
     /// and injuries, and present it as a [`View::Workout`]. Persists a `proposed`
     /// plan but logs NOTHING and starts no session. Any text after the command
     /// ("/nextworkout but something lighter") is passed to the designer as guidance.
+    ///
+    /// The design runs in an explicit [`TrainingMode`] ([C1.4]): with an active
+    /// programme it targets the current slot; without one it is ad-hoc, exactly the
+    /// pre-programme behaviour. Guidance leading with "adhoc" ("/nextworkout adhoc
+    /// dumbbells only") forces a one-off that leaves an active programme untouched.
     pub(super) async fn cmd_next_workout(&self, user: &User, text: &str) -> anyhow::Result<View> {
-        let guidance = text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
+        let raw_guidance = text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
+        let (force_ad_hoc, guidance) = split_ad_hoc_marker(&raw_guidance);
 
-        let (philosophy, sessions, recovery, goals, injuries, goal_ids) = {
+        let (mode, philosophy, sessions, recovery, goals, injuries, goal_ids) = {
             let db = self.db.lock().await;
             let goals = db.goal_progress_report(user.id, None, None)?;
             let goal_ids = goal_relevant_exercise_ids(&db, &goals)?;
             // Pull a generous window (bounded by config); the summariser decides how
             // much of it survives into the prompt under the token budget.
             (
+                db.training_mode_for_design(user.id, force_ad_hoc)?,
                 db.latest_philosophy(user.id)?,
                 db.recent_sessions_with_sets(user.id, self.config.designer_history.max_sessions)?,
                 db.muscle_recovery(user.id)?,
@@ -84,16 +91,22 @@ impl AssistantHandler {
             ));
         };
 
-        self.persist_and_view_workout(user, &philosophy, title, rationale, exercises).await
+        self.persist_and_view_workout(user, &philosophy, &mode, title, rationale, exercises).await
     }
 
-    /// Persist a designed workout as a `proposed` plan and build its [`View::Workout`].
-    /// Exercise names are resolved against the catalogue; unresolved ones are dropped
-    /// with a note rather than failing the whole design.
+    /// Persist a designed workout as a `proposed` plan and build its [`View::Workout`]
+    /// (or [`View::ProgramWorkout`] when a programme is in play). Exercise names are
+    /// resolved against the catalogue; unresolved ones are dropped with a note rather
+    /// than failing the whole design.
+    ///
+    /// In programme mode the plan is stamped with the slot it fills; in ad-hoc mode
+    /// its `program_slot_id` stays NULL and no slot status moves — a one-off under an
+    /// active programme never touches adherence.
     async fn persist_and_view_workout(
         &self,
         user: &User,
         philosophy: &WorkoutPhilosophy,
+        mode: &TrainingMode,
         title: String,
         rationale: Option<String>,
         exercises: Vec<ProposedExercise>,
@@ -103,6 +116,10 @@ impl AssistantHandler {
 
         let db = self.db.lock().await;
         let plan_id = db.create_plan(user.id, &title, rationale.as_deref(), Some(philosophy.id))?;
+        if let TrainingMode::Program { slot, .. } = mode {
+            db.bind_plan_to_slot(plan_id, slot.id)?;
+            tracing::debug!(plan_id, slot_id = slot.id, "Designed workout bound to programme slot");
+        }
 
         for (idx, ex) in exercises.into_iter().enumerate() {
             let Some(et) = find_exercise_type(&self.catalogue, &ex.exercise) else {
@@ -130,7 +147,11 @@ impl AssistantHandler {
             });
         }
 
-        Ok(View::Workout(WorkoutView { title, rationale, exercises: planned, notes }))
+        let workout = WorkoutView { title, rationale, exercises: planned, notes };
+        Ok(match mode_view(mode) {
+            Some(mode) => View::ProgramWorkout { workout, mode },
+            None => View::Workout(workout),
+        })
     }
 
     /// Build the designer's history block: the most recent sessions in full, older
@@ -302,6 +323,36 @@ pub(super) fn proposed_plan_within_window(created_at: &str, now: NaiveDateTime) 
     }
 }
 
+/// Split a leading ad-hoc marker ("adhoc", "ad-hoc", "oneoff", "one-off") off the
+/// `/nextworkout` guidance text ([C1.4]). Present means the user explicitly wants a
+/// one-off that leaves an active programme untouched; the rest stays designer
+/// guidance. Harmless without a programme, where every design is ad-hoc anyway.
+fn split_ad_hoc_marker(guidance: &str) -> (bool, String) {
+    let mut words = guidance.split_whitespace();
+    match words.next() {
+        Some(first) if ["adhoc", "ad-hoc", "oneoff", "one-off"].contains(&first.to_lowercase().as_str()) => {
+            (true, words.collect::<Vec<_>>().join(" "))
+        }
+        _ => (false, guidance.to_string()),
+    }
+}
+
+/// The wire-facing mode for a designed workout, or `None` for plain ad-hoc with no
+/// programme in play — which keeps travelling as the pre-programme [`View::Workout`],
+/// so a user with no programme sees exactly today's output.
+fn mode_view(mode: &TrainingMode) -> Option<TrainingModeView> {
+    match mode {
+        TrainingMode::AdHoc { program: None } => None,
+        TrainingMode::AdHoc { program: Some(program) } => Some(TrainingModeView::AdHoc { program_title: program.title.clone() }),
+        TrainingMode::Program { program, slot } => Some(TrainingModeView::Program {
+            program_title: program.title.clone(),
+            week: slot.week_idx.max(0) as u32,
+            day: slot.day_idx.max(0) as u32,
+            focus: slot.focus.clone(),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,10 +392,13 @@ mod tests {
         assert!(text.contains("Upper push"));
         assert!(text.contains("Bench Press"));
         assert!(text.contains("3 sets × 6 reps @ 65kg"));
+        // [C1.4]: no programme in play, so no mode line — exactly the pre-programme output.
+        assert!(!text.contains("Programme:") && !text.contains("Ad-hoc session"), "no mode line without a programme: {text}");
 
         let db = handler.db.lock().await;
         let plan = db.latest_proposed_plan(user.id).unwrap().expect("a proposed plan should be persisted");
         assert_eq!(plan.title, "Upper push");
+        assert_eq!(plan.program_slot_id, None, "a plan designed with no programme is ad-hoc");
         assert_eq!(db.list_plan_exercises(plan.id).unwrap().len(), 2);
         // The crucial guarantee: designing logs NOTHING.
         assert!(db.get_active_session(user.id).unwrap().is_none(), "nextworkout must not start a session");
@@ -375,6 +429,96 @@ mod tests {
         let db = handler.db.lock().await;
         let plan = db.latest_proposed_plan(user.id).unwrap().unwrap();
         assert_eq!(db.list_plan_exercises(plan.id).unwrap().len(), 1, "only the resolved exercise is persisted");
+    }
+
+    const DESIGN_RESPONSE: &str = r#"{"message": "Here's your session.", "actions": [
+        {"type": "propose_workout", "title": "Upper", "exercises": [
+            {"exercise": "Bench Press", "target_sets": 3, "target_reps": 6, "target_weight_kg": 65.0}
+        ]}
+    ]}"#;
+
+    /// Give `user_id` an active programme ("12-week hypertrophy") with a two-slot
+    /// week-1 grid, returning the slot ids in (week, day) order.
+    async fn activate_program_with_slots(handler: &AssistantHandler, user_id: i64) -> Vec<i64> {
+        let db = handler.db.lock().await;
+        let program = crate::db::new_program(user_id, "12-week hypertrophy", 2, "upper/lower", "double progression");
+        let program_id = db.create_program(&program).unwrap();
+        db.activate_program(program_id).unwrap();
+        [(1, 1, "upper"), (1, 2, "lower")]
+            .iter()
+            .map(|(w, d, focus)| db.add_program_slot(&crate::db::new_program_slot(program_id, *w, *d, focus)).unwrap())
+            .collect()
+    }
+
+    /// [C1.4]: with an active programme, `/nextworkout` designs against the current
+    /// slot — the plan records it, the slot fills, and the user is told which slot
+    /// today's session is.
+    #[tokio::test]
+    async fn nextworkout_under_active_programme_fills_the_current_slot() {
+        let (handler, _) = setup_handler(DESIGN_RESPONSE).await;
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
+        let user = { handler.db.lock().await.get_user_by_telegram_id("12345").unwrap().unwrap() };
+        {
+            handler.db.lock().await.insert_philosophy(user.id, "5x5, dumbbells to 24kg", "interview").unwrap();
+        }
+        let slots = activate_program_with_slots(&handler, user.id).await;
+
+        let reply = handler.handle_text_message(&msg, "/nextworkout").await.unwrap();
+        let text = shown(&reply);
+        assert!(text.contains("Programme: 12-week hypertrophy — week 1, day 1: upper"), "mode line missing: {text}");
+
+        let db = handler.db.lock().await;
+        let plan = db.latest_proposed_plan(user.id).unwrap().unwrap();
+        assert_eq!(plan.program_slot_id, Some(slots[0]), "the plan records the slot it fills");
+        assert_eq!(db.get_program_slot(slots[0]).unwrap().unwrap().status, crate::db::SlotStatus::Filled);
+        assert_eq!(db.get_program_slot(slots[1]).unwrap().unwrap().status, crate::db::SlotStatus::Pending);
+    }
+
+    /// [C1.4]: "/nextworkout adhoc …" during an active programme is a legitimate
+    /// one-off ("travelling, dumbbells only"): recorded and surfaced as ad-hoc, the
+    /// marker stripped from the designer guidance, and adherence never moves — every
+    /// slot stays pending through design, execution and session end.
+    #[tokio::test]
+    async fn adhoc_nextworkout_under_active_programme_leaves_slots_untouched() {
+        let (handler, llm) = setup_handler(DESIGN_RESPONSE).await;
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
+        let user = { handler.db.lock().await.get_user_by_telegram_id("12345").unwrap().unwrap() };
+        {
+            handler.db.lock().await.insert_philosophy(user.id, "5x5, dumbbells to 24kg", "interview").unwrap();
+        }
+        let slots = activate_program_with_slots(&handler, user.id).await;
+
+        let reply = handler.handle_text_message(&msg, "/nextworkout adhoc dumbbells only").await.unwrap();
+        let text = shown(&reply);
+        assert!(text.contains("Ad-hoc session — 12-week hypertrophy is untouched"), "mode line missing: {text}");
+
+        let design_request = llm.recorded_requests().pop().unwrap();
+        assert_eq!(design_request.messages.last().unwrap().content, "dumbbells only", "the adhoc marker is not designer guidance");
+
+        {
+            let db = handler.db.lock().await;
+            let plan = db.latest_proposed_plan(user.id).unwrap().unwrap();
+            assert_eq!(plan.program_slot_id, None, "an ad-hoc plan records no slot");
+        }
+
+        // Run the design through its whole lifecycle: start a session (binding the
+        // plan for guided execution), then end it (completing the plan).
+        llm.set_response(r#"{"message": "Let's go!", "actions": [{"type": "start_session"}]}"#);
+        let _ = handler.handle_text_message(&msg, "start my workout").await.unwrap();
+        llm.set_response(r#"{"message": "Nice work!", "actions": [{"type": "end_session"}]}"#);
+        let _ = handler.handle_text_message(&msg, "done").await.unwrap();
+
+        let db = handler.db.lock().await;
+        assert_eq!(db.latest_proposed_plan(user.id).unwrap().map(|p| p.id), None);
+        slots.iter().for_each(|slot| {
+            assert_eq!(
+                db.get_program_slot(*slot).unwrap().unwrap().status,
+                crate::db::SlotStatus::Pending,
+                "an ad-hoc session must not move any slot status"
+            );
+        });
     }
 
     #[tokio::test]
@@ -513,6 +657,18 @@ mod tests {
         let fresh = db.latest_proposed_plan(user.id).unwrap().unwrap();
         assert_ne!(fresh.id, plan_id, "a new plan was designed");
         assert!(fresh.override_note.is_none(), "the one-off must not survive into the next design");
+    }
+
+    #[test]
+    fn ad_hoc_marker_splits_off_the_first_word_only() {
+        assert_eq!(split_ad_hoc_marker("adhoc dumbbells only"), (true, "dumbbells only".to_string()));
+        assert_eq!(split_ad_hoc_marker("Ad-Hoc"), (true, String::new()));
+        assert_eq!(split_ad_hoc_marker("ONEOFF light"), (true, "light".to_string()));
+        assert_eq!(split_ad_hoc_marker("one-off legs"), (true, "legs".to_string()));
+        // Only a *leading* marker counts; ordinary guidance passes through whole.
+        assert_eq!(split_ad_hoc_marker("but something lighter"), (false, "but something lighter".to_string()));
+        assert_eq!(split_ad_hoc_marker("go adhoc today"), (false, "go adhoc today".to_string()));
+        assert_eq!(split_ad_hoc_marker(""), (false, String::new()));
     }
 
     #[test]
