@@ -1,4 +1,5 @@
 mod access;
+mod body_metrics;
 mod conversation;
 mod dashboard;
 mod database;
@@ -15,6 +16,7 @@ mod progress;
 mod schedules;
 mod users;
 
+pub use body_metrics::canonical_body_metric;
 pub use database::Database;
 pub use entries::{EntryReclassifyOutcome, SetEdit, SetEditError, SetEditOutcome};
 pub use models::*;

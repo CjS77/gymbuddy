@@ -626,6 +626,21 @@ pub struct HealthEntry {
     pub updated_at: String,
 }
 
+/// One body measurement: a (metric, value, moment) observation. Long-shaped —
+/// every metric is a row value, so new metrics (waist, resting HR) are new rows,
+/// never new columns. `metric` is the canonical unit-suffixed name (e.g.
+/// "bodyweight_kg", "body_fat_pct") shared with [`Goal::metric`], and `value` is
+/// in the unit that name carries. Retention and exposure policy for this data
+/// lives in the `body_metrics` DAO module docs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BodyMetric {
+    pub id: i64,
+    pub user_id: i64,
+    pub metric: String,
+    pub value: f64,
+    pub measured_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationMessage {
     pub id: i64,
@@ -845,6 +860,10 @@ pub fn new_health_entry(user_id: i64, entry_type: HealthEntryType, description: 
         notes: None,
         updated_at: now,
     }
+}
+
+pub fn new_body_metric(user_id: i64, metric: &str, value: f64) -> BodyMetric {
+    BodyMetric { id: 0, user_id, metric: metric.to_string(), value, measured_at: now_str() }
 }
 
 pub fn new_conversation_message(user_id: i64, platform: &str, role: ConversationRole, content: &str) -> ConversationMessage {

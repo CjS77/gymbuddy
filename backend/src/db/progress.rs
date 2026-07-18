@@ -188,14 +188,15 @@ impl Database {
         goals_with_info
             .into_iter()
             .map(|(goal, exercise_name)| {
-                // Only exercise goals have a sets-derived current value; metric goals
-                // report None until a metric source is wired up.
-                let current_value = match goal.exercise_type_id {
-                    Some(et_id) => {
-                        let goal_end = goal.target_date.as_deref().unwrap_or(to_str);
-                        self.relevant_value_for_exercise_type(user_id, et_id, goal.direction, &goal.start_date, goal_end)?
-                    }
-                    None => None,
+                // Exercise goals derive their current value from logged sets; metric
+                // goals (weightloss) read the user's latest body measurement up to the
+                // goal window's end. A metric with no measurement series (habit metrics
+                // like sessions_per_week) still reports None.
+                let goal_end = goal.target_date.as_deref().unwrap_or(to_str);
+                let current_value = match (goal.exercise_type_id, goal.metric.as_deref()) {
+                    (Some(et_id), _) => self.relevant_value_for_exercise_type(user_id, et_id, goal.direction, &goal.start_date, goal_end)?,
+                    (None, Some(metric)) => self.latest_body_metric_value(user_id, metric, goal_end)?,
+                    (None, None) => None,
                 };
 
                 let percentage = goal_percentage(goal.direction, current_value, goal.target_value);
@@ -283,7 +284,8 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::super::models::{
-        GoalDirection, GoalKind, MeasurementType, new_exercise_entry, new_exercise_goal, new_exercise_set, new_goal, new_user,
+        GoalDirection, GoalKind, MeasurementType, new_body_metric, new_exercise_entry, new_exercise_goal, new_exercise_set, new_goal,
+        new_user,
     };
     use super::*;
 
@@ -500,7 +502,8 @@ mod tests {
 
     #[test]
     fn metric_goal_surfaces_without_an_exercise() {
-        // A bodyweight goal has no exercise; it must still appear, with no derived value.
+        // A bodyweight goal has no exercise; it must still appear. With no
+        // measurements logged yet its current value stays None.
         let db = test_db();
         let user_id = db.insert_user(&new_user("Tester", None, "UTC")).unwrap();
 
@@ -513,5 +516,50 @@ mod tests {
         assert_eq!(report[0].exercise_name, "bodyweight_kg");
         assert_eq!(report[0].current_value, None);
         assert_eq!(report[0].status, GoalStatus::Active);
+    }
+
+    #[test]
+    fn weightloss_goal_reads_the_latest_body_metric() {
+        // Target 80kg from 90kg; the LATEST weigh-in (85kg), not the lowest, is
+        // the current value — you are judged against where you are now.
+        let db = test_db();
+        let user_id = db.insert_user(&new_user("Tester", None, "UTC")).unwrap();
+
+        for (date, kg) in [("2025-01-05 08:00:00", 90.0), ("2025-02-01 08:00:00", 84.0), ("2025-03-01 08:00:00", 85.0)] {
+            let mut m = new_body_metric(user_id, "weight", kg);
+            m.measured_at = date.into();
+            db.insert_body_metric(&m).unwrap();
+        }
+
+        let mut goal = new_goal(user_id, GoalKind::Bodyweight, None, Some("bodyweight_kg".into()), 80.0, GoalDirection::Decrease);
+        goal.start_date = "2025-01-01".into();
+        goal.target_date = Some("2027-12-31".into()); // future deadline, so status stays Active
+        db.insert_goal(&goal).unwrap();
+
+        let report = db.goal_progress_report(user_id, Some("2025-01-01"), Some("2027-12-31")).unwrap();
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].current_value, Some(85.0), "latest measurement, joined through the canonical metric name");
+        assert!((report[0].percentage - (80.0 / 85.0 * 100.0)).abs() < 0.01);
+        assert_eq!(report[0].status, GoalStatus::Active);
+    }
+
+    #[test]
+    fn weightloss_goal_is_achieved_once_weight_falls_to_target() {
+        let db = test_db();
+        let user_id = db.insert_user(&new_user("Tester", None, "UTC")).unwrap();
+
+        let mut m = new_body_metric(user_id, "bodyweight_kg", 79.5);
+        m.measured_at = "2025-06-01 08:00:00".into();
+        db.insert_body_metric(&m).unwrap();
+
+        let mut goal = new_goal(user_id, GoalKind::Bodyweight, None, Some("bodyweight_kg".into()), 80.0, GoalDirection::Decrease);
+        goal.start_date = "2025-01-01".into();
+        db.insert_goal(&goal).unwrap();
+
+        let report = db.goal_progress_report(user_id, Some("2025-01-01"), Some("2025-12-31")).unwrap();
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].current_value, Some(79.5));
+        assert!(report[0].percentage >= 100.0);
+        assert_eq!(report[0].status, GoalStatus::Achieved);
     }
 }
