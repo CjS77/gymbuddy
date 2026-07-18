@@ -182,9 +182,57 @@ impl Difficulty {
             _ => Self::Medium,
         }
     }
+
+    /// Ordinal for aggregation: easy < medium < hard < failure.
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Easy => 0,
+            Self::Medium => 1,
+            Self::Hard => 2,
+            Self::Failure => 3,
+        }
+    }
 }
 
 impl fmt::Display for Difficulty {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// How a whole session subjectively felt, as opposed to how mechanically hard it
+/// was ([`Difficulty`]): a hard session can still feel great. Part of the
+/// session outcome recorded at session end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionFeel {
+    Great,
+    Good,
+    Ok,
+    Rough,
+}
+
+impl SessionFeel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Great => "great",
+            Self::Good => "good",
+            Self::Ok => "ok",
+            Self::Rough => "rough",
+        }
+    }
+
+    pub fn from_str_loose(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "great" | "amazing" | "strong" => Self::Great,
+            "good" | "solid" => Self::Good,
+            "rough" | "bad" | "terrible" | "awful" => Self::Rough,
+            _ => Self::Ok,
+        }
+    }
+}
+
+impl fmt::Display for SessionFeel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -494,6 +542,19 @@ pub struct Session {
     pub started_at: String,
     pub ended_at: Option<String>,
     pub notes: Option<String>,
+    /// Session-level verdict, proposed at session end by distilling the last set
+    /// of each exercise and then confirmed or overridden by the user. Unlike
+    /// `notes` these fields are structured and feed the designer's feedback loop.
+    #[serde(default)]
+    pub overall_effort: Option<Difficulty>,
+    /// How the session subjectively felt, independent of `overall_effort`.
+    #[serde(default)]
+    pub felt: Option<SessionFeel>,
+    /// Whether the session ended before the user got through what they intended.
+    #[serde(default)]
+    pub cut_short: bool,
+    #[serde(default)]
+    pub cut_short_reason: Option<String>,
 }
 
 /// A block of related sets within a session (or standalone).
@@ -694,7 +755,17 @@ pub fn new_user_with_pubkey(name: &str, pubkey: &str, timezone: &str) -> User {
 }
 
 pub fn new_session(user_id: i64, notes: Option<&str>) -> Session {
-    Session { id: 0, user_id, started_at: now_str(), ended_at: None, notes: notes.map(String::from) }
+    Session {
+        id: 0,
+        user_id,
+        started_at: now_str(),
+        ended_at: None,
+        notes: notes.map(String::from),
+        overall_effort: None,
+        felt: None,
+        cut_short: false,
+        cut_short_reason: None,
+    }
 }
 
 pub fn new_exercise_entry(user_id: i64, session_id: Option<i64>, comment: Option<&str>) -> ExerciseEntry {

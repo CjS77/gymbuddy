@@ -2,10 +2,12 @@
 //! resolution, session lifecycle, entry close/edit/delete bookkeeping, and the
 //! rest-timer directives that ride along with each outcome.
 
+use anyhow::Context as _;
 use chrono::Utc;
 
 use crate::assistant::actions::AssistantAction;
 use crate::assistant::matching::find_exercise_type;
+use crate::assistant::prompts::format_session_outcome;
 use crate::db::{
     Database, Difficulty, ExerciseEntry, ExerciseTypeWithAncestry, GoalDirection, GoalKind, MeasurementType, Session, SetEdit,
     SetEditError, User, new_exercise_entry_at, new_exercise_set, new_goal, new_health_entry,
@@ -173,20 +175,37 @@ impl AssistantHandler {
             }
             AssistantAction::EndSession => {
                 let db = self.db.lock().await;
-                if let Some(session) = db.get_active_session(user.id)? {
-                    tracing::debug!(id = session.id, "Ending session");
-                    db.end_session(session.id)?;
-                    // Complete a guided workout plan bound to this session.
-                    if let Some(plan) = db.active_plan_for_user(user.id)?
-                        && plan.session_id == Some(session.id)
-                    {
-                        db.set_plan_status(plan.id, crate::db::PlanStatus::Completed)?;
-                    }
-                } else {
+                let Some(session) = db.get_active_session(user.id)? else {
                     tracing::debug!("No active session to end");
+                    // Resting is over once the session ends.
+                    return Ok(ActionOutcome::cancel());
+                };
+                tracing::debug!(id = session.id, "Ending session");
+                db.end_session(session.id)?;
+                // Complete a guided workout plan bound to this session.
+                if let Some(plan) = db.active_plan_for_user(user.id)?
+                    && plan.session_id == Some(session.id)
+                {
+                    db.set_plan_status(plan.id, crate::db::PlanStatus::Completed)?;
                 }
-                // Resting is over once the session ends.
-                Ok(ActionOutcome::cancel())
+                // end_session distilled a proposed verdict from the final set of each
+                // exercise; ask the user to confirm or override it. Resting is over
+                // once the session ends, so the timer cancel rides along either way.
+                let suffix = db.get_session(session.id)?.and_then(|s| s.overall_effort).map(session_verdict_question);
+                Ok(ActionOutcome { suffix, timer: Some(TimerSignal::Cancel) })
+            }
+            AssistantAction::RecordSessionOutcome { overall_effort, felt, cut_short, cut_short_reason } => {
+                let db = self.db.lock().await;
+                // Right after end_session no session is active, but the verdict still
+                // belongs to the one that just closed — hence latest, not active.
+                let Some(session) = db.latest_session_for_user(user.id)? else {
+                    tracing::debug!("No session to record an outcome against");
+                    return Ok(ActionOutcome::none());
+                };
+                db.set_session_outcome(session.id, *overall_effort, *felt, *cut_short, cut_short_reason.as_deref())?;
+                let updated = db.get_session(session.id)?.context("session vanished while recording its outcome")?;
+                tracing::debug!(id = session.id, effort = ?updated.overall_effort, felt = ?updated.felt, "Recorded session outcome");
+                Ok(format_session_outcome(&updated).map(|p| format!("Session verdict saved: {p}.")).into())
             }
             AssistantAction::CloseExerciseEntry { exercise, entry_id } => {
                 Ok(self.close_exercise_entry_action(user, exercise.as_deref(), *entry_id, false).await?.into_action_outcome())
@@ -646,6 +665,17 @@ fn opt_count(c: Option<i32>) -> String {
 /// Question appended to the assistant's reply when a logged set is a taxonomy
 /// relative of an exercise already in progress. The user resolves it on the next
 /// turn ("same exercise" → join the ongoing entry; "superset" → log separately).
+/// Question appended to the assistant's reply after end_session: proposes the
+/// session verdict distilled from the final set of each exercise, so the user can
+/// agree with one word — or override it with effort, feel, or a cut-short reason,
+/// which the LLM relays as a `record_session_outcome` action.
+fn session_verdict_question(effort: Difficulty) -> String {
+    format!(
+        "Going by the final set of each exercise, I'd call that session {effort} overall — sound right? \
+         You can correct me, add how it felt (great / good / ok / rough), or tell me if you had to cut it short and why."
+    )
+}
+
 fn superset_prompt(ongoing_exercise: &str, logged_exercise: &str) -> String {
     format!(
         "You've already got an open {ongoing_exercise} entry going. Should I add this {logged_exercise} set \

@@ -1,16 +1,57 @@
 use anyhow::Context as _;
-use rusqlite::{Row, params};
+use rusqlite::{Connection, Row, params};
 
 use super::database::Database;
-use super::models::{Difficulty, ExerciseEntry, ExerciseSet, ExerciseTypeWithAncestry, MeasurementType, Session, SessionSummary};
+use super::models::{
+    Difficulty, ExerciseEntry, ExerciseSet, ExerciseTypeWithAncestry, MeasurementType, Session, SessionFeel, SessionSummary,
+};
 
 // ── Sessions ───────────────────────────────────────────────────────────────────
 
 fn row_to_session(row: &Row) -> rusqlite::Result<Session> {
-    Ok(Session { id: row.get(0)?, user_id: row.get(1)?, started_at: row.get(2)?, ended_at: row.get(3)?, notes: row.get(4)? })
+    Ok(Session {
+        id: row.get(0)?,
+        user_id: row.get(1)?,
+        started_at: row.get(2)?,
+        ended_at: row.get(3)?,
+        notes: row.get(4)?,
+        overall_effort: row.get::<_, Option<String>>(5)?.map(|s| Difficulty::from_str_loose(&s)),
+        felt: row.get::<_, Option<String>>(6)?.map(|s| SessionFeel::from_str_loose(&s)),
+        cut_short: row.get(7)?,
+        cut_short_reason: row.get(8)?,
+    })
 }
 
-const SELECT_SESSION: &str = "SELECT id, user_id, started_at, ended_at, notes FROM sessions";
+const SELECT_SESSION: &str =
+    "SELECT id, user_id, started_at, ended_at, notes, overall_effort, felt, cut_short, cut_short_reason FROM sessions";
+
+/// The perceived difficulty of the LAST set of each distinct exercise in a
+/// session — the sets that best capture how the session finished.
+fn last_set_difficulties(conn: &Connection, session_id: i64) -> anyhow::Result<Vec<Difficulty>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.perceived_difficulty \
+         FROM sets s \
+         JOIN exercise_entry ee ON ee.id = s.exercise_entry_id \
+         WHERE ee.session_id = ?1 \
+           AND s.id = (SELECT s2.id FROM sets s2 \
+                       JOIN exercise_entry ee2 ON ee2.id = s2.exercise_entry_id \
+                       WHERE ee2.session_id = ?1 AND s2.exercise_type_id = s.exercise_type_id \
+                       ORDER BY s2.logged_at DESC, s2.id DESC LIMIT 1)",
+    )?;
+    let rows = stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?;
+    rows.map(|r| r.map(|s| Difficulty::from_str_loose(&s)))
+        .collect::<Result<Vec<_>, _>>()
+        .context("Failed to read last-set difficulties")
+}
+
+/// Distil per-exercise final-set efforts into one session verdict: the upper
+/// median — for an even split, the harder of the middle pair — so a session that
+/// finished heavy reads as heavy without a single failure set dominating.
+fn distil_overall_effort(last_sets: &[Difficulty]) -> Option<Difficulty> {
+    let mut ranked = last_sets.to_vec();
+    ranked.sort_by_key(|d| d.rank());
+    ranked.get(ranked.len() / 2).copied()
+}
 
 impl Database {
     pub fn start_session(&self, user_id: i64, notes: Option<&str>) -> anyhow::Result<Session> {
@@ -22,7 +63,9 @@ impl Database {
 
     /// End a session and cascade-close every still-open exercise_entry that
     /// belongs to it. Both writes use the same `datetime('now')` value so the
-    /// session and its entries share a precise end timestamp.
+    /// session and its entries share a precise end timestamp. Also proposes the
+    /// session-level `overall_effort` by distilling the last set of each
+    /// exercise; the user confirms or overrides it via [`Self::set_session_outcome`].
     pub fn end_session(&self, session_id: i64) -> anyhow::Result<()> {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
@@ -34,8 +77,49 @@ impl Database {
              WHERE session_id = ?1 AND end_timestamp IS NULL",
             params![session_id],
         )?;
+        // COALESCE keeps any effort the user already voiced mid-session.
+        if let Some(effort) = distil_overall_effort(&last_set_difficulties(&tx, session_id)?) {
+            tx.execute(
+                "UPDATE sessions SET overall_effort = COALESCE(overall_effort, ?2) WHERE id = ?1",
+                params![session_id, effort.as_str()],
+            )?;
+        }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Apply the user's confirm/override of the session outcome. Only the fields
+    /// provided change (`None` keeps what the end-of-session proposal wrote), so a
+    /// partial override like "actually that was easy" leaves the rest intact.
+    pub fn set_session_outcome(
+        &self,
+        session_id: i64,
+        overall_effort: Option<Difficulty>,
+        felt: Option<SessionFeel>,
+        cut_short: Option<bool>,
+        cut_short_reason: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let rows = self.conn().execute(
+            "UPDATE sessions SET \
+                 overall_effort = COALESCE(?2, overall_effort), \
+                 felt = COALESCE(?3, felt), \
+                 cut_short = COALESCE(?4, cut_short), \
+                 cut_short_reason = COALESCE(?5, cut_short_reason) \
+             WHERE id = ?1",
+            params![session_id, overall_effort.map(|d| d.as_str()), felt.map(|f| f.as_str()), cut_short, cut_short_reason],
+        )?;
+        anyhow::ensure!(rows > 0, "session id {session_id} not found");
+        Ok(())
+    }
+
+    /// The user's most recent session by start time, ended or not. The outcome
+    /// confirm/override lands here: right after end_session there is no active
+    /// session, but the verdict still belongs to the one that just closed.
+    pub fn latest_session_for_user(&self, user_id: i64) -> anyhow::Result<Option<Session>> {
+        let sql = format!("{SELECT_SESSION} WHERE user_id = ?1 ORDER BY started_at DESC, id DESC LIMIT 1");
+        let mut stmt = self.conn().prepare(&sql)?;
+        let mut rows = stmt.query_map(params![user_id], row_to_session)?;
+        rows.next().transpose().context("Failed to read latest session")
     }
 
     pub fn get_session(&self, id: i64) -> anyhow::Result<Option<Session>> {
@@ -67,7 +151,7 @@ impl Database {
 
     pub fn list_session_summaries(&self, user_id: i64, from: Option<&str>, to: Option<&str>) -> anyhow::Result<Vec<SessionSummary>> {
         let mut stmt = self.conn().prepare(
-            "SELECT s.id, s.user_id, s.started_at, s.ended_at, s.notes, \
+            "SELECT s.id, s.user_id, s.started_at, s.ended_at, s.notes, s.overall_effort, s.felt, s.cut_short, s.cut_short_reason, \
                     COUNT(DISTINCT ee.id) AS exercise_count, \
                     CASE WHEN s.ended_at IS NULL THEN NULL \
                          ELSE CAST((julianday(s.ended_at) - julianday(s.started_at)) * 24 * 60 AS INTEGER) \
@@ -81,9 +165,8 @@ impl Database {
              ORDER BY s.started_at DESC",
         )?;
         let rows = stmt.query_map(params![user_id, from, to], |row| {
-            let session =
-                Session { id: row.get(0)?, user_id: row.get(1)?, started_at: row.get(2)?, ended_at: row.get(3)?, notes: row.get(4)? };
-            Ok(SessionSummary { session, exercise_count: row.get(5)?, duration_mins: row.get(6)? })
+            let session = row_to_session(row)?;
+            Ok(SessionSummary { session, exercise_count: row.get(9)?, duration_mins: row.get(10)? })
         })?;
         rows.collect::<Result<Vec<_>, _>>().context("Failed to list session summaries")
     }

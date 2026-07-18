@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use crate::db::{Difficulty, GoalDirection, GoalKind, HealthEntryType};
+use crate::db::{Difficulty, GoalDirection, GoalKind, HealthEntryType, SessionFeel};
 
 #[derive(Debug, Deserialize)]
 pub struct AssistantResponse {
@@ -171,6 +171,21 @@ pub enum AssistantAction {
     SetSessionOverride {
         #[serde(alias = "content", alias = "override")]
         note: String,
+    },
+    /// The user's confirm/override of the session-level verdict the host proposed
+    /// at end_session (or a spontaneous mid-session "cutting it short because …").
+    /// Every field is optional: a bare agreement carries none and leaves the
+    /// proposed `overall_effort` standing; overrides carry only what the user said.
+    /// The host applies it to the most recent session (active or just ended).
+    RecordSessionOutcome {
+        #[serde(default, alias = "effort")]
+        overall_effort: Option<Difficulty>,
+        #[serde(default, alias = "feel")]
+        felt: Option<SessionFeel>,
+        #[serde(default)]
+        cut_short: Option<bool>,
+        #[serde(default, alias = "reason")]
+        cut_short_reason: Option<String>,
     },
     #[serde(other)]
     Unknown,
@@ -483,6 +498,51 @@ mod tests {
                 assert_eq!(exercises[0].notes.as_deref(), Some("brace hard"));
             }
             _ => panic!("expected ProposeWorkout"),
+        }
+    }
+
+    #[test]
+    fn parse_record_session_outcome_full() {
+        let json = r#"{"type": "record_session_outcome", "overall_effort": "hard", "felt": "good",
+                       "cut_short": true, "cut_short_reason": "knee pain"}"#;
+        let action: AssistantAction = serde_json::from_str(json).unwrap();
+        match action {
+            AssistantAction::RecordSessionOutcome { overall_effort, felt, cut_short, cut_short_reason } => {
+                assert_eq!(overall_effort, Some(Difficulty::Hard));
+                assert_eq!(felt, Some(SessionFeel::Good));
+                assert_eq!(cut_short, Some(true));
+                assert_eq!(cut_short_reason.as_deref(), Some("knee pain"));
+            }
+            _ => panic!("expected RecordSessionOutcome"),
+        }
+    }
+
+    #[test]
+    fn parse_record_session_outcome_bare_agreement() {
+        let json = r#"{"type": "record_session_outcome"}"#;
+        let action: AssistantAction = serde_json::from_str(json).unwrap();
+        match action {
+            AssistantAction::RecordSessionOutcome { overall_effort, felt, cut_short, cut_short_reason } => {
+                assert_eq!(overall_effort, None);
+                assert_eq!(felt, None);
+                assert_eq!(cut_short, None);
+                assert_eq!(cut_short_reason, None);
+            }
+            _ => panic!("expected RecordSessionOutcome"),
+        }
+    }
+
+    #[test]
+    fn parse_record_session_outcome_aliases() {
+        let json = r#"{"type": "record_session_outcome", "effort": "easy", "feel": "rough", "reason": "out of time"}"#;
+        let action: AssistantAction = serde_json::from_str(json).unwrap();
+        match action {
+            AssistantAction::RecordSessionOutcome { overall_effort, felt, cut_short_reason, .. } => {
+                assert_eq!(overall_effort, Some(Difficulty::Easy));
+                assert_eq!(felt, Some(SessionFeel::Rough));
+                assert_eq!(cut_short_reason.as_deref(), Some("out of time"));
+            }
+            _ => panic!("expected RecordSessionOutcome"),
         }
     }
 

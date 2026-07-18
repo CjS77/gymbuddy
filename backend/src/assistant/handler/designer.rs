@@ -10,7 +10,7 @@ use chrono::NaiveDateTime;
 use crate::assistant::actions::{AssistantAction, ProposedExercise};
 use crate::assistant::matching::find_exercise_type;
 use crate::assistant::parser::parse_assistant_response;
-use crate::assistant::prompts::{build_designer_prompt, format_muscle_recovery};
+use crate::assistant::prompts::{build_designer_prompt, format_muscle_recovery, format_session_outcome};
 use crate::config::DesignerHistoryConfig;
 use crate::db::{
     Database, EntryWithSets, ExerciseSet, GoalProgress, MeasurementType, Session, SessionWithSets, User, WorkoutPhilosophy,
@@ -173,7 +173,8 @@ fn top_set(sets: &[ExerciseSet]) -> Option<&ExerciseSet> {
 /// One session rendered in full: every exercise with all its sets, exactly as the
 /// designer read history before summarisation was introduced.
 fn format_full_session(session: &Session, entries: &[EntryWithSets], name_of: &impl Fn(i64) -> String) -> String {
-    let mut out = format!("- Session {}:\n", session.started_at);
+    let outcome = format_session_outcome(session).map(|p| format!(" ({p})")).unwrap_or_default();
+    let mut out = format!("- Session {}{outcome}:\n", session.started_at);
     for (_entry, sets) in entries {
         let Some(first) = sets.first() else { continue };
         let name = name_of(first.exercise_type_id);

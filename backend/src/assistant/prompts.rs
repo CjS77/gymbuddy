@@ -176,6 +176,17 @@ was my last bench press?\", \"when did I last squat?\"). Do NOT invent numbers \
 from RECENT HISTORY — emit the action and let the host fetch the authoritative \
 entry. If the user gave a parent or muscle-group word the host falls back to the \
 nearest descendant that has been logged.\n\
+- {{\"type\": \"record_session_outcome\", \"overall_effort\": \"easy|medium|hard|failure\", \
+\"felt\": \"great|good|ok|rough\", \"cut_short\": <bool>, \"cut_short_reason\": \"<optional>\"}}\n\
+  Records the verdict on a WHOLE session; every field is optional. After end_session \
+the host proposes an overall effort (read from the final set of each exercise) and \
+asks the user to confirm or correct it. When the user simply agrees (\"yes\", \"sounds \
+right\"), emit the action with NO overall_effort — the proposal stands. When they \
+override (\"no, that was easy\") or add detail (\"felt great\", \"had to bail, knee \
+pain\"), emit ONLY the fields they stated; a stop-early reason means \"cut_short\": \
+true with the reason in cut_short_reason. Also emit it mid-session when the user says \
+they are cutting the workout short or sums up how the whole session is going. Never \
+invent values the user did not express.\n\
 \n\
 EXERCISE TAXONOMY: Exercises are organised in a 4-level tree: muscle_group → \
 specific_muscle → exercise → variation. Users can log against any level.\n\
@@ -259,6 +270,10 @@ ONLY the log_exercise action(s) parsed from <EXERCISE TEXT> — no session chang
 The correct response is:\n\
   {{\"message\": \"<one short acknowledgement>\", \"actions\": [{{\"type\": \
 \"end_session\"}}]}}\n\
+- SESSION VERDICT: after you emit end_session the host appends its own question \
+proposing an overall-effort verdict for the session. When the user's NEXT message \
+answers it — agreement or correction, possibly with how it felt or a cut-short \
+reason — emit record_session_outcome carrying only what they said.\n\
 - Auto-start a session (start_session action) before logging if no session is active\n\
 - When the user asks about their most recent performance of an exercise (e.g. \
 \"what was my last bench press?\", \"when did I last squat?\", \"how heavy did I \
@@ -300,8 +315,9 @@ COLLECTING DATA BEFORE LOGGING:\n\
 This rule applies ONLY to data-collection actions (log_exercise, log_exercise_timed, \
 log_exercise_distance, log_health, set_goal). Navigation actions (start_session, \
 end_session, close_exercise_entry, confirm_close_exercise_entry, \
-close_all_open_entries, delete_exercise_entry, edit_set, get_last_exercise) MUST be \
-emitted as soon as the user's intent is clear, even with no other data.\n\
+close_all_open_entries, delete_exercise_entry, edit_set, get_last_exercise, \
+record_session_outcome) MUST be emitted as soon as the user's intent is clear, even \
+with no other data.\n\
 \n\
 Do NOT emit any log_exercise action until you have ALL required data. Respond with \
 \"actions\": [] while gathering info. Collect data across multiple messages using \
@@ -777,6 +793,24 @@ pub fn format_health_entries(entries: &[HealthEntry]) -> String {
     result
 }
 
+/// The session-level verdict as one compact phrase, e.g.
+/// "overall hard, felt good, cut short (knee pain)". `None` when no outcome has
+/// been recorded, so callers can omit the clause entirely.
+pub fn format_session_outcome(session: &Session) -> Option<String> {
+    let cut_short = session.cut_short.then(|| match session.cut_short_reason.as_deref() {
+        Some(reason) => format!("cut short ({reason})"),
+        None => "cut short".to_string(),
+    });
+    let parts: Vec<String> = session
+        .overall_effort
+        .map(|e| format!("overall {e}"))
+        .into_iter()
+        .chain(session.felt.map(|f| format!("felt {f}")))
+        .chain(cut_short)
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
 pub fn format_recent_history(summaries: &[SessionSummary], sets: &[ExerciseSet], catalogue: &[ExerciseTypeWithAncestry]) -> String {
     if summaries.is_empty() && sets.is_empty() {
         return "RECENT HISTORY: No recent workouts\n".to_string();
@@ -787,7 +821,8 @@ pub fn format_recent_history(summaries: &[SessionSummary], sets: &[ExerciseSet],
     for summary in summaries {
         let duration = summary.duration_mins.map(|d| format!(" ({d} min)")).unwrap_or_default();
         let status = if summary.session.ended_at.is_some() { "completed" } else { "active" };
-        result.push_str(&format!("- {} [{status}]: {} entries{duration}\n", summary.session.started_at, summary.exercise_count));
+        let outcome = format_session_outcome(&summary.session).map(|p| format!(" — {p}")).unwrap_or_default();
+        result.push_str(&format!("- {} [{status}]: {} entries{duration}{outcome}\n", summary.session.started_at, summary.exercise_count));
     }
 
     if !sets.is_empty() {
@@ -891,8 +926,17 @@ mod tests {
     #[test]
     fn prompt_includes_active_session_with_entries() {
         let mut ctx = base_context();
-        ctx.active_session =
-            Some(Session { id: 1, user_id: 1, started_at: "2026-03-23 09:00:00".to_string(), ended_at: None, notes: None });
+        ctx.active_session = Some(Session {
+            id: 1,
+            user_id: 1,
+            started_at: "2026-03-23 09:00:00".to_string(),
+            ended_at: None,
+            notes: None,
+            overall_effort: None,
+            felt: None,
+            cut_short: false,
+            cut_short_reason: None,
+        });
         ctx.session_entries = vec![EntryView {
             id: 7,
             exercise_name: "Bench Press".to_string(),
