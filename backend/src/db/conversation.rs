@@ -65,14 +65,18 @@ impl Database {
         Ok(updated)
     }
 
-    pub fn prune_old_messages(&self, user_id: i64, keep_last: usize) -> anyhow::Result<usize> {
+    /// Trim this user's history on a single platform down to its most recent
+    /// `keep_last` rows. Scoped to `(user, platform)` to mirror the read path
+    /// ([`Self::get_recent_messages_for_platform`]): a chatty session on one
+    /// platform must not evict another platform's context.
+    pub fn prune_old_messages_for_platform(&self, user_id: i64, platform: &str, keep_last: usize) -> anyhow::Result<usize> {
         let deleted = self.conn().execute(
-            "DELETE FROM conversation_history WHERE user_id = ?1 AND id NOT IN \
-             (SELECT id FROM conversation_history WHERE user_id = ?1 ORDER BY timestamp DESC LIMIT ?2)",
-            params![user_id, keep_last as i64],
+            "DELETE FROM conversation_history WHERE user_id = ?1 AND platform = ?2 AND id NOT IN \
+             (SELECT id FROM conversation_history WHERE user_id = ?1 AND platform = ?2 ORDER BY timestamp DESC LIMIT ?3)",
+            params![user_id, platform, keep_last as i64],
         )?;
         if deleted > 0 {
-            tracing::debug!(user_id, deleted, "DB: pruned old messages");
+            tracing::debug!(user_id, %platform, deleted, "DB: pruned old messages");
         }
         Ok(deleted)
     }
@@ -115,7 +119,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_old_messages() {
+    fn prune_old_messages_for_platform() {
         let db = test_db();
         let user_id = db.insert_user(&new_user("Tester", None, "UTC")).unwrap();
 
@@ -123,11 +127,40 @@ mod tests {
             db.insert_message(&new_conversation_message(user_id, "telegram", ConversationRole::User, &format!("Message {i}"))).unwrap();
         }
 
-        let deleted = db.prune_old_messages(user_id, 3).unwrap();
+        let deleted = db.prune_old_messages_for_platform(user_id, "telegram", 3).unwrap();
         assert_eq!(deleted, 7);
 
         let remaining = db.get_recent_messages(user_id, 100).unwrap();
         assert_eq!(remaining.len(), 3);
+    }
+
+    #[test]
+    fn prune_is_scoped_per_platform() {
+        let db = test_db();
+        let user_id = db.insert_user(&new_user("Tester", None, "UTC")).unwrap();
+
+        // A quiet confide (TUI) session: two messages the user still expects to see.
+        db.insert_message(&new_conversation_message(user_id, "confide", ConversationRole::User, "tui first")).unwrap();
+        db.insert_message(&new_conversation_message(user_id, "confide", ConversationRole::Assistant, "tui second")).unwrap();
+
+        // A chatty Telegram session: far more than the pruning window.
+        (0..20).for_each(|i| {
+            db.insert_message(&new_conversation_message(user_id, "telegram", ConversationRole::User, &format!("tg {i}"))).unwrap();
+        });
+
+        // Prune telegram down to its 3 most recent, as the handler does after a turn.
+        let deleted = db.prune_old_messages_for_platform(user_id, "telegram", 3).unwrap();
+        assert_eq!(deleted, 17);
+
+        // Telegram is trimmed...
+        let tg = db.get_recent_messages_for_platform(user_id, "telegram", 100).unwrap();
+        assert_eq!(tg.len(), 3);
+
+        // ...but the confide history is untouched — the chatty platform did not evict it.
+        let tui = db.get_recent_messages_for_platform(user_id, "confide", 100).unwrap();
+        assert_eq!(tui.len(), 2);
+        assert_eq!(tui[0].content, "tui first");
+        assert_eq!(tui[1].content, "tui second");
     }
 
     #[test]
