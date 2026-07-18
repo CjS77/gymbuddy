@@ -1155,4 +1155,54 @@ mod tests {
         let prompt = designer_prompt(&[]);
         assert!(prompt.contains("MUST name which SELECTION PRIORITY items drove today's"));
     }
+
+    #[test]
+    fn prompt_describes_record_session_outcome_action() {
+        let ctx = base_context();
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("record_session_outcome"), "prompt must advertise the record_session_outcome action");
+        assert!(prompt.contains("great|good|ok|rough"), "prompt must spell out the feel vocabulary");
+    }
+
+    #[test]
+    fn format_session_outcome_joins_recorded_parts() {
+        let mut session = Session {
+            id: 1,
+            user_id: 1,
+            started_at: "2026-03-20 09:00:00".to_string(),
+            ended_at: Some("2026-03-20 10:00:00".to_string()),
+            notes: None,
+            overall_effort: Some(crate::db::Difficulty::Hard),
+            felt: Some(crate::db::SessionFeel::Good),
+            cut_short: true,
+            cut_short_reason: Some("knee pain".to_string()),
+        };
+        assert_eq!(format_session_outcome(&session).as_deref(), Some("overall hard, felt good, cut short (knee pain)"));
+
+        session.felt = None;
+        session.cut_short_reason = None;
+        assert_eq!(format_session_outcome(&session).as_deref(), Some("overall hard, cut short"));
+
+        session.overall_effort = None;
+        session.cut_short = false;
+        assert_eq!(format_session_outcome(&session), None, "no outcome recorded → no phrase");
+    }
+
+    #[test]
+    fn recent_history_includes_session_outcome() {
+        let session = Session {
+            id: 1,
+            user_id: 1,
+            started_at: "2026-03-20 09:00:00".to_string(),
+            ended_at: Some("2026-03-20 10:00:00".to_string()),
+            notes: None,
+            overall_effort: Some(crate::db::Difficulty::Hard),
+            felt: Some(crate::db::SessionFeel::Good),
+            cut_short: false,
+            cut_short_reason: None,
+        };
+        let summary = SessionSummary { session, exercise_count: 3, duration_mins: Some(60) };
+        let text = format_recent_history(&[summary], &[], &[]);
+        assert!(text.contains("- 2026-03-20 09:00:00 [completed]: 3 entries (60 min) — overall hard, felt good"), "{text}");
+    }
 }

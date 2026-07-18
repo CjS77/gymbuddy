@@ -1057,6 +1057,103 @@ mod tests {
         assert_eq!(ids, vec![id_a, id_b]);
     }
 
+    // ── Session outcome ────────────────────────────────────────────────────────
+
+    /// Insert a weight_reps set with the given difficulty into `entry_id`.
+    fn seed_difficulty_set(db: &Database, entry_id: i64, exercise_type_id: i64, difficulty: Difficulty) {
+        let mut s = new_exercise_set(entry_id, exercise_type_id, MeasurementType::WeightReps, 60.0);
+        s.count = Some(8);
+        s.perceived_difficulty = difficulty;
+        db.insert_set(&s).unwrap();
+    }
+
+    #[test]
+    fn distil_overall_effort_takes_upper_median() {
+        use Difficulty::*;
+        assert_eq!(distil_overall_effort(&[]), None);
+        assert_eq!(distil_overall_effort(&[Easy]), Some(Easy));
+        // Even count: the harder of the middle pair wins.
+        assert_eq!(distil_overall_effort(&[Easy, Hard]), Some(Hard));
+        assert_eq!(distil_overall_effort(&[Easy, Medium, Failure]), Some(Medium));
+        // One failure set does not dominate a mostly-medium session.
+        assert_eq!(distil_overall_effort(&[Medium, Medium, Medium, Failure]), Some(Medium));
+    }
+
+    #[test]
+    fn end_session_proposes_effort_from_last_set_of_each_exercise() {
+        let (db, user_id, bp_id) = fixture();
+        let squat_id = db.get_exercise_type_by_name("Squat").unwrap().unwrap().id;
+        let session = db.start_session(user_id, None).unwrap();
+
+        // Bench spans two entries; only its overall last set (hard) counts.
+        let bench_1 = db.insert_entry(&new_exercise_entry(user_id, Some(session.id), None)).unwrap();
+        seed_difficulty_set(&db, bench_1, bp_id, Difficulty::Easy);
+        seed_difficulty_set(&db, bench_1, bp_id, Difficulty::Easy);
+        let squat_entry = db.insert_entry(&new_exercise_entry(user_id, Some(session.id), None)).unwrap();
+        seed_difficulty_set(&db, squat_entry, squat_id, Difficulty::Medium);
+        let bench_2 = db.insert_entry(&new_exercise_entry(user_id, Some(session.id), None)).unwrap();
+        seed_difficulty_set(&db, bench_2, bp_id, Difficulty::Hard);
+
+        db.end_session(session.id).unwrap();
+
+        // Last sets: bench hard + squat medium → upper median = hard.
+        let session = db.get_session(session.id).unwrap().unwrap();
+        assert_eq!(session.overall_effort, Some(Difficulty::Hard));
+        assert_eq!(session.felt, None);
+        assert!(!session.cut_short);
+        assert_eq!(session.cut_short_reason, None);
+    }
+
+    #[test]
+    fn end_session_without_sets_proposes_no_effort() {
+        let (db, user_id, _) = fixture();
+        let session = db.start_session(user_id, None).unwrap();
+        db.end_session(session.id).unwrap();
+        assert_eq!(db.get_session(session.id).unwrap().unwrap().overall_effort, None);
+    }
+
+    #[test]
+    fn set_session_outcome_partial_override_keeps_other_fields() {
+        let (db, user_id, bp_id) = fixture();
+        let session = db.start_session(user_id, None).unwrap();
+        let entry = db.insert_entry(&new_exercise_entry(user_id, Some(session.id), None)).unwrap();
+        seed_difficulty_set(&db, entry, bp_id, Difficulty::Hard);
+        db.end_session(session.id).unwrap();
+
+        // Only `felt` provided: the proposed effort must survive.
+        db.set_session_outcome(session.id, None, Some(SessionFeel::Good), None, None).unwrap();
+        let s = db.get_session(session.id).unwrap().unwrap();
+        assert_eq!(s.overall_effort, Some(Difficulty::Hard));
+        assert_eq!(s.felt, Some(SessionFeel::Good));
+
+        // Effort override + cut-short: `felt` in turn stays put.
+        db.set_session_outcome(session.id, Some(Difficulty::Easy), None, Some(true), Some("knee pain")).unwrap();
+        let s = db.get_session(session.id).unwrap().unwrap();
+        assert_eq!(s.overall_effort, Some(Difficulty::Easy));
+        assert_eq!(s.felt, Some(SessionFeel::Good));
+        assert!(s.cut_short);
+        assert_eq!(s.cut_short_reason.as_deref(), Some("knee pain"));
+    }
+
+    #[test]
+    fn session_outcome_check_rejects_unknown_effort() {
+        let (db, user_id, _) = fixture();
+        let session = db.start_session(user_id, None).unwrap();
+        let result = db.conn().execute("UPDATE sessions SET overall_effort = 'brutal' WHERE id = ?1", params![session.id]);
+        assert!(result.is_err(), "CHECK constraint must reject values outside the difficulty enum");
+    }
+
+    #[test]
+    fn latest_session_for_user_returns_most_recent() {
+        let (db, user_id, _) = fixture();
+        let s1 = db.start_session(user_id, None).unwrap();
+        db.end_session(s1.id).unwrap();
+        let s2 = db.start_session(user_id, None).unwrap();
+        db.end_session(s2.id).unwrap();
+        // Same-second starts fall back to the id tiebreak.
+        assert_eq!(db.latest_session_for_user(user_id).unwrap().unwrap().id, s2.id);
+    }
+
     // ── Set editing ────────────────────────────────────────────────────────────
 
     fn catalogue(db: &Database) -> Vec<ExerciseTypeWithAncestry> {

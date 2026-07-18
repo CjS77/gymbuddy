@@ -686,6 +686,8 @@ fn superset_prompt(ongoing_exercise: &str, logged_exercise: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use super::super::test_support::*;
     use crate::render::Telegram;
@@ -1019,6 +1021,92 @@ mod tests {
         // No open entries either.
         let leftover = db.list_open_entries_for_user(user.id).unwrap();
         assert!(leftover.is_empty(), "end_session must cascade-close every open entry");
+    }
+
+    /// Register, log one hard bench set, and end the session — the shared setup
+    /// for the session-verdict tests below. Returns the handler and mock LLM.
+    async fn setup_ended_session_with_hard_bench() -> (AssistantHandler, Arc<MockLlm>) {
+        let log = r#"{"message": "Logged.", "actions": [
+            {"type": "log_exercise", "exercise": "Bench Press", "reps": 8, "weight_kg": 80.0, "perceived_difficulty": "hard"}
+        ]}"#;
+        let (handler, llm) = setup_handler(log).await;
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
+        let _ = handler.handle_text_message(&msg, "bench 80kg 8 reps, hard").await.unwrap();
+        llm.set_response(r#"{"message": "Ending.", "actions": [{"type": "end_session"}]}"#);
+        (handler, llm)
+    }
+
+    #[tokio::test]
+    async fn end_session_proposes_session_verdict_from_final_sets() {
+        let (handler, _llm) = setup_ended_session_with_hard_bench().await;
+        let msg = make_message(12345, "hello");
+        let reply = handler.handle_text_message(&msg, "done").await.unwrap();
+        assert!(
+            shown(&reply).contains("I'd call that session hard overall"),
+            "verdict question must ride the reply: {}",
+            shown(&reply)
+        );
+
+        let db = handler.db.lock().await;
+        let user = db.get_user_by_telegram_id("12345").unwrap().unwrap();
+        let session = db.latest_session_for_user(user.id).unwrap().unwrap();
+        assert_eq!(session.overall_effort, Some(Difficulty::Hard), "proposal must be persisted at session end");
+        assert_eq!(session.felt, None);
+        assert!(!session.cut_short);
+    }
+
+    #[tokio::test]
+    async fn end_session_without_sets_skips_verdict_question() {
+        let (handler, llm) = setup_handler(r#"{"message": "Started.", "actions": [{"type": "start_session"}]}"#).await;
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
+        let _ = handler.handle_text_message(&msg, "starting my workout").await.unwrap();
+
+        llm.set_response(r#"{"message": "Ending.", "actions": [{"type": "end_session"}]}"#);
+        let reply = handler.handle_text_message(&msg, "done").await.unwrap();
+        assert!(!shown(&reply).contains("overall"), "no sets → nothing to propose: {}", shown(&reply));
+    }
+
+    #[tokio::test]
+    async fn record_session_outcome_bare_agreement_keeps_proposal() {
+        let (handler, llm) = setup_ended_session_with_hard_bench().await;
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "done").await.unwrap();
+
+        llm.set_response(r#"{"message": "Noted!", "actions": [{"type": "record_session_outcome"}]}"#);
+        let reply = handler.handle_text_message(&msg, "yes, sounds right").await.unwrap();
+        assert!(shown(&reply).contains("Session verdict saved: overall hard."), "got: {}", shown(&reply));
+
+        let db = handler.db.lock().await;
+        let user = db.get_user_by_telegram_id("12345").unwrap().unwrap();
+        let session = db.latest_session_for_user(user.id).unwrap().unwrap();
+        assert_eq!(session.overall_effort, Some(Difficulty::Hard));
+        assert_eq!(session.felt, None);
+    }
+
+    #[tokio::test]
+    async fn record_session_outcome_overrides_and_flags_cut_short() {
+        let (handler, llm) = setup_ended_session_with_hard_bench().await;
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "done").await.unwrap();
+
+        llm.set_response(
+            r#"{"message": "Got it.", "actions": [
+                {"type": "record_session_outcome", "overall_effort": "easy", "felt": "rough",
+                 "cut_short": true, "cut_short_reason": "knee pain"}
+            ]}"#,
+        );
+        let reply = handler.handle_text_message(&msg, "no, that was easy but felt rough — stopped early, knee pain").await.unwrap();
+        assert!(shown(&reply).contains("Session verdict saved: overall easy, felt rough, cut short (knee pain)."), "got: {}", shown(&reply));
+
+        let db = handler.db.lock().await;
+        let user = db.get_user_by_telegram_id("12345").unwrap().unwrap();
+        let session = db.latest_session_for_user(user.id).unwrap().unwrap();
+        assert_eq!(session.overall_effort, Some(Difficulty::Easy));
+        assert_eq!(session.felt, Some(crate::db::SessionFeel::Rough));
+        assert!(session.cut_short);
+        assert_eq!(session.cut_short_reason.as_deref(), Some("knee pain"));
     }
 
     #[tokio::test]
