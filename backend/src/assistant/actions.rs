@@ -93,6 +93,17 @@ pub enum AssistantAction {
     ResolveHealth {
         description: String,
     },
+    /// Record ONE body measurement (bodyweight, body fat, waist, resting HR) so a
+    /// free-text weigh-in logs without a command, the way health entries do via
+    /// [`Self::LogHealth`]. `metric` is the canonical unit-suffixed name
+    /// ("bodyweight_kg", "body_fat_pct", "waist_cm", "resting_hr_bpm" — the same
+    /// names `set_goal` metrics use); `value` is in the unit the name carries,
+    /// already converted to metric.
+    LogBodyMetric {
+        #[serde(alias = "name")]
+        metric: String,
+        value: f64,
+    },
     /// Set a goal. Exercise goals name an `exercise` (bigger-is-better strength /
     /// endurance targets); non-exercise goals (weightloss, "train 4x a week") name a
     /// `metric` instead. `direction` inverts progress for goals where smaller is
@@ -338,6 +349,32 @@ mod tests {
         let json = r#"{"type": "resolve_health", "description": "shoulder"}"#;
         let action: AssistantAction = serde_json::from_str(json).unwrap();
         assert!(matches!(action, AssistantAction::ResolveHealth { .. }));
+    }
+
+    #[test]
+    fn parse_log_body_metric() {
+        let json = r#"{"type": "log_body_metric", "metric": "bodyweight_kg", "value": 82.5}"#;
+        let action: AssistantAction = serde_json::from_str(json).unwrap();
+        match action {
+            AssistantAction::LogBodyMetric { metric, value } => {
+                assert_eq!(metric, "bodyweight_kg");
+                assert_eq!(value, 82.5);
+            }
+            _ => panic!("expected LogBodyMetric"),
+        }
+    }
+
+    #[test]
+    fn parse_log_body_metric_name_alias() {
+        let json = r#"{"type": "log_body_metric", "name": "body_fat_pct", "value": 18.0}"#;
+        let action: AssistantAction = serde_json::from_str(json).unwrap();
+        match action {
+            AssistantAction::LogBodyMetric { metric, value } => {
+                assert_eq!(metric, "body_fat_pct");
+                assert_eq!(value, 18.0);
+            }
+            _ => panic!("expected LogBodyMetric"),
+        }
     }
 
     #[test]

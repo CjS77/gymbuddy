@@ -10,7 +10,7 @@ use crate::assistant::matching::find_exercise_type;
 use crate::assistant::prompts::format_session_outcome;
 use crate::db::{
     Database, Difficulty, ExerciseEntry, ExerciseTypeWithAncestry, GoalDirection, GoalKind, MeasurementType, Session, SetEdit,
-    SetEditError, User, new_exercise_entry_at, new_exercise_set, new_goal, new_health_entry,
+    SetEditError, User, new_body_metric, new_exercise_entry_at, new_exercise_set, new_goal, new_health_entry,
 };
 
 use super::designer::proposed_plan_within_window;
@@ -236,6 +236,13 @@ impl AssistantHandler {
                 }
                 tracing::debug!(entry_type = ?entry_type, body_part = ?body_part, severity = ?severity, "Inserting health entry");
                 self.db.lock().await.insert_health_entry(&entry)?;
+                Ok(ActionOutcome::none())
+            }
+            AssistantAction::LogBodyMetric { metric, value } => {
+                // insert_body_metric canonicalises the metric name ("Body Weight" ->
+                // bodyweight_kg) so free-text weigh-ins join the same series goals read.
+                tracing::debug!(metric = %metric, value = %value, "Inserting body metric");
+                self.db.lock().await.insert_body_metric(&new_body_metric(user.id, metric, *value))?;
                 Ok(ActionOutcome::none())
             }
             AssistantAction::ResolveHealth { description } => {
@@ -717,6 +724,27 @@ mod tests {
         assert_eq!(sets.len(), 3);
         assert!(sets.iter().all(|s| s.count == Some(8) && (s.value - 80.0).abs() < 1e-6));
         assert!(entries[0].end_timestamp.is_none(), "entry should still be open");
+    }
+
+    #[tokio::test]
+    async fn body_metric_logging_creates_row() {
+        // A free-text weigh-in logs without a command; the loosely-named metric
+        // lands in the canonical series a weightloss goal reads.
+        let response = r#"{"message": "82.5kg noted.", "actions": [
+            {"type": "log_body_metric", "metric": "body weight", "value": 82.5}
+        ]}"#;
+        let (handler, _) = setup_handler(response).await;
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
+        let reply = handler.handle_text_message(&msg, "I weighed 82.5 this morning").await.unwrap();
+        assert!(shown(&reply).starts_with("82.5kg noted."));
+
+        let db = handler.db.lock().await;
+        let user = db.get_user_by_telegram_id("12345").unwrap().unwrap();
+        let latest = db.latest_body_metric(user.id, "bodyweight_kg").unwrap().unwrap();
+        assert_eq!(latest.value, 82.5);
+        assert_eq!(latest.metric, "bodyweight_kg");
+        assert!(db.get_active_session(user.id).unwrap().is_none(), "a weigh-in must not auto-start a session");
     }
 
     /// Register a user and log a Flat Barbell Bench Press set, opening one entry.
