@@ -22,3 +22,5 @@ data/
 gymbuddy.toml
 *.key.claude
 .claude/
+.kanban/
+
