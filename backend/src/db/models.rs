@@ -936,6 +936,10 @@ pub struct WorkoutPlan {
     /// today, do flys instead"). Scoped to THIS plan: it never touches the
     /// philosophy and expires when the plan completes or is superseded.
     pub override_note: Option<String>,
+    /// The programme slot this plan filled, or `None` for an ad-hoc plan —
+    /// the first-class default; binding to a slot is a separate, optional step.
+    #[serde(default)]
+    pub program_slot_id: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1031,4 +1035,156 @@ pub struct PlanVsActual {
     pub skipped: Vec<SkippedExercise>,
     /// Performed but not prescribed, in the order first logged.
     pub unplanned: Vec<UnplannedExercise>,
+}
+
+// ── Programmes ─────────────────────────────────────────────────────────────────
+
+/// Lifecycle of a [`Program`]: `Draft` while it is being designed, `Active`
+/// once the user commits (at most one per user, enforced by
+/// [`Database::activate_program`](super::Database)), then `Completed` or
+/// `Abandoned`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramStatus {
+    Draft,
+    Active,
+    Completed,
+    Abandoned,
+}
+
+impl ProgramStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Active => "active",
+            Self::Completed => "completed",
+            Self::Abandoned => "abandoned",
+        }
+    }
+
+    pub fn from_str_loose(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "active" => Self::Active,
+            "completed" => Self::Completed,
+            "abandoned" => Self::Abandoned,
+            _ => Self::Draft,
+        }
+    }
+}
+
+impl fmt::Display for ProgramStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Lifecycle of a [`ProgramSlot`]: `Pending` until a designed plan binds to it
+/// (`Filled`), `Missed` when its week passes untouched, `Skipped` when
+/// deliberately dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotStatus {
+    Pending,
+    Filled,
+    Missed,
+    Skipped,
+}
+
+impl SlotStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Filled => "filled",
+            Self::Missed => "missed",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    pub fn from_str_loose(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "filled" => Self::Filled,
+            "missed" => Self::Missed,
+            "skipped" => Self::Skipped,
+            _ => Self::Pending,
+        }
+    }
+}
+
+impl fmt::Display for SlotStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A long-term training programme: a skeleton, not a script. It persists the
+/// goals served (via `program_goals`), dates, split and progression policy;
+/// each session keeps being designed on demand against it. `split` and
+/// `progression_policy` are free text the LLM reads — no query looks inside.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Program {
+    pub id: i64,
+    pub user_id: i64,
+    pub title: String,
+    pub start_date: String,
+    /// The date the programme aims to conclude by. NULL = open-ended.
+    pub target_end_date: Option<String>,
+    pub days_per_week: i32,
+    pub split: String,
+    pub progression_policy: String,
+    pub status: ProgramStatus,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A mesocycle block within a [`Program`]: an inclusive 1-based week range with
+/// an intent (weeks 1–4 "hypertrophy", 5–6 "deload"). The designer reads the
+/// block the current week falls in and progresses within it — this is what
+/// makes sessions build on one another rather than repeat.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramBlock {
+    pub id: i64,
+    pub program_id: i64,
+    pub start_week: i32,
+    pub end_week: i32,
+    pub focus: String,
+    pub notes: Option<String>,
+}
+
+/// One cell of a [`Program`]'s week/day grid. `week_idx` is 1-based from the
+/// programme start; `day_idx` is the 1-based ordinal training day within the
+/// week (not a calendar weekday).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramSlot {
+    pub id: i64,
+    pub program_id: i64,
+    pub week_idx: i32,
+    pub day_idx: i32,
+    pub focus: String,
+    pub status: SlotStatus,
+    pub updated_at: String,
+}
+
+pub fn new_program(user_id: i64, title: &str, days_per_week: i32, split: &str, progression_policy: &str) -> Program {
+    let now = now_str();
+    Program {
+        id: 0,
+        user_id,
+        title: title.to_string(),
+        start_date: now.clone(),
+        target_end_date: None,
+        days_per_week,
+        split: split.to_string(),
+        progression_policy: progression_policy.to_string(),
+        status: ProgramStatus::Draft,
+        created_at: now.clone(),
+        updated_at: now,
+    }
+}
+
+pub fn new_program_block(program_id: i64, start_week: i32, end_week: i32, focus: &str) -> ProgramBlock {
+    ProgramBlock { id: 0, program_id, start_week, end_week, focus: focus.to_string(), notes: None }
+}
+
+pub fn new_program_slot(program_id: i64, week_idx: i32, day_idx: i32, focus: &str) -> ProgramSlot {
+    ProgramSlot { id: 0, program_id, week_idx, day_idx, focus: focus.to_string(), status: SlotStatus::Pending, updated_at: now_str() }
 }

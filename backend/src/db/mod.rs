@@ -10,6 +10,7 @@ mod health;
 mod migrations;
 mod models;
 mod planner;
+mod programs;
 mod progress;
 mod schedules;
 mod users;

@@ -4,7 +4,7 @@ use rusqlite::params;
 use super::database::Database;
 use super::models::{Goal, GoalDirection, GoalKind};
 
-fn row_to_goal(row: &rusqlite::Row) -> rusqlite::Result<Goal> {
+pub(super) fn row_to_goal(row: &rusqlite::Row) -> rusqlite::Result<Goal> {
     Ok(Goal {
         id: row.get(0)?,
         user_id: row.get(1)?,
@@ -23,7 +23,7 @@ fn row_to_goal(row: &rusqlite::Row) -> rusqlite::Result<Goal> {
     })
 }
 
-const SELECT_GOAL: &str = "\
+pub(super) const SELECT_GOAL: &str = "\
     SELECT id, user_id, kind, exercise_type_id, metric, target_value, direction, priority, \
            start_date, target_date, achieved, notes, created_at, updated_at \
     FROM goals";

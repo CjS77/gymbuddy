@@ -46,7 +46,7 @@ fn row_to_interview_state(row: &rusqlite::Row) -> rusqlite::Result<InterviewStat
     })
 }
 
-fn row_to_plan(row: &rusqlite::Row) -> rusqlite::Result<WorkoutPlan> {
+pub(super) fn row_to_plan(row: &rusqlite::Row) -> rusqlite::Result<WorkoutPlan> {
     Ok(WorkoutPlan {
         id: row.get(0)?,
         user_id: row.get(1)?,
@@ -56,8 +56,9 @@ fn row_to_plan(row: &rusqlite::Row) -> rusqlite::Result<WorkoutPlan> {
         status: PlanStatus::from_str_loose(&row.get::<_, String>(5)?),
         session_id: row.get(6)?,
         override_note: row.get(7)?,
-        created_at: row.get(8)?,
-        updated_at: row.get(9)?,
+        program_slot_id: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
     })
 }
 
@@ -77,8 +78,8 @@ fn row_to_plan_exercise(row: &rusqlite::Row) -> rusqlite::Result<WorkoutPlanExer
 
 const SELECT_PHILOSOPHY: &str = "SELECT id, user_id, content, source, created_at FROM workout_philosophy";
 
-const SELECT_PLAN: &str = "\
-    SELECT id, user_id, title, rationale, philosophy_id, status, session_id, override_note, created_at, updated_at \
+pub(super) const SELECT_PLAN: &str = "\
+    SELECT id, user_id, title, rationale, philosophy_id, status, session_id, override_note, program_slot_id, created_at, updated_at \
     FROM workout_plans";
 
 const SELECT_PLAN_EXERCISE: &str = "\
