@@ -427,9 +427,13 @@ to save, keep `actions` empty and ask the next question.",
 
 /// System prompt for `/nextworkout`: design ONE tailored training session from the
 /// user's philosophy, recent history, goals, and injuries. It advertises ONLY the
-/// `propose_workout` action — the design is a proposal and logs nothing. `history`
-/// is a pre-formatted block (the caller has the catalogue to resolve names);
-/// `philosophy` is the distilled philosophy text or a short placeholder.
+/// `propose_workout` action — the design is a proposal and logs nothing. Exercise
+/// selection follows the spec's decreasing priority order (goal contribution, done
+/// before, longest-rested muscles, philosophy fit, health issues, temporary
+/// requests); lower rungs break ties rather than veto, except active health issues,
+/// which stay a hard constraint. `history` is a pre-formatted block (the caller has
+/// the catalogue to resolve names); `philosophy` is the distilled philosophy text
+/// or a short placeholder.
 pub fn build_designer_prompt(
     philosophy: &str,
     history: &str,
@@ -448,19 +452,25 @@ Draw on your own expertise PLUS the user-specific information below to produce a
 specific session that pushes the user toward their goals. You are only designing a plan — you do \
 NOT log any sets and do NOT start a session.\n\
 \n\
+SELECTION PRIORITY — rank candidate exercises by these criteria, in DECREASING priority:\n\
+1. Contribution to the user's ACTIVE GOALS.\n\
+2. Exercises the user has done before (they appear in RECENT HISTORY).\n\
+3. Muscle groups with the longest rest period (MUSCLE RECOVERY lists them longest-rested first; \
+treat a group shown as never trained, or not trained in a long time, as a strong candidate).\n\
+4. Fit with the TRAINING PHILOSOPHY: its goal, preferred programs/rotation, weekly frequency.\n\
+5. Working around ACTIVE HEALTH ISSUES.\n\
+6. Temporary, single-session requests in the user's message (\"something lighter today\").\n\
+This is a decreasing priority order, not a filter: a lower item never vetoes a higher one — it \
+only breaks ties between options the higher items rank equally. EXCEPTION: ACTIVE HEALTH ISSUES \
+are a HARD constraint, not a tie-breaker — never prescribe a movement that loads an injured area; \
+substitute away (e.g. swap heavy spinal-loading deadlifts/squats for a focused one-arm row when \
+the lower back is flaring).\n\
+\n\
 HOW TO DESIGN (reason like a real trainer):\n\
-- Follow the PHILOSOPHY: honour the goal, preferred programs/rotation, weekly frequency, and \
-especially the EQUIPMENT and its weight limits — never prescribe a weight the user cannot load, \
-or equipment they do not have.\n\
-- Use RECENT HISTORY to pick what to train today (rotate muscle groups, respect recovery, avoid \
-repeating yesterday's heavy work) and to set weights: if the last sets of an exercise were easy, \
-progress the load; if they were hard or to failure, hold or back off.\n\
-- Use MUSCLE RECOVERY as the rest signal: it lists every muscle group ordered longest-rested first. \
-Prefer groups that have rested longest, and treat one shown as never trained (or not trained in a \
-long time) as a strong candidate for today.\n\
-- Respect ACTIVE HEALTH ISSUES: substitute away from movements that load an injured area (e.g. \
-swap heavy spinal-loading deadlifts/squats for a focused one-arm row when the lower back is \
-flaring), and say why in the rationale.\n\
+- Honour the EQUIPMENT in the philosophy and its weight limits — never prescribe a weight the \
+user cannot load, or equipment they do not have.\n\
+- Use RECENT HISTORY to set weights: if the last sets of an exercise were easy, progress the \
+load; if they were hard or to failure, hold or back off. Avoid repeating yesterday's heavy work.\n\
 - Pick 3-6 exercises. For each, prescribe target sets and target reps (or seconds for timed work) \
 and a target weight within the user's equipment limits. Add a short per-exercise cue when useful.\n\
 \n\
@@ -477,7 +487,8 @@ RESPONSE FORMAT: You MUST respond with ONLY a JSON object. No text before or aft
 \n\
 You MUST emit EXACTLY ONE action, of type propose_workout:\n\
 - {{\"type\": \"propose_workout\", \"title\": \"<short session title>\", \
-\"rationale\": \"<2-4 sentences explaining today's choices and any substitutions>\", \
+\"rationale\": \"<2-4 sentences that MUST name which SELECTION PRIORITY items drove today's \
+picks (e.g. goal contribution, longest-rested muscles), plus any injury substitutions and why>\", \
 \"exercises\": [{{\"exercise\": \"<EXACT NAME>\", \"target_sets\": N, \"target_reps\": N, \
 \"target_weight_kg\": N.N, \"target_secs\": N, \"notes\": \"<short cue, optional>\"}}, ...]}}\n\
   Use `target_secs` instead of reps/weight for timed exercises. Omit fields that do not apply.\n\
@@ -1019,5 +1030,68 @@ mod tests {
         let ctx = base_context();
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("get_last_exercise"), "prompt must advertise the get_last_exercise action");
+    }
+
+    fn designer_prompt(health_entries: &[HealthEntry]) -> String {
+        build_designer_prompt(
+            "goal=hypertrophy. Home gym: dumbbells up to 24kg.",
+            "RECENT HISTORY: No recent workouts\n",
+            "MUSCLE RECOVERY: no muscle groups on record.\n",
+            &[],
+            health_entries,
+            &base_context().exercise_types,
+        )
+    }
+
+    #[test]
+    fn designer_prompt_lists_selection_priorities_in_decreasing_order() {
+        let prompt = designer_prompt(&[]);
+        let rungs = [
+            "1. Contribution to the user's ACTIVE GOALS",
+            "2. Exercises the user has done before",
+            "3. Muscle groups with the longest rest period",
+            "4. Fit with the TRAINING PHILOSOPHY",
+            "5. Working around ACTIVE HEALTH ISSUES",
+            "6. Temporary, single-session requests",
+        ];
+        let positions: Vec<usize> = rungs
+            .iter()
+            .map(|rung| prompt.find(rung).unwrap_or_else(|| panic!("prompt is missing priority rung: {rung}")))
+            .collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]), "priority rungs appear out of order:\n{prompt}");
+        assert!(prompt.contains("in DECREASING priority"));
+    }
+
+    #[test]
+    fn designer_prompt_priorities_break_ties_rather_than_filter() {
+        let prompt = designer_prompt(&[]);
+        assert!(prompt.contains("not a filter"));
+        assert!(prompt.contains("a lower item never vetoes a higher one"));
+        assert!(prompt.contains("breaks ties"));
+    }
+
+    #[test]
+    fn designer_prompt_keeps_injuries_a_hard_constraint() {
+        let entries = vec![HealthEntry {
+            id: 1,
+            user_id: 1,
+            entry_type: HealthEntryType::Injury,
+            body_part: Some("lower back".to_string()),
+            severity: "moderate".to_string(),
+            description: "Lower back flare-up".to_string(),
+            started_at: "2026-03-20".to_string(),
+            resolved_at: None,
+            notes: None,
+            updated_at: "2026-03-20".to_string(),
+        }];
+        let prompt = designer_prompt(&entries);
+        assert!(prompt.contains("ACTIVE HEALTH ISSUES are a HARD constraint, not a tie-breaker"));
+        assert!(prompt.contains("Lower back flare-up"), "health entries must be rendered via format_health_entries");
+    }
+
+    #[test]
+    fn designer_prompt_requires_rationale_to_cite_priorities() {
+        let prompt = designer_prompt(&[]);
+        assert!(prompt.contains("MUST name which SELECTION PRIORITY items drove today's"));
     }
 }
