@@ -63,20 +63,16 @@ fn has_table(conn: &Connection, name: &str) -> anyhow::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::migrations::MIGRATIONS;
-
-    fn v1_conn() -> Connection {
-        let mut conn = Connection::open_in_memory().unwrap();
-        MIGRATIONS.to_latest(&mut conn).unwrap();
-        conn
-    }
+    // The frozen v1 fixture, not the live migration set: Phase 1 turns the live set into schema v2,
+    // and this test must keep asserting what a *v1* database looks like after that happens.
+    use crate::dump::fixtures::{V1_USER_VERSION, empty_v1_db};
 
     #[test]
     fn detects_v1_database() {
-        let (generation, source) = probe(&v1_conn()).unwrap();
+        let (generation, source) = probe(&empty_v1_db()).unwrap();
         assert_eq!(generation, Generation::V1);
         assert_eq!(source.generation, 1);
-        assert_eq!(source.user_version, 13, "v1 ends at migration 13");
+        assert_eq!(source.user_version, V1_USER_VERSION, "v1 ends at migration 13");
     }
 
     #[test]

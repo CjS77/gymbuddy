@@ -1,0 +1,931 @@
+{
+  "format": "gymbuddy.dump",
+  "dump_version": 1,
+  "source_schema": {
+    "generation": 1,
+    "user_version": 13
+  },
+  "exported_at": "<exported_at>",
+  "groups": [
+    {
+      "name": "beta",
+      "description": "Beta testers",
+      "created_at": "2026-01-01 08:00:00"
+    },
+    {
+      "name": "coaches",
+      "description": null,
+      "created_at": "2026-01-01 08:05:00"
+    }
+  ],
+  "users": [
+    {
+      "id": 1,
+      "name": "Alice",
+      "telegram_id": "tg-alice",
+      "pubkey": "pk-alice",
+      "timezone": "Europe/Lisbon",
+      "beta_tester": true,
+      "timers_enabled": false,
+      "created_at": "2026-01-01 09:00:00",
+      "updated_at": "2026-02-01 09:00:00",
+      "group_memberships": [
+        {
+          "group": "beta",
+          "level": "admin",
+          "granted_at": "2026-01-01 08:30:00"
+        },
+        {
+          "group": "coaches",
+          "level": "read",
+          "granted_at": "2026-01-01 08:31:00"
+        }
+      ],
+      "philosophies": [
+        {
+          "id": 7,
+          "content": "Compound lifts first.",
+          "source": "interview",
+          "created_at": "2026-01-03 10:00:00"
+        },
+        {
+          "id": 8,
+          "content": "It's the last set that counts — \"leave one in the tank\" is for cowards.",
+          "source": "note",
+          "created_at": "2026-01-06 10:00:00"
+        }
+      ],
+      "interview_states": [
+        {
+          "platform": "confide",
+          "mode": "philosophy",
+          "draft": "",
+          "turns": 0,
+          "started_at": "2026-01-04 10:05:00"
+        },
+        {
+          "platform": "telegram",
+          "mode": "philosophy",
+          "draft": "half a philosophy",
+          "turns": 2,
+          "started_at": "2026-01-04 10:00:00"
+        }
+      ],
+      "goals": [
+        {
+          "id": 11,
+          "kind": "strength",
+          "exercise": {
+            "name": "Bench Press",
+            "parent": "Pectoral"
+          },
+          "metric": null,
+          "target_value": 120.0,
+          "direction": "increase",
+          "priority": 5,
+          "start_date": "2026-01-01",
+          "target_date": "2026-06-01",
+          "achieved": false,
+          "achieved_at": null,
+          "notes": "bench 120",
+          "created_at": "2026-01-01 09:00:00",
+          "updated_at": "2026-01-01 09:00:00"
+        },
+        {
+          "id": 12,
+          "kind": "bodyweight",
+          "exercise": null,
+          "metric": "bodyweight_kg",
+          "target_value": 78.0,
+          "direction": "decrease",
+          "priority": 3,
+          "start_date": "2026-01-01",
+          "target_date": null,
+          "achieved": true,
+          "achieved_at": null,
+          "notes": null,
+          "created_at": "2026-01-01 09:00:00",
+          "updated_at": "2026-01-01 09:00:00"
+        },
+        {
+          "id": 13,
+          "kind": "endurance",
+          "exercise": {
+            "name": "Running",
+            "parent": "Cardiovascular"
+          },
+          "metric": null,
+          "target_value": 10.0,
+          "direction": "increase",
+          "priority": 2,
+          "start_date": "2026-01-01",
+          "target_date": "2026-09-01",
+          "achieved": false,
+          "achieved_at": null,
+          "notes": "10k without walking",
+          "created_at": "2026-01-01 09:00:00",
+          "updated_at": "2026-01-01 09:00:00"
+        },
+        {
+          "id": 14,
+          "kind": "body_composition",
+          "exercise": null,
+          "metric": "body_fat_pct",
+          "target_value": 15.0,
+          "direction": "decrease",
+          "priority": 1,
+          "start_date": "2026-01-01",
+          "target_date": "2026-12-01",
+          "achieved": false,
+          "achieved_at": null,
+          "notes": null,
+          "created_at": "2026-01-01 09:00:00",
+          "updated_at": "2026-01-01 09:00:00"
+        },
+        {
+          "id": 15,
+          "kind": "habit",
+          "exercise": {
+            "name": "Cardio",
+            "parent": null
+          },
+          "metric": null,
+          "target_value": 3.0,
+          "direction": "increase",
+          "priority": 0,
+          "start_date": "2026-01-01",
+          "target_date": null,
+          "achieved": false,
+          "achieved_at": null,
+          "notes": "three cardio sessions a week",
+          "created_at": "2026-01-01 09:00:00",
+          "updated_at": "2026-01-01 09:00:00"
+        }
+      ],
+      "sessions": [
+        {
+          "id": 21,
+          "started_at": "2026-02-01 17:00:00",
+          "ended_at": "2026-02-01 18:15:00",
+          "intent": "felt strong",
+          "overall_effort": "hard",
+          "effort_source": null,
+          "felt": "great",
+          "cut_short": false,
+          "cut_short_reason": null,
+          "entries": [
+            {
+              "id": 31,
+              "start_timestamp": "2026-02-01 17:05:00",
+              "end_timestamp": "2026-02-01 17:30:00",
+              "comment": "warmed up",
+              "sets": [
+                {
+                  "exercise": {
+                    "name": "Flat Barbell Bench Press",
+                    "parent": "Bench Press"
+                  },
+                  "order_idx": 0,
+                  "measurement_type": "weight_reps",
+                  "count": 8,
+                  "value": 80.0,
+                  "perceived_difficulty": "medium",
+                  "comment": "smooth",
+                  "logged_at": "2026-02-01 17:10:00"
+                },
+                {
+                  "exercise": {
+                    "name": "Flat Barbell Bench Press",
+                    "parent": "Bench Press"
+                  },
+                  "order_idx": 1,
+                  "measurement_type": "weight_reps",
+                  "count": 6,
+                  "value": 90.0,
+                  "perceived_difficulty": "hard",
+                  "comment": null,
+                  "logged_at": "2026-02-01 17:20:00"
+                }
+              ]
+            },
+            {
+              "id": 32,
+              "start_timestamp": "2026-02-01 17:35:00",
+              "end_timestamp": null,
+              "comment": null,
+              "sets": [
+                {
+                  "exercise": {
+                    "name": "Plank",
+                    "parent": "Transverse Abdominis"
+                  },
+                  "order_idx": 0,
+                  "measurement_type": "time_based",
+                  "count": null,
+                  "value": 60.0,
+                  "perceived_difficulty": "easy",
+                  "comment": null,
+                  "logged_at": "2026-02-01 17:40:00"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": 22,
+          "started_at": "2026-02-03 17:00:00",
+          "ended_at": null,
+          "intent": "no sentinel here",
+          "overall_effort": null,
+          "effort_source": null,
+          "felt": null,
+          "cut_short": true,
+          "cut_short_reason": "gym closed"
+        },
+        {
+          "id": 23,
+          "started_at": "2026-02-05 17:00:00",
+          "ended_at": "2026-02-05 18:30:00",
+          "intent": null,
+          "overall_effort": "failure",
+          "effort_source": null,
+          "felt": "rough",
+          "cut_short": false,
+          "cut_short_reason": null,
+          "entries": [
+            {
+              "id": 34,
+              "start_timestamp": "2026-02-05 17:10:00",
+              "end_timestamp": "2026-02-05 17:50:00",
+              "comment": null,
+              "sets": [
+                {
+                  "exercise": {
+                    "name": "Running",
+                    "parent": "Cardiovascular"
+                  },
+                  "order_idx": 0,
+                  "measurement_type": "distance_based",
+                  "count": null,
+                  "value": 5.2,
+                  "perceived_difficulty": "medium",
+                  "comment": "5.2 km",
+                  "logged_at": "2026-02-05 17:15:00"
+                },
+                {
+                  "exercise": {
+                    "name": "Padel",
+                    "parent": "Cardiovascular"
+                  },
+                  "order_idx": 1,
+                  "measurement_type": "score_based",
+                  "count": null,
+                  "value": 21.0,
+                  "perceived_difficulty": "hard",
+                  "comment": "won 21-19",
+                  "logged_at": "2026-02-05 17:45:00"
+                }
+              ]
+            },
+            {
+              "id": 35,
+              "start_timestamp": "2026-02-05 18:00:00",
+              "end_timestamp": null,
+              "comment": "started, logged nothing"
+            }
+          ]
+        },
+        {
+          "id": 24,
+          "started_at": "2026-02-07 17:00:00",
+          "ended_at": "2026-02-07 17:45:00",
+          "intent": null,
+          "overall_effort": "easy",
+          "effort_source": null,
+          "felt": "good",
+          "cut_short": false,
+          "cut_short_reason": null
+        },
+        {
+          "id": 25,
+          "started_at": "2026-02-09 17:00:00",
+          "ended_at": "2026-02-09 18:00:00",
+          "intent": "unicode check: 100kg — pesado, ~5 reps <ok> \\ done",
+          "overall_effort": "medium",
+          "effort_source": null,
+          "felt": "ok",
+          "cut_short": false,
+          "cut_short_reason": null
+        }
+      ],
+      "unsessioned_entries": [
+        {
+          "id": 33,
+          "start_timestamp": "2026-01-15 12:00:00",
+          "end_timestamp": null,
+          "comment": "logged outside a session",
+          "sets": [
+            {
+              "exercise": {
+                "name": "Squat",
+                "parent": "Quadriceps"
+              },
+              "order_idx": 0,
+              "measurement_type": "weight_reps",
+              "count": 5,
+              "value": 100.0,
+              "perceived_difficulty": "failure",
+              "comment": null,
+              "logged_at": "2026-01-15 12:05:00"
+            }
+          ]
+        },
+        {
+          "id": 36,
+          "start_timestamp": "2026-01-22 12:00:00",
+          "end_timestamp": "2026-01-22 12:20:00",
+          "comment": null,
+          "sets": [
+            {
+              "exercise": {
+                "name": "Front Plank",
+                "parent": "Plank"
+              },
+              "order_idx": 0,
+              "measurement_type": "level_based",
+              "count": null,
+              "value": 3.0,
+              "perceived_difficulty": "easy",
+              "comment": "level 3 hold",
+              "logged_at": "2026-01-22 12:10:00"
+            }
+          ]
+        }
+      ],
+      "session_rosters": [
+        {
+          "id": 81,
+          "title": "Next Pull",
+          "rationale": "lats need volume",
+          "philosophy_id": 7,
+          "status": "draft",
+          "session_id": null,
+          "programme_slot_id": null,
+          "override_note": null,
+          "created_at": "2026-02-04 08:00:00",
+          "updated_at": "2026-02-04 08:00:00"
+        },
+        {
+          "id": 82,
+          "title": "Push Day",
+          "rationale": "chest focus",
+          "philosophy_id": 7,
+          "status": "completed",
+          "session_id": 21,
+          "programme_slot_id": 71,
+          "override_note": "no dips today",
+          "created_at": "2026-02-01 16:00:00",
+          "updated_at": "2026-02-01 18:15:00",
+          "exercises": [
+            {
+              "exercise": {
+                "name": "Flat Barbell Bench Press",
+                "parent": "Bench Press"
+              },
+              "order_idx": 0,
+              "target_sets": 3,
+              "target_reps": 8,
+              "target_weight_kg": 80.0,
+              "target_secs": null,
+              "notes": "controlled tempo"
+            },
+            {
+              "exercise": {
+                "name": "Plank",
+                "parent": "Transverse Abdominis"
+              },
+              "order_idx": 1,
+              "target_sets": 3,
+              "target_reps": null,
+              "target_weight_kg": null,
+              "target_secs": 60,
+              "notes": null
+            },
+            {
+              "exercise": {
+                "name": "Overhand Pull-Up",
+                "parent": "Pull-Up"
+              },
+              "order_idx": 2,
+              "target_sets": 4,
+              "target_reps": 6,
+              "target_weight_kg": null,
+              "target_secs": null,
+              "notes": null
+            }
+          ]
+        },
+        {
+          "id": 83,
+          "title": "Leg Day",
+          "rationale": null,
+          "philosophy_id": 8,
+          "status": "active",
+          "session_id": 23,
+          "programme_slot_id": null,
+          "override_note": null,
+          "created_at": "2026-02-05 16:00:00",
+          "updated_at": "2026-02-05 18:30:00",
+          "exercises": [
+            {
+              "exercise": {
+                "name": "Squat",
+                "parent": "Quadriceps"
+              },
+              "order_idx": 0,
+              "target_sets": 5,
+              "target_reps": 5,
+              "target_weight_kg": 110.0,
+              "target_secs": null,
+              "notes": "belt on the last two"
+            }
+          ]
+        },
+        {
+          "id": 84,
+          "title": "Deload Week",
+          "rationale": "too much fatigue",
+          "philosophy_id": null,
+          "status": "abandoned",
+          "session_id": null,
+          "programme_slot_id": null,
+          "override_note": "shoulder still sore",
+          "created_at": "2026-01-12 08:00:00",
+          "updated_at": "2026-01-14 08:00:00"
+        }
+      ],
+      "programmes": [
+        {
+          "id": 51,
+          "title": "Winter Strength",
+          "start_date": "2026-01-06",
+          "target_end_date": "2026-03-30",
+          "days_per_week": 4,
+          "split": "upper/lower",
+          "progression_policy": "double progression",
+          "status": "active",
+          "created_at": "2026-01-05 09:00:00",
+          "updated_at": "2026-01-05 09:00:00",
+          "goal_ids": [
+            11,
+            13
+          ],
+          "blocks": [
+            {
+              "start_week": 1,
+              "end_week": 4,
+              "focus": "hypertrophy",
+              "notes": "build volume"
+            },
+            {
+              "start_week": 5,
+              "end_week": 6,
+              "focus": "deload",
+              "notes": null
+            },
+            {
+              "start_week": 7,
+              "end_week": 12,
+              "focus": "strength",
+              "notes": "heavy triples"
+            }
+          ],
+          "slots": [
+            {
+              "id": 71,
+              "week_idx": 1,
+              "day_idx": 1,
+              "focus": "push",
+              "status": "filled",
+              "updated_at": "2026-02-01 18:15:00"
+            },
+            {
+              "id": 72,
+              "week_idx": 1,
+              "day_idx": 2,
+              "focus": "pull",
+              "status": "pending",
+              "updated_at": "2026-01-05 09:00:00"
+            },
+            {
+              "id": 73,
+              "week_idx": 1,
+              "day_idx": 3,
+              "focus": "legs",
+              "status": "missed",
+              "updated_at": "2026-01-12 09:00:00"
+            },
+            {
+              "id": 74,
+              "week_idx": 2,
+              "day_idx": 1,
+              "focus": "push",
+              "status": "skipped",
+              "updated_at": "2026-01-13 09:00:00"
+            }
+          ]
+        },
+        {
+          "id": 52,
+          "title": "Autumn Base",
+          "start_date": "2025-09-01",
+          "target_end_date": "2025-11-30",
+          "days_per_week": 3,
+          "split": "full body",
+          "progression_policy": "linear",
+          "status": "completed",
+          "created_at": "2025-08-25 09:00:00",
+          "updated_at": "2025-12-01 09:00:00",
+          "goal_ids": [
+            12
+          ],
+          "blocks": [
+            {
+              "start_week": 1,
+              "end_week": 12,
+              "focus": "base",
+              "notes": null
+            }
+          ]
+        },
+        {
+          "id": 53,
+          "title": "Abandoned Experiment",
+          "start_date": "2025-06-01",
+          "target_end_date": null,
+          "days_per_week": 6,
+          "split": "bro split",
+          "progression_policy": "none",
+          "status": "abandoned",
+          "created_at": "2025-05-25 09:00:00",
+          "updated_at": "2025-06-20 09:00:00"
+        }
+      ],
+      "health_entries": [
+        {
+          "entry_type": "injury",
+          "body_part": "shoulder",
+          "severity": "severe",
+          "description": "tweaked left shoulder",
+          "started_at": "2026-01-20 09:00:00",
+          "resolved_at": null,
+          "notes": "avoid overhead",
+          "updated_at": "2026-01-20 09:00:00"
+        },
+        {
+          "entry_type": "illness",
+          "body_part": null,
+          "severity": "moderate",
+          "description": "flu",
+          "started_at": "2026-01-25 09:00:00",
+          "resolved_at": "2026-01-29 09:00:00",
+          "notes": null,
+          "updated_at": "2026-01-29 09:00:00"
+        },
+        {
+          "entry_type": "wellbeing",
+          "body_part": null,
+          "severity": "mild",
+          "description": "sleeping badly",
+          "started_at": "2026-02-02 09:00:00",
+          "resolved_at": null,
+          "notes": "four hours a night",
+          "updated_at": "2026-02-02 09:00:00"
+        }
+      ],
+      "body_metrics": [
+        {
+          "metric": "bodyweight_kg",
+          "value": 82.5,
+          "measured_at": "2026-01-10 07:00:00"
+        },
+        {
+          "metric": "body_fat_pct",
+          "value": 19.4,
+          "measured_at": "2026-01-10 07:00:00"
+        },
+        {
+          "metric": "waist_cm",
+          "value": 86.0,
+          "measured_at": "2026-01-10 07:00:00"
+        },
+        {
+          "metric": "resting_hr_bpm",
+          "value": 58.0,
+          "measured_at": "2026-01-10 07:00:00"
+        },
+        {
+          "metric": "bodyweight_kg",
+          "value": 81.9,
+          "measured_at": "2026-02-10 07:00:00"
+        }
+      ],
+      "conversation_history": [
+        {
+          "platform": "confide",
+          "role": "user",
+          "content": "logged 8 at 80",
+          "timestamp": "2026-02-01 17:10:00",
+          "exclude_from_context": false
+        },
+        {
+          "platform": "telegram",
+          "role": "assistant",
+          "content": "nice work",
+          "timestamp": "2026-02-01 17:10:05",
+          "exclude_from_context": true
+        },
+        {
+          "platform": "signal",
+          "role": "system",
+          "content": "session summary generated",
+          "timestamp": "2026-02-01 18:16:00",
+          "exclude_from_context": false
+        },
+        {
+          "platform": "web",
+          "role": "user",
+          "content": "quotes \"inside\" and a backslash \\ survive",
+          "timestamp": "2026-02-03 17:00:00",
+          "exclude_from_context": false
+        }
+      ],
+      "legacy": {
+        "signal_id": "signal-alice",
+        "schedules": [
+          {
+            "name": "Push Day",
+            "cron_expr": "0 17 * * 1",
+            "reminder_type": "voice",
+            "reminder_notice_mins": 45,
+            "enabled": true,
+            "created_at": "2026-01-01 09:00:00",
+            "updated_at": "2026-01-01 09:00:00",
+            "exercises": [
+              {
+                "exercise": {
+                  "name": "Flat Barbell Bench Press",
+                  "parent": "Bench Press"
+                },
+                "order_idx": 0,
+                "target_sets": 3,
+                "target_reps": 8,
+                "target_weight_kg": 80.0
+              },
+              {
+                "exercise": {
+                  "name": "Plank",
+                  "parent": "Transverse Abdominis"
+                },
+                "order_idx": 1,
+                "target_sets": 3,
+                "target_reps": null,
+                "target_weight_kg": null
+              }
+            ]
+          },
+          {
+            "name": "Leg Day",
+            "cron_expr": "0 17 * * 4",
+            "reminder_type": "text",
+            "reminder_notice_mins": 30,
+            "enabled": false,
+            "created_at": "2026-01-01 09:00:00",
+            "updated_at": "2026-01-08 09:00:00"
+          }
+        ],
+        "session_plan_names": [
+          {
+            "session_id": 21,
+            "plan": "Push Day"
+          },
+          {
+            "session_id": 23,
+            "plan": "Leg Day"
+          }
+        ]
+      }
+    },
+    {
+      "id": 2,
+      "name": "Bob",
+      "telegram_id": null,
+      "pubkey": null,
+      "timezone": "UTC",
+      "beta_tester": false,
+      "timers_enabled": true,
+      "created_at": "2026-01-02 09:00:00",
+      "updated_at": "2026-01-02 09:00:00",
+      "legacy": {}
+    },
+    {
+      "id": 3,
+      "name": "Carol",
+      "telegram_id": "tg-carol",
+      "pubkey": "pk-carol",
+      "timezone": "America/New_York",
+      "beta_tester": false,
+      "timers_enabled": true,
+      "created_at": "2026-01-03 09:00:00",
+      "updated_at": "2026-01-03 09:00:00",
+      "group_memberships": [
+        {
+          "group": "coaches",
+          "level": "write",
+          "granted_at": "2026-01-03 09:30:00"
+        }
+      ],
+      "philosophies": [
+        {
+          "id": 9,
+          "content": "Volume over intensity.",
+          "source": "import",
+          "created_at": "2026-01-04 10:00:00"
+        }
+      ],
+      "interview_states": [
+        {
+          "platform": "web",
+          "mode": "philosophy",
+          "draft": "starting out",
+          "turns": 1,
+          "started_at": "2026-01-05 10:00:00"
+        }
+      ],
+      "goals": [
+        {
+          "id": 16,
+          "kind": "strength",
+          "exercise": {
+            "name": "Squat",
+            "parent": "Quadriceps"
+          },
+          "metric": null,
+          "target_value": 140.0,
+          "direction": "increase",
+          "priority": 4,
+          "start_date": "2026-01-05",
+          "target_date": null,
+          "achieved": false,
+          "achieved_at": null,
+          "notes": null,
+          "created_at": "2026-01-05 09:00:00",
+          "updated_at": "2026-01-05 09:00:00"
+        }
+      ],
+      "sessions": [
+        {
+          "id": 26,
+          "started_at": "2026-02-02 07:00:00",
+          "ended_at": "2026-02-02 08:00:00",
+          "intent": "morning squats",
+          "overall_effort": "medium",
+          "effort_source": null,
+          "felt": "good",
+          "cut_short": false,
+          "cut_short_reason": null,
+          "entries": [
+            {
+              "id": 37,
+              "start_timestamp": "2026-02-02 07:05:00",
+              "end_timestamp": "2026-02-02 07:40:00",
+              "comment": null,
+              "sets": [
+                {
+                  "exercise": {
+                    "name": "Squat",
+                    "parent": "Quadriceps"
+                  },
+                  "order_idx": 0,
+                  "measurement_type": "weight_reps",
+                  "count": 10,
+                  "value": 60.0,
+                  "perceived_difficulty": "medium",
+                  "comment": null,
+                  "logged_at": "2026-02-02 07:10:00"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "unsessioned_entries": [
+        {
+          "id": 38,
+          "start_timestamp": "2026-01-28 18:00:00",
+          "end_timestamp": null,
+          "comment": "carol logged a set on her own",
+          "sets": [
+            {
+              "exercise": {
+                "name": "Overhand Pull-Up",
+                "parent": "Pull-Up"
+              },
+              "order_idx": 0,
+              "measurement_type": "weight_reps",
+              "count": 4,
+              "value": 0.0,
+              "perceived_difficulty": "hard",
+              "comment": "bodyweight only",
+              "logged_at": "2026-01-28 18:05:00"
+            }
+          ]
+        }
+      ],
+      "session_rosters": [
+        {
+          "id": 85,
+          "title": "First Session",
+          "rationale": "start light",
+          "philosophy_id": 9,
+          "status": "draft",
+          "session_id": null,
+          "programme_slot_id": null,
+          "override_note": null,
+          "created_at": "2026-01-06 08:00:00",
+          "updated_at": "2026-01-06 08:00:00",
+          "exercises": [
+            {
+              "exercise": {
+                "name": "Squat",
+                "parent": "Quadriceps"
+              },
+              "order_idx": 0,
+              "target_sets": 3,
+              "target_reps": 10,
+              "target_weight_kg": 20.0,
+              "target_secs": null,
+              "notes": null
+            }
+          ]
+        }
+      ],
+      "programmes": [
+        {
+          "id": 54,
+          "title": "Couch to Squat",
+          "start_date": "2026-01-10",
+          "target_end_date": null,
+          "days_per_week": 2,
+          "split": "full body",
+          "progression_policy": "linear",
+          "status": "draft",
+          "created_at": "2026-01-05 09:00:00",
+          "updated_at": "2026-01-05 09:00:00",
+          "goal_ids": [
+            16
+          ],
+          "slots": [
+            {
+              "id": 75,
+              "week_idx": 1,
+              "day_idx": 1,
+              "focus": "full body",
+              "status": "pending",
+              "updated_at": "2026-01-05 09:00:00"
+            }
+          ]
+        }
+      ],
+      "health_entries": [
+        {
+          "entry_type": "injury",
+          "body_part": "knee",
+          "severity": "mild",
+          "description": "sore knee after squats",
+          "started_at": "2026-02-03 09:00:00",
+          "resolved_at": "2026-02-06 09:00:00",
+          "notes": null,
+          "updated_at": "2026-02-06 09:00:00"
+        }
+      ],
+      "body_metrics": [
+        {
+          "metric": "bodyweight_kg",
+          "value": 64.2,
+          "measured_at": "2026-01-11 07:00:00"
+        }
+      ],
+      "conversation_history": [
+        {
+          "platform": "telegram",
+          "role": "user",
+          "content": "how heavy should I squat?",
+          "timestamp": "2026-02-02 07:00:00",
+          "exclude_from_context": false
+        }
+      ],
+      "legacy": {}
+    }
+  ]
+}
