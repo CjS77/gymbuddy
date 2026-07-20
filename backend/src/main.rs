@@ -67,6 +67,19 @@ enum Command {
     /// Migrate a legacy database to schema v2: export, build v2, import, then verify.
     ///
     /// Writes a new file and never touches the old one, which is therefore its own rollback.
+    ///
+    /// DEPLOYMENT GATE — before migrating the live database:
+    ///
+    /// 1. Stop the bot. Migrating a file that is being written to migrates a moving target.
+    ///
+    /// 2. Rehearse on a copy: `gymbuddy migrate --db <copy> --out <copy>.v2.db`. Verification is
+    ///    on by default; a non-zero exit means do not proceed.
+    ///
+    /// 3. Run it for real, and KEEP THE OLD FILE. It is the rollback, and it costs a few megabytes.
+    ///
+    /// 4. Point the config at the new file and restart. `serve` refuses to open a legacy database,
+    ///    so a forgotten step four fails loudly at startup rather than half-upgrading it in place.
+    #[command(verbatim_doc_comment)]
     Migrate {
         /// Legacy database to read. Never written to.
         #[arg(long)]

@@ -255,3 +255,16 @@ fn help_lists_every_subcommand_and_serve_is_the_default() {
     });
     assert!(help.contains("--config"), "--config stays a global flag so the deployment invocation is unchanged");
 }
+
+/// The deployment gate has to reach the person running the migration, and that person is at a
+/// terminal, not in `dump/migrate.rs`. `--help` is the one place they are certain to look.
+#[test]
+fn migrate_help_carries_the_deployment_gate() {
+    let output = Command::new(GYMBUDDY).args(["migrate", "--help"]).output().expect("running gymbuddy migrate --help");
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("DEPLOYMENT GATE"), "the gate should be in the help:\n{help}");
+    ["Stop the bot", "Rehearse on a copy", "KEEP THE OLD FILE"].iter().for_each(|step| {
+        assert!(help.contains(step), "the gate is missing `{step}`:\n{help}");
+    });
+}
