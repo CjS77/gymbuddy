@@ -48,7 +48,7 @@ pub struct RosterProgress {
     /// Names of prescribed exercises the user has already logged sets for this session.
     pub done: Vec<String>,
     /// The next prescribed exercise still to do.
-    pub next: Option<RosterExerciseView>,
+    pub next: Option<PromptRosterExercise>,
     /// How many prescribed exercises remain.
     pub remaining: usize,
     /// Today-only overrides the user voiced for THIS roster ("no bench today, do flys
@@ -57,8 +57,13 @@ pub struct RosterProgress {
 }
 
 /// One exercise of a [`RosterProgress`] as the prompt sees it.
+///
+/// Deliberately *not* a `…View`: in this codebase `View` names the wire-facing
+/// render contract in `gymbuddy_proto::view`, and this struct never leaves the
+/// process — it is prompt input, formatted into text by [`format_prescription`].
+/// Its wire-side counterpart is [`gymbuddy_proto::RosterExerciseView`].
 #[derive(Debug, Clone)]
-pub struct RosterExerciseView {
+pub struct PromptRosterExercise {
     pub exercise_name: String,
     pub target_sets: Option<i32>,
     pub target_reps: Option<i32>,
@@ -793,7 +798,7 @@ fn format_active_roster(roster: &Option<RosterProgress>) -> String {
 }
 
 /// A prescribed exercise as one compact line, e.g. "Bench Press — 3 sets 6 reps @ 65kg (push it)".
-fn format_prescription(p: &RosterExerciseView) -> String {
+fn format_prescription(p: &PromptRosterExercise) -> String {
     let mut parts = Vec::new();
     if let Some(sets) = p.target_sets {
         parts.push(format!("{sets} sets"));
@@ -1047,7 +1052,7 @@ mod tests {
             title: "Push Day".to_string(),
             started,
             done: Vec::new(),
-            next: Some(RosterExerciseView {
+            next: Some(PromptRosterExercise {
                 exercise_name: "Overhead Press".to_string(),
                 target_sets: Some(4),
                 target_reps: Some(6),

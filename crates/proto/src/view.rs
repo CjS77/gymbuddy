@@ -36,18 +36,18 @@ pub enum View {
     /// Clients show it however they like — Telegram as a one-line notice, the TUI by
     /// updating its sidebar switch.
     Timers { enabled: bool },
-    /// A designed-but-unlogged workout ( `/nextworkout` ): the rationale plus the
-    /// prescribed exercises and target sets. Nothing here is logged — the user still
-    /// logs sets the normal way.
-    Workout(WorkoutView),
-    /// A designed workout produced while the user has an active programme ([C1.4]):
+    /// A designed-but-unlogged session roster ( `/nextworkout` ): the rationale plus
+    /// the prescribed exercises and target sets. Nothing here is logged — the user
+    /// still logs sets the normal way.
+    SessionRoster(SessionRosterView),
+    /// A session roster designed while the user has an active programme ([C1.4]):
     /// either it fills the programme's current slot, or it is a deliberate one-off
     /// that leaves the programme untouched — `mode` says which. Designs with no
-    /// programme in play keep travelling as plain [`View::Workout`], byte-identical
+    /// programme in play keep travelling as plain [`View::SessionRoster`], byte-identical
     /// to the pre-programme protocol (postcard is positional, so extending
-    /// [`WorkoutView`] itself would silently reshape existing messages — see the
+    /// [`SessionRosterView`] itself would silently reshape existing messages — see the
     /// append-only rule on the envelope enums).
-    ProgramWorkout { workout: WorkoutView, mode: TrainingModeView },
+    ProgrammeSessionRoster { roster: SessionRosterView, mode: TrainingModeView },
 }
 
 impl View {
@@ -78,8 +78,8 @@ impl View {
             View::Status(_) => "Here's your current session.".to_string(),
             View::Catalog(_) => "Here's the exercise catalogue.".to_string(),
             View::History(_) => "Here's your recent workout history.".to_string(),
-            View::Workout(w) => format!("Here's a workout: {}.", w.title),
-            View::ProgramWorkout { workout, mode } => format!("Here's a workout: {} ({}).", workout.title, mode.summary()),
+            View::SessionRoster(r) => format!("Here's a workout: {}.", r.title),
+            View::ProgrammeSessionRoster { roster, mode } => format!("Here's a workout: {} ({}).", roster.title, mode.summary()),
         }
     }
 }
@@ -209,29 +209,29 @@ pub struct SessionSummaryView {
 
 // ── /nextworkout ─────────────────────────────────────────────────────────────────
 
-/// A designed workout: a title, the coach's reasoning, and the prescribed
+/// A designed session roster: a title, the coach's reasoning, and the prescribed
 /// exercises. Purely a proposal — logging still happens the normal way.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct WorkoutView {
+pub struct SessionRosterView {
     pub title: String,
     /// The coach's reasoning for this session (why these exercises today).
     pub rationale: Option<String>,
-    pub exercises: Vec<PlannedExerciseView>,
+    pub exercises: Vec<RosterExerciseView>,
     /// Free-text caveats the coach attached (e.g. a dropped exercise, equipment note).
     pub notes: Vec<String>,
 }
 
-/// The training mode that produced a designed workout ([C1.4]), for workouts
+/// The training mode that produced a designed session roster ([C1.4]), for rosters
 /// designed while a programme is active. Plain ad-hoc with no programme in play
-/// has no mode to report and travels as [`View::Workout`], so "no programme"
+/// has no mode to report and travels as [`View::SessionRoster`], so "no programme"
 /// is deliberately unrepresentable here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrainingModeView {
     /// A deliberate one-off during an active programme ("travelling, dumbbells
     /// only"): the named programme's slots are left completely untouched.
-    AdHoc { program_title: String },
-    /// The workout fills the active programme's current slot.
-    Program { program_title: String, week: u32, day: u32, focus: String },
+    AdHoc { programme_title: String },
+    /// The roster fills the active programme's current slot.
+    Programme { programme_title: String, week: u32, day: u32, focus: String },
 }
 
 impl TrainingModeView {
@@ -241,19 +241,19 @@ impl TrainingModeView {
     /// and escaping stay at the renderer.
     pub fn summary(&self) -> String {
         match self {
-            Self::AdHoc { program_title } => format!("Ad-hoc session — {program_title} is untouched"),
-            Self::Program { program_title, week, day, focus } => {
-                format!("Programme: {program_title} — week {week}, day {day}: {focus}")
+            Self::AdHoc { programme_title } => format!("Ad-hoc session — {programme_title} is untouched"),
+            Self::Programme { programme_title, week, day, focus } => {
+                format!("Programme: {programme_title} — week {week}, day {day}: {focus}")
             }
         }
     }
 }
 
-/// One prescribed exercise in a [`WorkoutView`]. The target fields are
+/// One prescribed exercise in a [`SessionRosterView`]. The target fields are
 /// presentation hints; `(target_reps, target_weight_kg)` cover the weight_reps
 /// case and `target_secs` covers timed work.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PlannedExerciseView {
+pub struct RosterExerciseView {
     pub name: String,
     pub target_sets: Option<u32>,
     pub target_reps: Option<u32>,
@@ -263,7 +263,7 @@ pub struct PlannedExerciseView {
     pub cue: Option<String>,
 }
 
-impl PlannedExerciseView {
+impl RosterExerciseView {
     /// The prescription line for this exercise, e.g. "3 sets × 6 reps @ 65kg" or
     /// "3 sets × 60s". Empty when no targets are set. Shared by all client renderers
     /// (the value is plain text — escaping/styling stays at the renderer).
@@ -310,10 +310,10 @@ mod tests {
             View::Status(StatusView { user_name: "Al".into(), session: None, health: vec![] }),
             View::Catalog(CatalogView { groups: vec![] }),
             View::History(HistoryView { sessions: vec![] }),
-            View::Workout(WorkoutView { title: "Push focus".into(), rationale: None, exercises: vec![], notes: vec![] }),
-            View::ProgramWorkout {
-                workout: WorkoutView { title: "Upper".into(), rationale: None, exercises: vec![], notes: vec![] },
-                mode: TrainingModeView::Program { program_title: "12-week".into(), week: 1, day: 1, focus: "upper".into() },
+            View::SessionRoster(SessionRosterView { title: "Push focus".into(), rationale: None, exercises: vec![], notes: vec![] }),
+            View::ProgrammeSessionRoster {
+                roster: SessionRosterView { title: "Upper".into(), rationale: None, exercises: vec![], notes: vec![] },
+                mode: TrainingModeView::Programme { programme_title: "12-week".into(), week: 1, day: 1, focus: "upper".into() },
             },
         ];
         for view in &views {
@@ -325,10 +325,10 @@ mod tests {
     /// the programme and the programme mode must place the user in the grid.
     #[test]
     fn training_mode_summary_names_the_programme() {
-        let ad_hoc = TrainingModeView::AdHoc { program_title: "12-week hypertrophy".into() };
+        let ad_hoc = TrainingModeView::AdHoc { programme_title: "12-week hypertrophy".into() };
         assert_eq!(ad_hoc.summary(), "Ad-hoc session — 12-week hypertrophy is untouched");
 
-        let slot = TrainingModeView::Program { program_title: "12-week hypertrophy".into(), week: 2, day: 1, focus: "upper".into() };
+        let slot = TrainingModeView::Programme { programme_title: "12-week hypertrophy".into(), week: 2, day: 1, focus: "upper".into() };
         assert_eq!(slot.summary(), "Programme: 12-week hypertrophy — week 2, day 1: upper");
     }
 
@@ -348,8 +348,8 @@ mod tests {
     }
 
     #[test]
-    fn planned_exercise_target_line() {
-        let weighted = PlannedExerciseView {
+    fn roster_exercise_target_line() {
+        let weighted = RosterExerciseView {
             name: "Bench Press".into(),
             target_sets: Some(3),
             target_reps: Some(6),
@@ -359,7 +359,7 @@ mod tests {
         };
         assert_eq!(weighted.target_line(), "3 sets × 6 reps @ 65kg");
 
-        let timed = PlannedExerciseView {
+        let timed = RosterExerciseView {
             name: "Plank".into(),
             target_sets: Some(3),
             target_reps: None,
@@ -369,7 +369,7 @@ mod tests {
         };
         assert_eq!(timed.target_line(), "3 sets × 60s");
 
-        let bare = PlannedExerciseView {
+        let bare = RosterExerciseView {
             name: "Mystery".into(),
             target_sets: None,
             target_reps: None,

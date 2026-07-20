@@ -21,11 +21,11 @@ use crate::science::{ScienceQuery, normalise_body_part, prescription_doc};
 
 use super::AssistantHandler;
 use super::continuity::parse_sqlite_datetime;
-use gymbuddy_proto::{PlannedExerciseView, TrainingModeView, View, WorkoutView};
+use gymbuddy_proto::{RosterExerciseView, TrainingModeView, View, SessionRosterView};
 
 impl AssistantHandler {
     /// Design a tailored workout from the user's philosophy, recent history, goals,
-    /// and injuries, and present it as a [`View::Workout`]. Persists a draft session
+    /// and injuries, and present it as a [`View::SessionRoster`]. Persists a draft session
     /// roster but logs NOTHING and starts no session. Any text after the command
     /// ("/nextworkout but something lighter") is passed to the designer as guidance.
     ///
@@ -95,18 +95,18 @@ impl AssistantHandler {
             ));
         };
 
-        self.persist_and_view_workout(user, &philosophy, &mode, title, rationale, exercises).await
+        self.persist_and_view_roster(user, &philosophy, &mode, title, rationale, exercises).await
     }
 
-    /// Persist a designed session as a draft roster and build its [`View::Workout`]
-    /// (or [`View::ProgramWorkout`] when a programme is in play). Exercise names are
+    /// Persist a designed session as a draft roster and build its [`View::SessionRoster`]
+    /// (or [`View::ProgrammeSessionRoster`] when a programme is in play). Exercise names are
     /// resolved against the catalogue; unresolved ones are dropped with a note rather
     /// than failing the whole design.
     ///
     /// In programme mode the roster is stamped with the slot it fills; in ad-hoc mode
     /// its `programme_slot_id` stays NULL and no slot status moves — a one-off under an
     /// active programme never touches adherence.
-    async fn persist_and_view_workout(
+    async fn persist_and_view_roster(
         &self,
         user: &User,
         philosophy: &WorkoutPhilosophy,
@@ -115,7 +115,7 @@ impl AssistantHandler {
         rationale: Option<String>,
         exercises: Vec<ProposedRosterExercise>,
     ) -> anyhow::Result<View> {
-        let mut planned: Vec<PlannedExerciseView> = Vec::new();
+        let mut roster_exercises: Vec<RosterExerciseView> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
 
         let db = self.db.lock().await;
@@ -141,7 +141,7 @@ impl AssistantHandler {
                 target_secs: ex.target_secs,
                 notes: ex.notes.clone(),
             })?;
-            planned.push(PlannedExerciseView {
+            roster_exercises.push(RosterExerciseView {
                 name: et.exercise_type.name.clone(),
                 target_sets: ex.target_sets.map(|n| n.max(0) as u32),
                 target_reps: ex.target_reps.map(|n| n.max(0) as u32),
@@ -151,10 +151,10 @@ impl AssistantHandler {
             });
         }
 
-        let workout = WorkoutView { title, rationale, exercises: planned, notes };
+        let roster = SessionRosterView { title, rationale, exercises: roster_exercises, notes };
         Ok(match mode_view(mode) {
-            Some(mode) => View::ProgramWorkout { workout, mode },
-            None => View::Workout(workout),
+            Some(mode) => View::ProgrammeSessionRoster { roster, mode },
+            None => View::SessionRoster(roster),
         })
     }
 
@@ -381,17 +381,17 @@ fn split_ad_hoc_marker(guidance: &str) -> (bool, String) {
     }
 }
 
-/// The wire-facing mode for a designed workout, or `None` for plain ad-hoc with no
-/// programme in play — which keeps travelling as the pre-programme [`View::Workout`],
+/// The wire-facing mode for a designed session roster, or `None` for plain ad-hoc with no
+/// programme in play — which keeps travelling as the pre-programme [`View::SessionRoster`],
 /// so a user with no programme sees exactly today's output.
 fn mode_view(mode: &TrainingMode) -> Option<TrainingModeView> {
     match mode {
         TrainingMode::AdHoc { programme: None } => None,
         TrainingMode::AdHoc { programme: Some(programme) } => {
-            Some(TrainingModeView::AdHoc { program_title: programme.title.clone() })
+            Some(TrainingModeView::AdHoc { programme_title: programme.title.clone() })
         }
-        TrainingMode::Programme { programme, slot } => Some(TrainingModeView::Program {
-            program_title: programme.title.clone(),
+        TrainingMode::Programme { programme, slot } => Some(TrainingModeView::Programme {
+            programme_title: programme.title.clone(),
             week: slot.week_idx.max(0) as u32,
             day: slot.day_idx.max(0) as u32,
             focus: slot.focus.clone(),

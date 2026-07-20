@@ -4,7 +4,7 @@
 
 use chrono::Utc;
 
-use crate::assistant::prompts::{EntryView, PromptContext, RosterExerciseView, RosterProgress, build_system_prompt};
+use crate::assistant::prompts::{EntryView, PromptContext, PromptRosterExercise, RosterProgress, build_system_prompt};
 use crate::db::{Database, ExerciseSet, ExerciseTypeWithAncestry, Session, User};
 
 use super::continuity::compute_last_activity_age_hours;
@@ -131,7 +131,7 @@ impl AssistantHandler {
             if logged.contains(&ex.exercise_type_id) {
                 done.push(name);
             } else if next.is_none() {
-                next = Some(RosterExerciseView {
+                next = Some(PromptRosterExercise {
                     exercise_name: name,
                     target_sets: ex.target_sets,
                     target_reps: ex.target_reps,

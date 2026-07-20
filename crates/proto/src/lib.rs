@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 pub mod view;
 pub use view::{
-    CatalogEntry, CatalogGroup, CatalogView, ExerciseLog, HealthNote, HistoryView, Measurement, PlannedExerciseView, Render,
-    SessionSummaryView, SessionView, SetLine, StatusView, TrainingModeView, View, WorkoutView,
+    CatalogEntry, CatalogGroup, CatalogView, ExerciseLog, HealthNote, HistoryView, Measurement, Render, RosterExerciseView,
+    SessionRosterView, SessionSummaryView, SessionView, SetLine, StatusView, TrainingModeView, View,
 };
 
 /// Discriminator placed in confide's `Message::Custom { kind, .. }` so the peer
@@ -215,32 +215,64 @@ mod tests {
             View::History(view::HistoryView {
                 sessions: vec![view::SessionSummaryView { started_at: "2026-06-16 10:00:00".into(), status: "done".into(), entries: 3, minutes: Some(45) }],
             }),
-            View::ProgramWorkout {
-                workout: view::WorkoutView { title: "Upper".into(), rationale: Some("push it".into()), exercises: vec![], notes: vec![] },
-                mode: view::TrainingModeView::AdHoc { program_title: "12-week hypertrophy".into() },
+            View::ProgrammeSessionRoster {
+                roster: view::SessionRosterView {
+                    title: "Upper".into(),
+                    rationale: Some("push it".into()),
+                    exercises: vec![],
+                    notes: vec![],
+                },
+                mode: view::TrainingModeView::AdHoc { programme_title: "12-week hypertrophy".into() },
             },
-            View::ProgramWorkout {
-                workout: view::WorkoutView { title: "Upper".into(), rationale: None, exercises: vec![], notes: vec![] },
-                mode: view::TrainingModeView::Program { program_title: "12-week".into(), week: 1, day: 2, focus: "upper".into() },
+            View::ProgrammeSessionRoster {
+                roster: view::SessionRosterView { title: "Upper".into(), rationale: None, exercises: vec![], notes: vec![] },
+                mode: view::TrainingModeView::Programme { programme_title: "12-week".into(), week: 1, day: 2, focus: "upper".into() },
             },
         ] {
             roundtrip_response(ServerResponse::Reply { view, timer: None });
         }
     }
 
-    /// [C1.4] appended `View::ProgramWorkout` — appended, because postcard tags are
-    /// declaration-order varints: an ad-hoc design with no programme still encodes
-    /// as the original `Workout` tag, byte-identical to the pre-programme protocol.
+    /// Every `View` discriminant, pinned to its number.
+    ///
+    /// postcard tags are declaration-order varints, so variant *order* is the wire
+    /// format and variant *names* are not: the [R1.5] renames (`Workout` →
+    /// `SessionRoster`, `ProgramWorkout` → `ProgrammeSessionRoster`) had to leave
+    /// these bytes untouched. Pinning the whole enum rather than only the two renamed
+    /// tags is what makes an accidental reorder or insertion fail here instead of in
+    /// the field, where an older peer would silently misparse the shifted variants.
+    ///
+    /// Adding a variant means appending it and adding a line below — never inserting.
     #[test]
-    fn program_workout_variant_is_appended_not_inserted() {
-        let plain = View::Workout(view::WorkoutView { title: "Push".into(), rationale: None, exercises: vec![], notes: vec![] });
-        let moded = View::ProgramWorkout {
-            workout: view::WorkoutView { title: "Push".into(), rationale: None, exercises: vec![], notes: vec![] },
-            mode: view::TrainingModeView::AdHoc { program_title: "12-week".into() },
-        };
+    fn view_discriminants_are_pinned_to_their_wire_tags() {
+        let roster = || view::SessionRosterView { title: "Push".into(), rationale: None, exercises: vec![], notes: vec![] };
         let tag = |view: &View| postcard::to_allocvec(view).unwrap()[0];
-        assert_eq!(tag(&plain), 6, "Workout keeps its pre-[C1.4] discriminant");
-        assert_eq!(tag(&moded), 7, "ProgramWorkout sits after every existing variant");
+
+        assert_eq!(tag(&View::message("hi")), 0, "Message");
+        assert_eq!(tag(&View::Status(view::StatusView { user_name: "Al".into(), session: None, health: vec![] })), 1, "Status");
+        assert_eq!(tag(&View::Catalog(view::CatalogView { groups: vec![] })), 2, "Catalog");
+        assert_eq!(tag(&View::History(view::HistoryView { sessions: vec![] })), 3, "History");
+        assert_eq!(tag(&View::notice("ok")), 4, "Notice");
+        assert_eq!(tag(&View::Timers { enabled: true }), 5, "Timers");
+        assert_eq!(tag(&View::SessionRoster(roster())), 6, "SessionRoster keeps the pre-[R1.5] `Workout` discriminant");
+        assert_eq!(
+            tag(&View::ProgrammeSessionRoster {
+                roster: roster(),
+                mode: view::TrainingModeView::AdHoc { programme_title: "12-week".into() },
+            }),
+            7,
+            "ProgrammeSessionRoster keeps the pre-[R1.5] `ProgramWorkout` discriminant",
+        );
+    }
+
+    /// `TrainingModeView` rides inside tag 7, so its own variant order is wire format
+    /// too — the [R1.5] `Program` → `Programme` rename must not have moved it.
+    #[test]
+    fn training_mode_discriminants_are_pinned_to_their_wire_tags() {
+        let tag = |mode: &view::TrainingModeView| postcard::to_allocvec(mode).unwrap()[0];
+        assert_eq!(tag(&view::TrainingModeView::AdHoc { programme_title: "p".into() }), 0, "AdHoc");
+        let slot = view::TrainingModeView::Programme { programme_title: "p".into(), week: 1, day: 1, focus: "upper".into() };
+        assert_eq!(tag(&slot), 1, "Programme keeps the pre-[R1.5] `Program` discriminant");
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! Reproduces the exact output the handler emitted before the view refactor, so
 //! the Telegram bot is visually unchanged — locked down by golden tests below.
 
-use gymbuddy_proto::{CatalogView, HistoryView, Render, SetLine, StatusView, TrainingModeView, View, WorkoutView};
+use gymbuddy_proto::{CatalogView, HistoryView, Render, SessionRosterView, SetLine, StatusView, TrainingModeView, View};
 
 /// The Telegram renderer. `Output` is `(text, parse_mode)` — `parse_mode` is
 /// `Some("HTML")` for the rich `/status` and `/exercises` views, `None` otherwise.
@@ -19,8 +19,8 @@ impl Render for Telegram {
             View::History(history) => (render_history(history), None),
             View::Status(status) => (render_status(status), Some("HTML")),
             View::Catalog(catalog) => (render_catalog(catalog), Some("HTML")),
-            View::Workout(workout) => (render_workout(workout, None), Some("HTML")),
-            View::ProgramWorkout { workout, mode } => (render_workout(workout, Some(mode)), Some("HTML")),
+            View::SessionRoster(roster) => (render_session_roster(roster, None), Some("HTML")),
+            View::ProgrammeSessionRoster { roster, mode } => (render_session_roster(roster, Some(mode)), Some("HTML")),
             View::Timers { enabled } => (format!("Rest timers are now {}.", if *enabled { "on" } else { "off" }), None),
             // `View` is `#[non_exhaustive]`: a variant from a newer server lands here.
             // Degrade to plain text rather than sending Telegram an empty message
@@ -123,26 +123,26 @@ fn render_history(history: &HistoryView) -> String {
     parts.join("\n")
 }
 
-/// Render a designed workout; `mode` (present only when a programme is active,
-/// [C1.4]) adds one italic line under the title saying whether this fills the
-/// programme's current slot or deliberately sidesteps it. `None` — ad-hoc with no
-/// programme — keeps the golden pre-programme layout untouched.
-fn render_workout(workout: &WorkoutView, mode: Option<&TrainingModeView>) -> String {
-    let mut result = format!("<b>{}</b>\n", escape_html(&workout.title));
+/// Render a designed session roster; `mode` (present only when a programme is
+/// active, [C1.4]) adds one italic line under the title saying whether this fills
+/// the programme's current slot or deliberately sidesteps it. `None` — ad-hoc with
+/// no programme — keeps the golden pre-programme layout untouched.
+fn render_session_roster(roster: &SessionRosterView, mode: Option<&TrainingModeView>) -> String {
+    let mut result = format!("<b>{}</b>\n", escape_html(&roster.title));
 
     if let Some(mode) = mode {
         result.push_str(&format!("<i>{}</i>\n", escape_html(&mode.summary())));
     }
 
-    if let Some(rationale) = &workout.rationale
+    if let Some(rationale) = &roster.rationale
         && !rationale.trim().is_empty()
     {
         result.push_str(&format!("\n{}\n", escape_html(rationale)));
     }
 
-    if !workout.exercises.is_empty() {
+    if !roster.exercises.is_empty() {
         result.push('\n');
-        for (i, exercise) in workout.exercises.iter().enumerate() {
+        for (i, exercise) in roster.exercises.iter().enumerate() {
             let target = exercise.target_line();
             let target_part = if target.is_empty() { String::new() } else { format!(" — {target}") };
             result.push_str(&format!("{}. <b>{}</b>{target_part}\n", i + 1, escape_html(&exercise.name)));
@@ -154,9 +154,9 @@ fn render_workout(workout: &WorkoutView, mode: Option<&TrainingModeView>) -> Str
         }
     }
 
-    if !workout.notes.is_empty() {
+    if !roster.notes.is_empty() {
         result.push_str("\n<b>Notes:</b>\n");
-        for note in &workout.notes {
+        for note in &roster.notes {
             result.push_str(&format!("- {}\n", escape_html(note)));
         }
     }
@@ -261,13 +261,13 @@ mod tests {
     }
 
     #[test]
-    fn workout_html_renders_plan() {
-        use gymbuddy_proto::PlannedExerciseView;
-        let workout = WorkoutView {
+    fn session_roster_html_renders_the_prescription() {
+        use gymbuddy_proto::RosterExerciseView;
+        let roster = SessionRosterView {
             title: "Upper push + lat focus".into(),
             rationale: Some("2 days rest on bench and your last session was easy, so we push the weight.".into()),
             exercises: vec![
-                PlannedExerciseView {
+                RosterExerciseView {
                     name: "Bench Press".into(),
                     target_sets: Some(3),
                     target_reps: Some(6),
@@ -275,7 +275,7 @@ mod tests {
                     target_secs: None,
                     cue: Some("Last time 55kg felt easy.".into()),
                 },
-                PlannedExerciseView {
+                RosterExerciseView {
                     name: "One Arm Dumbbell Row".into(),
                     target_sets: Some(3),
                     target_reps: Some(8),
@@ -283,7 +283,7 @@ mod tests {
                     target_secs: None,
                     cue: None,
                 },
-                PlannedExerciseView {
+                RosterExerciseView {
                     name: "Plank".into(),
                     target_sets: Some(3),
                     target_reps: None,
@@ -294,7 +294,7 @@ mod tests {
             ],
             notes: vec!["Skipped deadlift to protect your lower back.".into()],
         };
-        let (html, mode) = Telegram.render(&View::Workout(workout));
+        let (html, mode) = Telegram.render(&View::SessionRoster(roster));
         assert_eq!(mode, Some("HTML"));
         let expected = "<b>Upper push + lat focus</b>\n\
                         \n2 days rest on bench and your last session was easy, so we push the weight.\n\
@@ -309,12 +309,12 @@ mod tests {
         assert_eq!(html, expected);
     }
 
-    fn one_exercise_workout() -> WorkoutView {
-        use gymbuddy_proto::PlannedExerciseView;
-        WorkoutView {
+    fn one_exercise_roster() -> SessionRosterView {
+        use gymbuddy_proto::RosterExerciseView;
+        SessionRosterView {
             title: "Upper".into(),
             rationale: None,
-            exercises: vec![PlannedExerciseView {
+            exercises: vec![RosterExerciseView {
                 name: "Bench Press".into(),
                 target_sets: Some(3),
                 target_reps: Some(6),
@@ -329,10 +329,10 @@ mod tests {
     /// [C1.4]: a programme-slot design carries an italic mode line under the title;
     /// the rest of the layout is the untouched ad-hoc one.
     #[test]
-    fn program_workout_html_names_the_slot() {
-        let view = View::ProgramWorkout {
-            workout: one_exercise_workout(),
-            mode: TrainingModeView::Program { program_title: "12-week <plan>".into(), week: 2, day: 1, focus: "upper".into() },
+    fn programme_session_roster_html_names_the_slot() {
+        let view = View::ProgrammeSessionRoster {
+            roster: one_exercise_roster(),
+            mode: TrainingModeView::Programme { programme_title: "12-week <plan>".into(), week: 2, day: 1, focus: "upper".into() },
         };
         let (html, mode) = Telegram.render(&view);
         assert_eq!(mode, Some("HTML"));
@@ -347,10 +347,10 @@ mod tests {
     /// [C1.4]: an explicit one-off during an active programme says so, and says the
     /// programme is untouched.
     #[test]
-    fn ad_hoc_workout_under_a_programme_says_it_is_untouched() {
-        let view = View::ProgramWorkout {
-            workout: one_exercise_workout(),
-            mode: TrainingModeView::AdHoc { program_title: "12-week hypertrophy".into() },
+    fn ad_hoc_roster_under_a_programme_says_it_is_untouched() {
+        let view = View::ProgrammeSessionRoster {
+            roster: one_exercise_roster(),
+            mode: TrainingModeView::AdHoc { programme_title: "12-week hypertrophy".into() },
         };
         let (html, _) = Telegram.render(&view);
         assert!(html.contains("<i>Ad-hoc session — 12-week hypertrophy is untouched</i>\n"), "got: {html}");

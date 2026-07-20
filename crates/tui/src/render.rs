@@ -4,7 +4,7 @@
 //! headings, bullets, and space-aligned columns (no bordered `Table` widget,
 //! which clashes with the flowing transcript).
 
-use gymbuddy_proto::{CatalogView, ExerciseLog, HistoryView, SetLine, StatusView, TrainingModeView, View, WorkoutView};
+use gymbuddy_proto::{CatalogView, ExerciseLog, HistoryView, SessionRosterView, SetLine, StatusView, TrainingModeView, View};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -23,8 +23,8 @@ pub fn render_view(view: &View) -> Vec<Line<'static>> {
         View::Status(status) => render_status(status),
         View::Catalog(catalog) => render_catalog(catalog),
         View::History(history) => render_history(history),
-        View::Workout(workout) => render_workout(workout, None),
-        View::ProgramWorkout { workout, mode } => render_workout(workout, Some(mode)),
+        View::SessionRoster(roster) => render_session_roster(roster, None),
+        View::ProgrammeSessionRoster { roster, mode } => render_session_roster(roster, Some(mode)),
         View::Timers { enabled } => vec![Line::from(Span::styled(
             format!("Rest timers {}", if *enabled { "on" } else { "off" }),
             Style::default().fg(if *enabled { SUCCESS } else { MUTED }).add_modifier(Modifier::BOLD),
@@ -131,26 +131,26 @@ fn render_history(history: &HistoryView) -> Vec<Line<'static>> {
     lines
 }
 
-/// Render a designed workout; `mode` (present only when a programme is active,
-/// [C1.4]) adds one muted line under the title saying whether this fills the
-/// programme's current slot or deliberately sidesteps it. `None` — ad-hoc with no
-/// programme — keeps the pre-programme layout untouched.
-fn render_workout(workout: &WorkoutView, mode: Option<&TrainingModeView>) -> Vec<Line<'static>> {
-    let mut lines = vec![heading(workout.title.clone())];
+/// Render a designed session roster; `mode` (present only when a programme is
+/// active, [C1.4]) adds one muted line under the title saying whether this fills
+/// the programme's current slot or deliberately sidesteps it. `None` — ad-hoc with
+/// no programme — keeps the pre-programme layout untouched.
+fn render_session_roster(roster: &SessionRosterView, mode: Option<&TrainingModeView>) -> Vec<Line<'static>> {
+    let mut lines = vec![heading(roster.title.clone())];
 
     if let Some(mode) = mode {
         lines.push(muted(mode.summary()));
     }
 
-    if let Some(rationale) = &workout.rationale
+    if let Some(rationale) = &roster.rationale
         && !rationale.trim().is_empty()
     {
         lines.extend(rationale.split('\n').map(|l| muted(l.to_string())));
     }
 
-    if !workout.exercises.is_empty() {
+    if !roster.exercises.is_empty() {
         lines.push(Line::from(""));
-        for (i, exercise) in workout.exercises.iter().enumerate() {
+        for (i, exercise) in roster.exercises.iter().enumerate() {
             let target = exercise.target_line();
             let target_part = if target.is_empty() { String::new() } else { format!(" — {target}") };
             lines.push(Line::from(vec![
@@ -166,10 +166,10 @@ fn render_workout(workout: &WorkoutView, mode: Option<&TrainingModeView>) -> Vec
         }
     }
 
-    if !workout.notes.is_empty() {
+    if !roster.notes.is_empty() {
         lines.push(Line::from(""));
         lines.push(bold("Notes"));
-        for note in &workout.notes {
+        for note in &roster.notes {
             lines.push(Line::from(vec![Span::styled("  • ", Style::default().fg(MUTED)), Span::raw(note.clone())]));
         }
     }
@@ -250,12 +250,12 @@ mod tests {
     }
 
     #[test]
-    fn workout_renders_plan_without_markup() {
-        use gymbuddy_proto::{PlannedExerciseView, WorkoutView};
-        let view = View::Workout(WorkoutView {
+    fn session_roster_renders_the_prescription_without_markup() {
+        use gymbuddy_proto::{RosterExerciseView, SessionRosterView};
+        let view = View::SessionRoster(SessionRosterView {
             title: "Push focus".into(),
             rationale: Some("Bench was easy last time.".into()),
-            exercises: vec![PlannedExerciseView {
+            exercises: vec![RosterExerciseView {
                 name: "Bench Press".into(),
                 target_sets: Some(3),
                 target_reps: Some(6),
@@ -274,20 +274,20 @@ mod tests {
         assert!(!text.contains('<'), "no HTML markup should appear: {text}");
     }
 
-    /// [C1.4]: a workout designed under an active programme carries its mode line;
+    /// [C1.4]: a roster designed under an active programme carries its mode line;
     /// both modes name the programme so the user always knows what today counts for.
     #[test]
-    fn program_workout_renders_the_mode_line() {
-        use gymbuddy_proto::WorkoutView;
-        let workout = WorkoutView { title: "Upper".into(), rationale: None, exercises: vec![], notes: vec![] };
+    fn programme_session_roster_renders_the_mode_line() {
+        use gymbuddy_proto::SessionRosterView;
+        let roster = SessionRosterView { title: "Upper".into(), rationale: None, exercises: vec![], notes: vec![] };
 
-        let slot = View::ProgramWorkout {
-            workout: workout.clone(),
-            mode: TrainingModeView::Program { program_title: "12-week".into(), week: 2, day: 1, focus: "upper".into() },
+        let slot = View::ProgrammeSessionRoster {
+            roster: roster.clone(),
+            mode: TrainingModeView::Programme { programme_title: "12-week".into(), week: 2, day: 1, focus: "upper".into() },
         };
         assert!(flat(&render_view(&slot)).contains("Programme: 12-week — week 2, day 1: upper"));
 
-        let ad_hoc = View::ProgramWorkout { workout, mode: TrainingModeView::AdHoc { program_title: "12-week".into() } };
+        let ad_hoc = View::ProgrammeSessionRoster { roster, mode: TrainingModeView::AdHoc { programme_title: "12-week".into() } };
         assert!(flat(&render_view(&ad_hoc)).contains("Ad-hoc session — 12-week is untouched"));
     }
 
