@@ -14,13 +14,13 @@ mod metrics;
 // legacy, without publishing the migration set itself.
 pub(crate) mod migrations;
 mod models;
-mod planner;
-mod programs;
+mod philosophy;
+mod programmes;
 mod progress;
+mod rosters;
 mod users;
 
 pub use body_metrics::canonical_body_metric;
 pub use database::Database;
-pub use entries::{EntryReclassifyOutcome, SetEdit, SetEditError, SetEditOutcome};
+pub use entries::{EntryReclassifyOutcome, EntryWithSets, SessionWithSets, SetEdit, SetEditError, SetEditOutcome};
 pub use models::*;
-pub use planner::{EntryWithSets, SessionWithSets};

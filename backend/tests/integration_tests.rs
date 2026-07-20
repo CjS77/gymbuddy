@@ -8,32 +8,30 @@ fn fixture_loads_completely() {
     let f = build_fixture();
     let db = &f.db;
 
-    let user_count: i64 = db.conn().query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).unwrap();
-    assert_eq!(user_count, 2);
+    assert_eq!(db.list_users().unwrap().len(), 2);
 
-    let session_count: i64 = db.conn().query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap();
+    let session_count = [f.alice_id, f.bob_id].iter().map(|id| db.count_sessions_for_user(*id).unwrap()).sum::<i64>();
     assert!(session_count >= 30, "expected ≥30 sessions across both users, got {session_count}");
 
-    let set_count: i64 = db.conn().query_row("SELECT COUNT(*) FROM sets", [], |r| r.get(0)).unwrap();
+    let set_count: usize = [f.alice_id, f.bob_id].iter().map(|id| db.list_sets_for_user(*id, None, None).unwrap().len()).sum();
     assert!(set_count >= 100);
 
-    let goal_count: i64 = db.conn().query_row("SELECT COUNT(*) FROM goals", [], |r| r.get(0)).unwrap();
+    // A window wide enough to catch every seeded goal, achieved ones included —
+    // `list_active_goals` would hide Alice's completed bench goal.
+    let goal_count: usize =
+        [f.alice_id, f.bob_id].iter().map(|id| db.list_goals_in_period(*id, "2000-01-01", "2100-01-01").unwrap().len()).sum();
     assert_eq!(goal_count, 3);
 }
 
 #[test]
 fn invariant_closed_sessions_have_no_open_entries() {
     let f = build_fixture();
-    let leaks: i64 =
-        f.db.conn()
-            .query_row(
-                "SELECT COUNT(*) FROM exercise_entries ee \
-             JOIN sessions s ON ee.session_id = s.id \
-             WHERE s.ended_at IS NOT NULL AND ee.end_timestamp IS NULL",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
+    let leaks: usize = [f.alice_id, f.bob_id]
+        .iter()
+        .flat_map(|id| f.db.list_sessions(*id, None, None).unwrap())
+        .filter(|session| session.ended_at.is_some())
+        .map(|session| f.db.list_open_entries_for_session(session.id).unwrap().len())
+        .sum();
     assert_eq!(leaks, 0, "ended sessions must have no open exercise_entry");
 }
 
@@ -127,11 +125,7 @@ fn access_control_across_seeded_groups() {
 #[test]
 fn conversation_history_present() {
     let f = build_fixture();
-    let msg_count: i64 =
-        f.db.conn()
-            .query_row("SELECT COUNT(*) FROM conversation_history WHERE user_id = ?1", rusqlite::params![f.alice_id], |r| r.get(0))
-            .unwrap();
-    assert!(msg_count >= 20);
+    assert!(f.db.count_messages_for_user(f.alice_id).unwrap() >= 20);
 }
 
 #[test]

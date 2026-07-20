@@ -159,9 +159,7 @@ going in the existing session — and I'll log that set accordingly."
             };
             if let Some(sid) = session_id {
                 let db = self.db.lock().await;
-                db.conn()
-                    .execute("UPDATE sessions SET started_at = datetime('now') WHERE id = ?1", rusqlite::params![sid])
-                    .context("bumping session started_at for continuity-same")?;
+                db.touch_session_started_at(sid)?;
             }
             tracing::debug!(%quoted, "session continuity resume: SAME workout");
         }

@@ -270,6 +270,47 @@ impl fmt::Display for HealthEntryType {
     }
 }
 
+/// How much a [`HealthEntry`] constrains training. The v2 `health_entries.severity`
+/// CHECK is `('mild','moderate','severe')`, and the column has always held exactly
+/// those three strings — this makes the type say so.
+///
+/// It is not decoration: [C5.4] graduates the designer's response by severity —
+/// mild means work around it, severe means do not train it — and a free-text column
+/// cannot be matched exhaustively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    Mild,
+    Moderate,
+    Severe,
+}
+
+impl Severity {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Mild => "mild",
+            Self::Moderate => "moderate",
+            Self::Severe => "severe",
+        }
+    }
+
+    /// Anything unrecognised reads as [`Self::Mild`], matching the column default:
+    /// an unparseable severity must never silently escalate to "do not train".
+    pub fn from_str_loose(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "moderate" => Self::Moderate,
+            "severe" => Self::Severe,
+            _ => Self::Mild,
+        }
+    }
+}
+
+impl fmt::Display for Severity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccessLevel {
@@ -564,7 +605,7 @@ pub struct HealthEntry {
     pub user_id: i64,
     pub entry_type: HealthEntryType,
     pub body_part: Option<String>,
-    pub severity: String,
+    pub severity: Severity,
     pub description: String,
     pub started_at: String,
     pub resolved_at: Option<String>,
@@ -797,7 +838,7 @@ pub fn new_health_entry(user_id: i64, entry_type: HealthEntryType, description: 
         user_id,
         entry_type,
         body_part: None,
-        severity: "mild".to_string(),
+        severity: Severity::Mild,
         description: description.to_string(),
         started_at: now.clone(),
         resolved_at: None,
@@ -822,7 +863,7 @@ pub fn new_conversation_message(user_id: i64, platform: &str, role: Conversation
     }
 }
 
-// ── Workout planner ────────────────────────────────────────────────────────────
+// ── Philosophy and session rosters ─────────────────────────────────────────────
 
 /// One append-only entry in a user's distilled training philosophy. The most
 /// recent row is the active philosophy; equipment lives as free text in `content`.
@@ -848,77 +889,83 @@ pub struct InterviewState {
     pub started_at: String,
 }
 
+/// The lifecycle a [`SessionRoster`] and a [`Programme`] both follow: `Draft` while it is being
+/// designed, `Active` once it is under way, then `Completed` or `Abandoned`.
+///
+/// One enum for both because the two are the same four states over the same stored strings —
+/// `session_rosters.status` and `programmes.status` carry identical v2 CHECK constraints
+/// (`'draft','active','completed','abandoned'`), so [`Self::as_str`] must keep returning exactly
+/// those values or every write fails the constraint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PlanStatus {
-    Proposed,
+pub enum LifecycleStatus {
+    Draft,
     Active,
     Completed,
     Abandoned,
 }
 
-impl PlanStatus {
-    /// Schema v2 spells the first state `draft`, so a roster and a programme share one lifecycle
-    /// vocabulary — the two enums merge into `LifecycleStatus` when the Rust types are renamed.
-    /// The variant is still called `Proposed`; only the stored value has moved.
+impl LifecycleStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Proposed => "draft",
+            Self::Draft => "draft",
             Self::Active => "active",
             Self::Completed => "completed",
             Self::Abandoned => "abandoned",
         }
     }
 
-    /// `draft` and v1's `proposed` both parse to [`Self::Proposed`], since this also reads rows
-    /// that came from a legacy database by way of a dump.
+    /// `draft` and v1's `proposed` both parse to [`Self::Draft`] — v1 spelled a roster's first
+    /// state `proposed`, and rows arriving through a dump of a legacy database still say so. The
+    /// importer ([R1.3]) relies on that, so the acceptance must stay even though nothing writes it.
     pub fn from_str_loose(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "active" => Self::Active,
             "completed" => Self::Completed,
             "abandoned" => Self::Abandoned,
-            _ => Self::Proposed,
+            _ => Self::Draft,
         }
     }
 }
 
-impl fmt::Display for PlanStatus {
+impl fmt::Display for LifecycleStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
-/// A generated workout plan. Designed by `/nextworkout` (status `Proposed`),
-/// bound to a session and marked `Active` during guided execution, then
-/// `Completed` when the session ends. A plan never logs sets itself.
+/// The set of exercises designed for one session — the built-session artifact.
+/// Designed by `/nextworkout` (status `Draft`), bound to a session and marked
+/// `Active` during guided execution, then `Completed` when the session ends. A
+/// roster prescribes; it never logs sets itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkoutPlan {
+pub struct SessionRoster {
     pub id: i64,
     pub user_id: i64,
     pub title: String,
     pub rationale: Option<String>,
     pub philosophy_id: Option<i64>,
-    pub status: PlanStatus,
+    pub status: LifecycleStatus,
     pub session_id: Option<i64>,
     /// A one-off, today-only override the user voiced mid-workout (e.g. "no bench
-    /// today, do flys instead"). Scoped to THIS plan: it never touches the
-    /// philosophy and expires when the plan completes or is superseded.
+    /// today, do flys instead"). Scoped to THIS roster: it never touches the
+    /// philosophy and expires when the roster completes or is superseded.
     pub override_note: Option<String>,
-    /// The programme slot this plan filled, or `None` for an ad-hoc plan —
+    /// The programme slot this roster filled, or `None` for an ad-hoc roster —
     /// the first-class default; binding to a slot is a separate, optional step.
     #[serde(default)]
-    pub program_slot_id: Option<i64>,
+    pub programme_slot_id: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
 }
 
-/// A single prescribed exercise within a [`WorkoutPlan`]. `(target_reps,
+/// A single prescribed exercise within a [`SessionRoster`]. `(target_reps,
 /// target_weight_kg)` cover the weight_reps case; `target_secs` covers timed
 /// work. `target_sets` is the prescribed number of sets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkoutPlanExercise {
+pub struct RosterExercise {
     pub id: i64,
-    pub plan_id: i64,
+    pub roster_id: i64,
     pub exercise_type_id: i64,
     pub order_idx: i32,
     pub target_sets: Option<i32>,
@@ -943,13 +990,13 @@ pub struct PerformedRollup {
     pub avg_secs: Option<f64>,
 }
 
-/// The gap between what a plan prescribed and what a session performed for one
+/// The gap between what a roster prescribed and what a session performed for one
 /// exercise present on both sides.
 ///
 /// Every `*_delta` is signed `performed − prescribed`: **positive means the
 /// athlete exceeded the prescription, negative means they fell short, zero means
 /// they hit it.** Deviation is signal, not failure — a consistent overshoot means
-/// the plan under-prescribes, a consistent shortfall means it over-prescribes — so
+/// the roster under-prescribes, a consistent shortfall means it over-prescribes — so
 /// consumers (the post-session report, the next-run designer, progression) must
 /// read the sign and magnitude, never treat a non-zero delta as an error. A delta
 /// is `None` when the prescription or the performance left that dimension unset.
@@ -957,8 +1004,8 @@ pub struct PerformedRollup {
 pub struct ExerciseDelta {
     pub exercise_name: String,
     pub measurement_type: MeasurementType,
-    /// The plan's prescription for this exercise (targets, order, notes).
-    pub prescribed: WorkoutPlanExercise,
+    /// The roster's prescription for this exercise (targets, order, notes).
+    pub prescribed: RosterExercise,
     /// The session's rolled-up performance for this exercise.
     pub performed: PerformedRollup,
     /// `performed_sets − target_sets`.
@@ -971,16 +1018,16 @@ pub struct ExerciseDelta {
     pub secs_delta: Option<f64>,
 }
 
-/// An exercise the plan prescribed that the session never performed
-/// (planned-not-performed). Skipping is signal too, not an error.
+/// An exercise the roster prescribed that the session never performed
+/// (rostered-not-performed). Skipping is signal too, not an error.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkippedExercise {
     pub exercise_name: String,
-    pub prescribed: WorkoutPlanExercise,
+    pub prescribed: RosterExercise,
 }
 
-/// An exercise the session performed that the plan never prescribed
-/// (performed-not-planned) — an improvised addition, not an error.
+/// An exercise the session performed that the roster never prescribed
+/// (performed-not-rostered) — an improvised addition, not an error.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnplannedExercise {
     pub exercise_type_id: i64,
@@ -989,17 +1036,17 @@ pub struct UnplannedExercise {
     pub performed: PerformedRollup,
 }
 
-/// The full prescribed-vs-actual comparison for a plan bound to a session: the
+/// The full prescribed-vs-actual comparison for a roster bound to a session: the
 /// matched exercises with their signed deltas, the prescribed exercises that were
-/// skipped, and the performed exercises that were never planned. Closes the loop
-/// between what the plan asked for and what the session did.
+/// skipped, and the performed exercises that were never rostered. Closes the loop
+/// between what the roster asked for and what the session did.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlanVsActual {
-    pub plan_id: i64,
+pub struct RosterVsActual {
+    pub roster_id: i64,
     pub session_id: i64,
-    /// Prescribed and performed, in plan order, with signed deltas.
+    /// Prescribed and performed, in roster order, with signed deltas.
     pub matched: Vec<ExerciseDelta>,
-    /// Prescribed but not performed, in plan order.
+    /// Prescribed but not performed, in roster order.
     pub skipped: Vec<SkippedExercise>,
     /// Performed but not prescribed, in the order first logged.
     pub unplanned: Vec<UnplannedExercise>,
@@ -1007,46 +1054,7 @@ pub struct PlanVsActual {
 
 // ── Programmes ─────────────────────────────────────────────────────────────────
 
-/// Lifecycle of a [`Program`]: `Draft` while it is being designed, `Active`
-/// once the user commits (at most one per user, enforced by
-/// [`Database::activate_program`](super::Database)), then `Completed` or
-/// `Abandoned`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProgramStatus {
-    Draft,
-    Active,
-    Completed,
-    Abandoned,
-}
-
-impl ProgramStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Draft => "draft",
-            Self::Active => "active",
-            Self::Completed => "completed",
-            Self::Abandoned => "abandoned",
-        }
-    }
-
-    pub fn from_str_loose(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "active" => Self::Active,
-            "completed" => Self::Completed,
-            "abandoned" => Self::Abandoned,
-            _ => Self::Draft,
-        }
-    }
-}
-
-impl fmt::Display for ProgramStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// Lifecycle of a [`ProgramSlot`]: `Pending` until a designed plan binds to it
+/// Lifecycle of a [`ProgrammeSlot`]: `Pending` until a designed roster binds to it
 /// (`Filled`), `Missed` when its week passes untouched, `Skipped` when
 /// deliberately dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1088,8 +1096,11 @@ impl fmt::Display for SlotStatus {
 /// goals served (via `programme_goals`), dates, split and progression policy;
 /// each session keeps being designed on demand against it. `split` and
 /// `progression_policy` are free text the LLM reads — no query looks inside.
+///
+/// At most one programme per user is [`LifecycleStatus::Active`], enforced by
+/// [`Database::activate_programme`](super::Database).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Program {
+pub struct Programme {
     pub id: i64,
     pub user_id: i64,
     pub title: String,
@@ -1099,32 +1110,32 @@ pub struct Program {
     pub days_per_week: i32,
     pub split: String,
     pub progression_policy: String,
-    pub status: ProgramStatus,
+    pub status: LifecycleStatus,
     pub created_at: String,
     pub updated_at: String,
 }
 
-/// A mesocycle block within a [`Program`]: an inclusive 1-based week range with
+/// A mesocycle block within a [`Programme`]: an inclusive 1-based week range with
 /// an intent (weeks 1–4 "hypertrophy", 5–6 "deload"). The designer reads the
 /// block the current week falls in and progresses within it — this is what
 /// makes sessions build on one another rather than repeat.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProgramBlock {
+pub struct ProgrammeBlock {
     pub id: i64,
-    pub program_id: i64,
+    pub programme_id: i64,
     pub start_week: i32,
     pub end_week: i32,
     pub focus: String,
     pub notes: Option<String>,
 }
 
-/// One cell of a [`Program`]'s week/day grid. `week_idx` is 1-based from the
+/// One cell of a [`Programme`]'s week/day grid. `week_idx` is 1-based from the
 /// programme start; `day_idx` is the 1-based ordinal training day within the
 /// week (not a calendar weekday).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProgramSlot {
+pub struct ProgrammeSlot {
     pub id: i64,
-    pub program_id: i64,
+    pub programme_id: i64,
     pub week_idx: i32,
     pub day_idx: i32,
     pub focus: String,
@@ -1140,18 +1151,18 @@ pub struct ProgramSlot {
 /// [`gymbuddy_proto::TrainingModeView`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TrainingMode {
-    /// A one-off design. `program` is the active programme deliberately sat out
+    /// A one-off design. `programme` is the active programme deliberately sat out
     /// (or already fully resolved), `None` when the user has no programme at all —
     /// in which case behaviour is exactly the pre-programme one.
-    AdHoc { program: Option<Program> },
-    /// The design fills `slot` of the active `program`; persisting it stamps the
-    /// plan's `program_slot_id` and marks the slot filled.
-    Program { program: Program, slot: ProgramSlot },
+    AdHoc { programme: Option<Programme> },
+    /// The design fills `slot` of the active `programme`; persisting it stamps the
+    /// roster's `programme_slot_id` and marks the slot filled.
+    Programme { programme: Programme, slot: ProgrammeSlot },
 }
 
-pub fn new_program(user_id: i64, title: &str, days_per_week: i32, split: &str, progression_policy: &str) -> Program {
+pub fn new_programme(user_id: i64, title: &str, days_per_week: i32, split: &str, progression_policy: &str) -> Programme {
     let now = now_str();
-    Program {
+    Programme {
         id: 0,
         user_id,
         title: title.to_string(),
@@ -1160,16 +1171,16 @@ pub fn new_program(user_id: i64, title: &str, days_per_week: i32, split: &str, p
         days_per_week,
         split: split.to_string(),
         progression_policy: progression_policy.to_string(),
-        status: ProgramStatus::Draft,
+        status: LifecycleStatus::Draft,
         created_at: now.clone(),
         updated_at: now,
     }
 }
 
-pub fn new_program_block(program_id: i64, start_week: i32, end_week: i32, focus: &str) -> ProgramBlock {
-    ProgramBlock { id: 0, program_id, start_week, end_week, focus: focus.to_string(), notes: None }
+pub fn new_programme_block(programme_id: i64, start_week: i32, end_week: i32, focus: &str) -> ProgrammeBlock {
+    ProgrammeBlock { id: 0, programme_id, start_week, end_week, focus: focus.to_string(), notes: None }
 }
 
-pub fn new_program_slot(program_id: i64, week_idx: i32, day_idx: i32, focus: &str) -> ProgramSlot {
-    ProgramSlot { id: 0, program_id, week_idx, day_idx, focus: focus.to_string(), status: SlotStatus::Pending, updated_at: now_str() }
+pub fn new_programme_slot(programme_id: i64, week_idx: i32, day_idx: i32, focus: &str) -> ProgrammeSlot {
+    ProgrammeSlot { id: 0, programme_id, week_idx, day_idx, focus: focus.to_string(), status: SlotStatus::Pending, updated_at: now_str() }
 }

@@ -6,6 +6,13 @@ use super::models::{
     Difficulty, ExerciseEntry, ExerciseSet, ExerciseTypeWithAncestry, MeasurementType, Session, SessionFeel, SessionSummary,
 };
 
+/// An exercise entry paired with the sets logged into it.
+pub type EntryWithSets = (ExerciseEntry, Vec<ExerciseSet>);
+
+/// A session paired with its entries and their sets — how the `/nextworkout`
+/// designer reads recent history.
+pub type SessionWithSets = (Session, Vec<EntryWithSets>);
+
 // ── Sessions ───────────────────────────────────────────────────────────────────
 
 fn row_to_session(row: &Row) -> rusqlite::Result<Session> {
@@ -59,6 +66,43 @@ impl Database {
         let id = self.conn().last_insert_rowid();
         let session = self.get_session(id)?.context("Session disappeared immediately after insert")?;
         Ok(session)
+    }
+
+    /// Insert a session at explicit timestamps, returning its id. `sessions` has a
+    /// single writer (this module), so history fixtures and back-dated seeds come
+    /// through here rather than reaching for the connection.
+    pub fn start_session_at(
+        &self,
+        user_id: i64,
+        started_at: &str,
+        ended_at: Option<&str>,
+        intent: Option<&str>,
+    ) -> anyhow::Result<i64> {
+        self.conn().execute(
+            "INSERT INTO sessions (user_id, started_at, ended_at, intent) VALUES (?1, ?2, ?3, ?4)",
+            params![user_id, started_at, ended_at, intent],
+        )?;
+        Ok(self.conn().last_insert_rowid())
+    }
+
+    /// Reset a session's start to now. The continuity check reads the gap since
+    /// `started_at` to decide whether a pending set belongs to the open session; when
+    /// the user confirms it is the same workout, bumping the start makes the gap zero
+    /// so the same prompt cannot fire twice on one turn.
+    pub fn touch_session_started_at(&self, session_id: i64) -> anyhow::Result<()> {
+        let rows = self
+            .conn()
+            .execute("UPDATE sessions SET started_at = datetime('now') WHERE id = ?1", params![session_id])
+            .context("bumping session started_at for continuity-same")?;
+        anyhow::ensure!(rows > 0, "session id {session_id} not found");
+        Ok(())
+    }
+
+    /// How many sessions the user has ever logged.
+    pub fn count_sessions_for_user(&self, user_id: i64) -> anyhow::Result<i64> {
+        self.conn()
+            .query_row("SELECT COUNT(*) FROM sessions WHERE user_id = ?1", params![user_id], |row| row.get(0))
+            .context("Failed to count sessions for user")
     }
 
     /// End a session and cascade-close every still-open exercise_entry that
@@ -184,6 +228,32 @@ impl Database {
         let rows = stmt.query_map(params![user_id, period], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<Result<Vec<_>, _>>().context("Failed to query session count by week")
     }
+
+    // ── History for the designer ──────────────────────────────────────────────────
+
+    /// The last `limit` sessions (most recent first), each with its exercise
+    /// entries and their sets, for the `/nextworkout` designer prompt.
+    ///
+    /// Lives here rather than with the roster DAO that calls it: every table it
+    /// touches — sessions, exercise_entries, sets — belongs to this module.
+    pub fn recent_sessions_with_sets(&self, user_id: i64, limit: usize) -> anyhow::Result<Vec<SessionWithSets>> {
+        let sessions = self.list_sessions(user_id, None, None)?;
+        sessions
+            .into_iter()
+            .take(limit)
+            .map(|session| {
+                let entries = self
+                    .list_entries_for_session(session.id)?
+                    .into_iter()
+                    .map(|entry| {
+                        let sets = self.list_sets_for_entry(entry.id)?;
+                        Ok((entry, sets))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                Ok((session, entries))
+            })
+            .collect()
+    }
 }
 
 // ── Exercise entries ───────────────────────────────────────────────────────────
@@ -224,6 +294,20 @@ impl Database {
         )?;
         anyhow::ensure!(rows > 0, "exercise_entry id {entry_id} not found or already closed");
         Ok(())
+    }
+
+    /// Close an entry at an explicit timestamp rather than now — used to reconcile
+    /// an entry that leaked past the end of its session, where the honest close time
+    /// is the session's `ended_at`, not whenever the leak was noticed.
+    ///
+    /// Returns whether a row was closed: an already-closed entry is not an error
+    /// here, since the caller is sweeping speculatively.
+    pub fn end_entry_at(&self, entry_id: i64, end_timestamp: &str) -> anyhow::Result<bool> {
+        let rows = self.conn().execute(
+            "UPDATE exercise_entries SET end_timestamp = ?1 WHERE id = ?2 AND end_timestamp IS NULL",
+            params![end_timestamp, entry_id],
+        )?;
+        Ok(rows > 0)
     }
 
     pub fn get_entry(&self, id: i64) -> anyhow::Result<Option<ExerciseEntry>> {
@@ -829,6 +913,68 @@ mod tests {
         let user_id = db.insert_user(&user).unwrap();
         let bp = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
         (db, user_id, bp.id)
+    }
+
+    #[test]
+    fn recent_sessions_with_sets_returns_history() {
+        let (db, user_id, bp_id) = fixture();
+
+        let session = db.start_session(user_id, None).unwrap();
+        let entry_id = db.insert_entry(&new_exercise_entry(user_id, Some(session.id), None)).unwrap();
+        let mut set = new_exercise_set(entry_id, bp_id, MeasurementType::WeightReps, 60.0);
+        set.count = Some(8);
+        db.insert_set(&set).unwrap();
+
+        let history = db.recent_sessions_with_sets(user_id, 5).unwrap();
+        assert_eq!(history.len(), 1);
+        let (got_session, entries) = &history[0];
+        assert_eq!(got_session.id, session.id);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1.len(), 1);
+        assert_eq!(entries[0].1[0].value, 60.0);
+    }
+
+    /// `start_session_at` is the DAO's answer to back-dated fixtures — the reason
+    /// `conn()` no longer needs to be reachable from outside `crate::db`.
+    #[test]
+    fn start_session_at_records_the_given_timestamps() {
+        let (db, user_id, _) = fixture();
+        let id = db.start_session_at(user_id, "2025-03-01 09:00:00", Some("2025-03-01 10:30:00"), Some("Week 1")).unwrap();
+
+        let session = db.get_session(id).unwrap().unwrap();
+        assert_eq!(session.started_at, "2025-03-01 09:00:00");
+        assert_eq!(session.ended_at.as_deref(), Some("2025-03-01 10:30:00"));
+        assert_eq!(session.notes.as_deref(), Some("Week 1"));
+        assert_eq!(db.count_sessions_for_user(user_id).unwrap(), 1);
+    }
+
+    /// Closing a leaked entry at the parent session's `ended_at` must not disturb an
+    /// entry that was already closed, and reports whether it did anything.
+    #[test]
+    fn end_entry_at_closes_only_an_open_entry() {
+        let (db, user_id, _) = fixture();
+        let session = db.start_session(user_id, None).unwrap();
+        let entry_id = db.insert_entry(&new_exercise_entry(user_id, Some(session.id), None)).unwrap();
+
+        assert!(db.end_entry_at(entry_id, "2025-03-01 10:30:00").unwrap());
+        assert_eq!(db.get_entry(entry_id).unwrap().unwrap().end_timestamp.as_deref(), Some("2025-03-01 10:30:00"));
+
+        // Already closed: no second write, and no error either — the caller sweeps
+        // speculatively over entries that may or may not have leaked.
+        assert!(!db.end_entry_at(entry_id, "2025-03-02 11:00:00").unwrap());
+        assert_eq!(db.get_entry(entry_id).unwrap().unwrap().end_timestamp.as_deref(), Some("2025-03-01 10:30:00"));
+    }
+
+    /// Bumping `started_at` is how continuity-resume zeroes the gap; a missing
+    /// session is an error rather than a silent no-op.
+    #[test]
+    fn touch_session_started_at_moves_the_start_and_rejects_an_unknown_session() {
+        let (db, user_id, _) = fixture();
+        let id = db.start_session_at(user_id, "2025-03-01 09:00:00", None, None).unwrap();
+
+        db.touch_session_started_at(id).unwrap();
+        assert_ne!(db.get_session(id).unwrap().unwrap().started_at, "2025-03-01 09:00:00");
+        assert!(db.touch_session_started_at(id + 999).is_err());
     }
 
     #[test]

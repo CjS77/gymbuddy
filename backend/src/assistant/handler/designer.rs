@@ -14,7 +14,7 @@ use crate::assistant::prompts::{build_designer_prompt, format_muscle_recovery, f
 use crate::config::DesignerHistoryConfig;
 use crate::db::{
     Database, EntryWithSets, ExerciseSet, GoalProgress, MeasurementType, Session, SessionWithSets, TrainingMode, User, WorkoutPhilosophy,
-    WorkoutPlanExercise,
+    RosterExercise,
 };
 
 use super::AssistantHandler;
@@ -100,7 +100,7 @@ impl AssistantHandler {
     /// than failing the whole design.
     ///
     /// In programme mode the plan is stamped with the slot it fills; in ad-hoc mode
-    /// its `program_slot_id` stays NULL and no slot status moves — a one-off under an
+    /// its `programme_slot_id` stays NULL and no slot status moves — a one-off under an
     /// active programme never touches adherence.
     async fn persist_and_view_workout(
         &self,
@@ -115,9 +115,9 @@ impl AssistantHandler {
         let mut notes: Vec<String> = Vec::new();
 
         let db = self.db.lock().await;
-        let plan_id = db.create_plan(user.id, &title, rationale.as_deref(), Some(philosophy.id))?;
-        if let TrainingMode::Program { slot, .. } = mode {
-            db.bind_plan_to_slot(plan_id, slot.id)?;
+        let plan_id = db.create_roster(user.id, &title, rationale.as_deref(), Some(philosophy.id))?;
+        if let TrainingMode::Programme { slot, .. } = mode {
+            db.bind_roster_to_slot(plan_id, slot.id)?;
             tracing::debug!(plan_id, slot_id = slot.id, "Designed workout bound to programme slot");
         }
 
@@ -126,9 +126,9 @@ impl AssistantHandler {
                 notes.push(format!("Skipped \"{}\" -- I couldn't match it to a known exercise.", ex.exercise));
                 continue;
             };
-            db.add_plan_exercise(&WorkoutPlanExercise {
+            db.add_roster_exercise(&RosterExercise {
                 id: 0,
-                plan_id,
+                roster_id: plan_id,
                 exercise_type_id: et.exercise_type.id,
                 order_idx: idx as i32,
                 target_sets: ex.target_sets,
@@ -342,10 +342,12 @@ fn split_ad_hoc_marker(guidance: &str) -> (bool, String) {
 /// so a user with no programme sees exactly today's output.
 fn mode_view(mode: &TrainingMode) -> Option<TrainingModeView> {
     match mode {
-        TrainingMode::AdHoc { program: None } => None,
-        TrainingMode::AdHoc { program: Some(program) } => Some(TrainingModeView::AdHoc { program_title: program.title.clone() }),
-        TrainingMode::Program { program, slot } => Some(TrainingModeView::Program {
-            program_title: program.title.clone(),
+        TrainingMode::AdHoc { programme: None } => None,
+        TrainingMode::AdHoc { programme: Some(programme) } => {
+            Some(TrainingModeView::AdHoc { program_title: programme.title.clone() })
+        }
+        TrainingMode::Programme { programme, slot } => Some(TrainingModeView::Program {
+            program_title: programme.title.clone(),
             week: slot.week_idx.max(0) as u32,
             day: slot.day_idx.max(0) as u32,
             focus: slot.focus.clone(),
@@ -396,10 +398,10 @@ mod tests {
         assert!(!text.contains("Programme:") && !text.contains("Ad-hoc session"), "no mode line without a programme: {text}");
 
         let db = handler.db.lock().await;
-        let plan = db.latest_proposed_plan(user.id).unwrap().expect("a proposed plan should be persisted");
+        let plan = db.latest_draft_roster(user.id).unwrap().expect("a proposed plan should be persisted");
         assert_eq!(plan.title, "Upper push");
-        assert_eq!(plan.program_slot_id, None, "a plan designed with no programme is ad-hoc");
-        assert_eq!(db.list_plan_exercises(plan.id).unwrap().len(), 2);
+        assert_eq!(plan.programme_slot_id, None, "a plan designed with no programme is ad-hoc");
+        assert_eq!(db.list_roster_exercises(plan.id).unwrap().len(), 2);
         // The crucial guarantee: designing logs NOTHING.
         assert!(db.get_active_session(user.id).unwrap().is_none(), "nextworkout must not start a session");
         assert!(db.recent_sessions_with_sets(user.id, 5).unwrap().is_empty(), "nextworkout must not log sets");
@@ -427,8 +429,8 @@ mod tests {
         assert!(text.contains("Skipped") && text.contains("Jetpack Flips"), "unresolved exercise should be noted, not fatal");
 
         let db = handler.db.lock().await;
-        let plan = db.latest_proposed_plan(user.id).unwrap().unwrap();
-        assert_eq!(db.list_plan_exercises(plan.id).unwrap().len(), 1, "only the resolved exercise is persisted");
+        let plan = db.latest_draft_roster(user.id).unwrap().unwrap();
+        assert_eq!(db.list_roster_exercises(plan.id).unwrap().len(), 1, "only the resolved exercise is persisted");
     }
 
     const DESIGN_RESPONSE: &str = r#"{"message": "Here's your session.", "actions": [
@@ -441,12 +443,12 @@ mod tests {
     /// week-1 grid, returning the slot ids in (week, day) order.
     async fn activate_program_with_slots(handler: &AssistantHandler, user_id: i64) -> Vec<i64> {
         let db = handler.db.lock().await;
-        let program = crate::db::new_program(user_id, "12-week hypertrophy", 2, "upper/lower", "double progression");
-        let program_id = db.create_program(&program).unwrap();
-        db.activate_program(program_id).unwrap();
+        let program = crate::db::new_programme(user_id, "12-week hypertrophy", 2, "upper/lower", "double progression");
+        let program_id = db.create_programme(&program).unwrap();
+        db.activate_programme(program_id).unwrap();
         [(1, 1, "upper"), (1, 2, "lower")]
             .iter()
-            .map(|(w, d, focus)| db.add_program_slot(&crate::db::new_program_slot(program_id, *w, *d, focus)).unwrap())
+            .map(|(w, d, focus)| db.add_programme_slot(&crate::db::new_programme_slot(program_id, *w, *d, focus)).unwrap())
             .collect()
     }
 
@@ -469,10 +471,10 @@ mod tests {
         assert!(text.contains("Programme: 12-week hypertrophy — week 1, day 1: upper"), "mode line missing: {text}");
 
         let db = handler.db.lock().await;
-        let plan = db.latest_proposed_plan(user.id).unwrap().unwrap();
-        assert_eq!(plan.program_slot_id, Some(slots[0]), "the plan records the slot it fills");
-        assert_eq!(db.get_program_slot(slots[0]).unwrap().unwrap().status, crate::db::SlotStatus::Filled);
-        assert_eq!(db.get_program_slot(slots[1]).unwrap().unwrap().status, crate::db::SlotStatus::Pending);
+        let plan = db.latest_draft_roster(user.id).unwrap().unwrap();
+        assert_eq!(plan.programme_slot_id, Some(slots[0]), "the plan records the slot it fills");
+        assert_eq!(db.get_programme_slot(slots[0]).unwrap().unwrap().status, crate::db::SlotStatus::Filled);
+        assert_eq!(db.get_programme_slot(slots[1]).unwrap().unwrap().status, crate::db::SlotStatus::Pending);
     }
 
     /// [C1.4]: "/nextworkout adhoc …" during an active programme is a legitimate
@@ -499,8 +501,8 @@ mod tests {
 
         {
             let db = handler.db.lock().await;
-            let plan = db.latest_proposed_plan(user.id).unwrap().unwrap();
-            assert_eq!(plan.program_slot_id, None, "an ad-hoc plan records no slot");
+            let plan = db.latest_draft_roster(user.id).unwrap().unwrap();
+            assert_eq!(plan.programme_slot_id, None, "an ad-hoc plan records no slot");
         }
 
         // Run the design through its whole lifecycle: start a session (binding the
@@ -511,10 +513,10 @@ mod tests {
         let _ = handler.handle_text_message(&msg, "done").await.unwrap();
 
         let db = handler.db.lock().await;
-        assert_eq!(db.latest_proposed_plan(user.id).unwrap().map(|p| p.id), None);
+        assert_eq!(db.latest_draft_roster(user.id).unwrap().map(|p| p.id), None);
         slots.iter().for_each(|slot| {
             assert_eq!(
-                db.get_program_slot(*slot).unwrap().unwrap().status,
+                db.get_programme_slot(*slot).unwrap().unwrap().status,
                 crate::db::SlotStatus::Pending,
                 "an ad-hoc session must not move any slot status"
             );
@@ -539,7 +541,7 @@ mod tests {
         assert!(text.contains("couldn't design a valid workout"), "should surface a clear retry notice, got: {text}");
 
         let db = handler.db.lock().await;
-        assert!(db.latest_proposed_plan(user.id).unwrap().is_none(), "no phantom plan may be persisted on a failed design");
+        assert!(db.latest_draft_roster(user.id).unwrap().is_none(), "no phantom plan may be persisted on a failed design");
     }
 
     /// Register a user, give them a philosophy, design a one-exercise workout, then
@@ -571,10 +573,10 @@ mod tests {
 
         {
             let db = handler.db.lock().await;
-            let plan = db.active_plan_for_user(user.id).unwrap().expect("plan should be active after start");
+            let plan = db.active_roster_for_user(user.id).unwrap().expect("plan should be active after start");
             let session = db.get_active_session(user.id).unwrap().unwrap();
             assert_eq!(plan.session_id, Some(session.id), "plan bound to the session");
-            assert!(db.latest_proposed_plan(user.id).unwrap().is_none(), "no longer 'proposed' once active");
+            assert!(db.latest_draft_roster(user.id).unwrap().is_none(), "no longer 'proposed' once active");
         }
 
         // The next turn's system prompt carries the guided prescription.
@@ -591,7 +593,7 @@ mod tests {
         let (handler, llm) = setup_handler("").await;
         let msg = make_message(12345, "hello");
         let user = start_guided_workout(&handler, &llm, &msg).await;
-        let plan_id = handler.db.lock().await.active_plan_for_user(user.id).unwrap().unwrap().id;
+        let plan_id = handler.db.lock().await.active_roster_for_user(user.id).unwrap().unwrap().id;
 
         // A durable preference voiced mid-workout is appended to the philosophy.
         llm.set_response(r#"{"message": "Got it.", "actions": [{"type": "append_philosophy_note", "note": "prefers goblet squats"}]}"#);
@@ -607,8 +609,8 @@ mod tests {
         llm.set_response(r#"{"message": "Nice work!", "actions": [{"type": "end_session"}]}"#);
         let _ = handler.handle_text_message(&msg, "done").await.unwrap();
         let db = handler.db.lock().await;
-        assert!(db.active_plan_for_user(user.id).unwrap().is_none());
-        assert_eq!(db.get_plan(plan_id).unwrap().unwrap().status, crate::db::PlanStatus::Completed);
+        assert!(db.active_roster_for_user(user.id).unwrap().is_none());
+        assert_eq!(db.get_roster(plan_id).unwrap().unwrap().status, crate::db::LifecycleStatus::Completed);
     }
 
     #[tokio::test]
@@ -616,7 +618,7 @@ mod tests {
         let (handler, llm) = setup_handler("").await;
         let msg = make_message(12345, "hello");
         let user = start_guided_workout(&handler, &llm, &msg).await;
-        let plan_id = handler.db.lock().await.active_plan_for_user(user.id).unwrap().unwrap().id;
+        let plan_id = handler.db.lock().await.active_roster_for_user(user.id).unwrap().unwrap().id;
 
         // A one-off voiced mid-workout attaches to the plan in flight, NOT the philosophy.
         llm.set_response(
@@ -627,7 +629,7 @@ mod tests {
 
         {
             let db = handler.db.lock().await;
-            let plan = db.get_plan(plan_id).unwrap().unwrap();
+            let plan = db.get_roster(plan_id).unwrap().unwrap();
             assert!(plan.override_note.as_deref().unwrap().contains("flys"), "override stored on the plan");
             // The philosophy must be untouched — a one-off there would ban bench forever.
             let latest = db.latest_philosophy(user.id).unwrap().unwrap();
@@ -654,7 +656,7 @@ mod tests {
         let _ = handler.handle_text_message(&msg, "/nextworkout").await.unwrap();
 
         let db = handler.db.lock().await;
-        let fresh = db.latest_proposed_plan(user.id).unwrap().unwrap();
+        let fresh = db.latest_draft_roster(user.id).unwrap().unwrap();
         assert_ne!(fresh.id, plan_id, "a new plan was designed");
         assert!(fresh.override_note.is_none(), "the one-off must not survive into the next design");
     }
@@ -689,10 +691,7 @@ mod tests {
     /// Insert one session at `started_at`, each exercise in its own entry (as real
     /// logging does) so per-exercise trends resolve independently.
     fn seed_dated_session(db: &Database, user_id: i64, started_at: &str, exercises: &[(i64, f64, i32)]) {
-        db.conn()
-            .execute("INSERT INTO sessions (user_id, started_at) VALUES (?1, ?2)", rusqlite::params![user_id, started_at])
-            .unwrap();
-        let session_id = db.conn().last_insert_rowid();
+        let session_id = db.start_session_at(user_id, started_at, None, None).unwrap();
         for (et_id, weight, count) in exercises {
             let entry_id = db.insert_entry(&new_exercise_entry_at(user_id, Some(session_id), None, started_at)).unwrap();
             let mut s = new_exercise_set(entry_id, *et_id, MeasurementType::WeightReps, *weight);

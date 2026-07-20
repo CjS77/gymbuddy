@@ -149,11 +149,9 @@ mod tests {
         let context_msgs = db.get_recent_messages_for_platform(user.id, "telegram", 100).unwrap();
         assert_eq!(context_msgs.len(), 0);
 
-        let all_count: i64 = db
-            .conn()
-            .query_row("SELECT COUNT(*) FROM conversation_history WHERE user_id = ?1", rusqlite::params![user.id], |row| row.get(0))
-            .unwrap();
-        assert_eq!(all_count, 2);
+        // Counts every stored message, excluded ones included — the point of the
+        // assertion is that the turn was persisted, not that it reaches the LLM.
+        assert_eq!(db.count_messages_for_user(user.id).unwrap(), 2);
     }
 
     #[tokio::test]

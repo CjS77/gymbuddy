@@ -183,10 +183,10 @@ impl AssistantHandler {
                 tracing::debug!(id = session.id, "Ending session");
                 db.end_session(session.id)?;
                 // Complete a guided workout plan bound to this session.
-                if let Some(plan) = db.active_plan_for_user(user.id)?
+                if let Some(plan) = db.active_roster_for_user(user.id)?
                     && plan.session_id == Some(session.id)
                 {
-                    db.set_plan_status(plan.id, crate::db::PlanStatus::Completed)?;
+                    db.set_roster_status(plan.id, crate::db::LifecycleStatus::Completed)?;
                 }
                 // end_session distilled a proposed verdict from the final set of each
                 // exercise; ask the user to confirm or override it. Resting is over
@@ -232,7 +232,7 @@ impl AssistantHandler {
                 let mut entry = new_health_entry(user.id, *entry_type, description);
                 entry.body_part = body_part.clone();
                 if let Some(sev) = severity {
-                    entry.severity = sev.clone();
+                    entry.severity = crate::db::Severity::from_str_loose(sev);
                 }
                 tracing::debug!(entry_type = ?entry_type, body_part = ?body_part, severity = ?severity, "Inserting health entry");
                 self.db.lock().await.insert_health_entry(&entry)?;
@@ -304,9 +304,9 @@ impl AssistantHandler {
                 // A one-off attaches to the plan in flight so it expires with that plan
                 // and never touches the philosophy. With no plan in flight there is
                 // nothing to scope it to, so drop it rather than leak it anywhere durable.
-                match db.inflight_plan_for_user(user.id)? {
+                match db.inflight_roster_for_user(user.id)? {
                     Some(plan) => {
-                        db.append_plan_override(plan.id, note)?;
+                        db.append_roster_override(plan.id, note)?;
                         Ok(Some("Got it -- just for this workout.".to_string()).into())
                     }
                     None => Ok(Some("There's no workout in progress to apply that to right now.".to_string()).into()),
@@ -364,16 +364,16 @@ impl AssistantHandler {
     /// After a session starts, bind the most recent designed (proposed) workout to it
     /// so guided execution begins. No-op when there is no proposed plan.
     fn bind_proposed_plan(&self, db: &Database, user_id: i64, session_id: i64) -> anyhow::Result<()> {
-        let Some(plan) = db.latest_proposed_plan(user_id)? else {
+        let Some(plan) = db.latest_draft_roster(user_id)? else {
             return Ok(());
         };
         if proposed_plan_within_window(&plan.created_at, Utc::now().naive_utc()) {
-            db.bind_plan_to_session(plan.id, session_id)?;
+            db.bind_roster_to_session(plan.id, session_id)?;
             tracing::debug!(plan_id = plan.id, session_id, "Bound designed workout to session for guided execution");
         } else {
             // Designed too long ago to silently attach to this session — retire it so
             // it stops being a binding candidate.
-            db.set_plan_status(plan.id, crate::db::PlanStatus::Abandoned)?;
+            db.set_roster_status(plan.id, crate::db::LifecycleStatus::Abandoned)?;
             tracing::debug!(plan_id = plan.id, "Abandoned a stale proposed workout instead of binding");
         }
         Ok(())
@@ -630,10 +630,7 @@ impl AssistantHandler {
             let session = db.get_session(session_id)?;
             match session.and_then(|s| s.ended_at) {
                 Some(ended_at) => {
-                    db.conn().execute(
-                        "UPDATE exercise_entries SET end_timestamp = ?1 WHERE id = ?2 AND end_timestamp IS NULL",
-                        rusqlite::params![ended_at, entry.id],
-                    )?;
+                    db.end_entry_at(entry.id, &ended_at)?;
                 }
                 None => {
                     // session is still active — not a leak; leave it alone.
@@ -1157,9 +1154,7 @@ mod tests {
         // The original session is still the active one — no new session was created.
         let db = handler.db.lock().await;
         let user = db.get_user_by_telegram_id("12345").unwrap().unwrap();
-        let session_count: i64 =
-            db.conn().query_row("SELECT COUNT(*) FROM sessions WHERE user_id = ?1", rusqlite::params![user.id], |r| r.get(0)).unwrap();
-        assert_eq!(session_count, 1);
+        assert_eq!(db.count_sessions_for_user(user.id).unwrap(), 1);
     }
 
     #[tokio::test]

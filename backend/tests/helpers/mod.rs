@@ -57,13 +57,8 @@ fn seed_alice_history(db: &Database, user_id: i64, bench: i64, deadlift: i64, pl
 
         let started = format!("{date} 09:00:00");
         let ended = format!("{date} 10:30:00");
-        db.conn()
-            .execute(
-                "INSERT INTO sessions (user_id, started_at, ended_at, intent) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![user_id, started, ended, format!("Week {}", week + 1)],
-            )
-            .unwrap();
-        let session_id = db.conn().last_insert_rowid();
+        let intent = format!("Week {}", week + 1);
+        let session_id = db.start_session_at(user_id, &started, Some(&ended), Some(&intent)).unwrap();
 
         let mut bench_entry = new_exercise_entry(user_id, Some(session_id), None);
         bench_entry.start_timestamp = format!("{date} 09:05:00");
@@ -123,13 +118,7 @@ fn seed_bob_history(db: &Database, user_id: i64, bench: i64) {
     for day in 0..10 {
         let date = NaiveDate::from_ymd_opt(2025, 3, 1).unwrap() + Duration::days(day * 3);
         let ended = format!("{date} 19:00:00");
-        db.conn()
-            .execute(
-                "INSERT INTO sessions (user_id, started_at, ended_at) VALUES (?1, ?2, ?3)",
-                rusqlite::params![user_id, format!("{date} 18:00:00"), ended],
-            )
-            .unwrap();
-        let session_id = db.conn().last_insert_rowid();
+        let session_id = db.start_session_at(user_id, &format!("{date} 18:00:00"), Some(&ended), None).unwrap();
         let mut entry = new_exercise_entry(user_id, Some(session_id), None);
         entry.end_timestamp = Some(ended.clone());
         let entry_id = db.insert_entry(&entry).unwrap();
@@ -167,14 +156,14 @@ fn seed_health(db: &Database, user_id: i64) {
     // Resolved injury (the "gap" in Alice's training)
     let mut injury = new_health_entry(user_id, HealthEntryType::Injury, "Lower back strain");
     injury.body_part = Some("lower back".into());
-    injury.severity = "moderate".into();
+    injury.severity = Severity::Moderate;
     injury.started_at = "2025-07-01".into();
     injury.resolved_at = Some("2025-07-14".into());
     db.insert_health_entry(&injury).unwrap();
 
     // Active wellbeing entry
     let mut active = new_health_entry(user_id, HealthEntryType::Wellbeing, "Sleeping well");
-    active.severity = "mild".into();
+    active.severity = Severity::Mild;
     active.started_at = "2025-08-01".into();
     db.insert_health_entry(&active).unwrap();
 }

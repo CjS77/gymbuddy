@@ -2,7 +2,7 @@ use anyhow::Context as _;
 use rusqlite::params;
 
 use super::database::Database;
-use super::models::{HealthEntry, HealthEntryType};
+use super::models::{HealthEntry, HealthEntryType, Severity};
 
 fn row_to_health_entry(row: &rusqlite::Row) -> rusqlite::Result<HealthEntry> {
     Ok(HealthEntry {
@@ -10,7 +10,7 @@ fn row_to_health_entry(row: &rusqlite::Row) -> rusqlite::Result<HealthEntry> {
         user_id: row.get(1)?,
         entry_type: HealthEntryType::from_str_loose(&row.get::<_, String>(2)?),
         body_part: row.get(3)?,
-        severity: row.get(4)?,
+        severity: Severity::from_str_loose(&row.get::<_, String>(4)?),
         description: row.get(5)?,
         started_at: row.get(6)?,
         resolved_at: row.get(7)?,
@@ -34,7 +34,7 @@ impl Database {
                 entry.user_id,
                 entry.entry_type.as_str(),
                 entry.body_part,
-                entry.severity,
+                entry.severity.as_str(),
                 entry.description,
                 if entry.started_at.is_empty() { None } else { Some(&entry.started_at) },
                 entry.resolved_at,
@@ -90,7 +90,7 @@ impl Database {
             params![
                 entry.entry_type.as_str(),
                 entry.body_part,
-                entry.severity,
+                entry.severity.as_str(),
                 entry.description,
                 entry.resolved_at,
                 entry.notes,
@@ -118,7 +118,7 @@ mod tests {
 
         let mut entry = new_health_entry(user_id, HealthEntryType::Injury, "Shoulder pain");
         entry.body_part = Some("shoulder".into());
-        entry.severity = "moderate".into();
+        entry.severity = Severity::Moderate;
         db.insert_health_entry(&entry).unwrap();
 
         let active = db.list_active_health_entries(user_id).unwrap();

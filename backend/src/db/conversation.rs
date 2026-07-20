@@ -37,6 +37,15 @@ impl Database {
         Ok(id)
     }
 
+    /// Every message stored for the user, including the ones excluded from LLM
+    /// context. `get_recent_messages*` deliberately hide exclusions; this counts the
+    /// table, which is what "was it persisted at all?" needs to ask.
+    pub fn count_messages_for_user(&self, user_id: i64) -> anyhow::Result<i64> {
+        self.conn()
+            .query_row("SELECT COUNT(*) FROM conversation_history WHERE user_id = ?1", params![user_id], |row| row.get(0))
+            .context("Failed to count messages for user")
+    }
+
     pub fn get_recent_messages(&self, user_id: i64, limit: usize) -> anyhow::Result<Vec<ConversationMessage>> {
         let sql = format!("{SELECT_MSG} WHERE user_id = ?1 AND exclude_from_context = 0 ORDER BY timestamp DESC LIMIT ?2");
         let mut stmt = self.conn().prepare(&sql)?;

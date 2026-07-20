@@ -89,7 +89,7 @@ mod tests {
     fn a_metric_created_on_demand_has_no_unit() {
         let db = Database::open_in_memory().unwrap();
         let id = db.get_or_create_metric("vertical_leap_cm").unwrap();
-        let unit: Option<String> = db.conn().query_row("SELECT unit FROM metrics WHERE id = ?1", params![id], |r| r.get(0)).unwrap();
+        let unit: Option<String> = db.test_conn().query_row("SELECT unit FROM metrics WHERE id = ?1", params![id], |r| r.get(0)).unwrap();
         assert_eq!(unit, None);
     }
 }

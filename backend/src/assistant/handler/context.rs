@@ -133,7 +133,7 @@ impl AssistantHandler {
     ) -> anyhow::Result<Option<WorkoutPlanProgress>> {
         // Guided execution: a plan bound to the CURRENT session.
         if let Some(session) = active_session
-            && let Some(plan) = db.active_plan_for_user(user_id)?
+            && let Some(plan) = db.active_roster_for_user(user_id)?
             && plan.session_id == Some(session.id)
         {
             let logged: std::collections::HashSet<i64> = session_sets.iter().map(|(s, _)| s.exercise_type_id).collect();
@@ -142,7 +142,7 @@ impl AssistantHandler {
 
         // Otherwise a freshly designed plan ready to start — but only while it is
         // recent, so a stale design does not resurface as "ready" days later.
-        if let Some(plan) = db.latest_proposed_plan(user_id)?
+        if let Some(plan) = db.latest_draft_roster(user_id)?
             && proposed_plan_within_window(&plan.created_at, Utc::now().naive_utc())
         {
             return Ok(Some(self.workout_plan_progress(db, &plan, &std::collections::HashSet::new(), false)?));
@@ -156,11 +156,11 @@ impl AssistantHandler {
     fn workout_plan_progress(
         &self,
         db: &Database,
-        plan: &crate::db::WorkoutPlan,
+        plan: &crate::db::SessionRoster,
         logged: &std::collections::HashSet<i64>,
         started: bool,
     ) -> anyhow::Result<WorkoutPlanProgress> {
-        let exercises = db.list_plan_exercises(plan.id)?;
+        let exercises = db.list_roster_exercises(plan.id)?;
         let mut done = Vec::new();
         let mut next = None;
         for ex in &exercises {
