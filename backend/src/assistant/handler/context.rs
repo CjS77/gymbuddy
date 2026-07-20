@@ -5,7 +5,7 @@
 use chrono::Utc;
 
 use crate::assistant::prompts::{
-    ActivePlanView, EntryView, PlanExerciseView, PrescribedExercise, PromptContext, WorkoutPlanProgress, build_system_prompt,
+    ActivePlanView, EntryView, PrescribedExercise, PromptContext, WorkoutPlanProgress, build_system_prompt,
 };
 use crate::db::{Database, ExerciseSet, ExerciseTypeWithAncestry, Session, User};
 
@@ -59,7 +59,7 @@ impl AssistantHandler {
         };
 
         // A `/nextworkout` design: bound to the current session (guided execution) or
-        // freshly designed and ready to start. Sourced from `workout_plans`, distinct
+        // freshly designed and ready to start. Sourced from `session_rosters`, distinct
         // from the schedule-based `active_plan` above.
         let active_workout_plan = self.build_active_workout_plan(&db, user.id, active_session.as_ref(), &session_sets)?;
 
@@ -84,7 +84,6 @@ impl AssistantHandler {
         let session_set_ids: std::collections::HashSet<i64> = session_sets.iter().map(|(s, _)| s.id).collect();
         let recent_sets: Vec<_> = recent_sets.into_iter().filter(|s| !session_set_ids.contains(&s.id)).take(10).collect();
         let active_goals = db.goal_progress_report(user.id, None, None)?;
-        let schedules = db.list_schedules(user.id)?;
 
         let ctx = PromptContext {
             user_name: user.name.clone(),
@@ -101,7 +100,6 @@ impl AssistantHandler {
             recent_sets,
             exercise_types: self.catalogue.clone(),
             active_goals,
-            schedules,
             last_activity_age_hours,
         };
 
@@ -115,17 +113,12 @@ impl AssistantHandler {
         plan_name: &str,
         completed_exercise_ids: &[i64],
     ) -> anyhow::Result<Option<ActivePlanView>> {
-        let schedules = db.list_schedules(user_id)?;
-        let Some(schedule) = schedules.into_iter().find(|s| s.name.eq_ignore_ascii_case(plan_name)) else {
-            return Ok(None);
-        };
-        let mut planned = db.list_schedule_exercises(schedule.id)?;
-        planned.sort_by_key(|p| p.order_idx);
-        let next = planned.iter().find(|p| !completed_exercise_ids.contains(&p.exercise_type_id)).map(|p| {
-            let exercise_name = self.exercise_name(p.exercise_type_id);
-            PlanExerciseView { exercise_name, target_sets: p.target_sets, target_reps: p.target_reps, target_weight_kg: p.target_weight_kg }
-        });
-        Ok(Some(ActivePlanView { name: schedule.name, completed_exercise_ids: completed_exercise_ids.to_vec(), next }))
+        // Always empty since schema v2 dropped `schedules`: this section resolved a session's
+        // `plan:` sentinel against a saved schedule, and nothing has created a schedule for a long
+        // time. The sentinel, `ActivePlanView` and this function all go together, which is a change
+        // to the assistant layer rather than to the schema — so it stays here, inert, until then.
+        let _ = (db, user_id, plan_name, completed_exercise_ids);
+        Ok(None)
     }
 
     /// Build the guided-execution view of a `/nextworkout` design. Prefers a plan
@@ -190,7 +183,7 @@ impl AssistantHandler {
     }
 }
 
-/// Build EntryView rows for any open exercise_entries the user has, so the prompt
+/// Build EntryView rows for any open exercise_entry the user has, so the prompt
 /// (and LLM-driven cleanup logic) can see them. When `active_session_id` is given,
 /// only entries inside that session are reported (the caller's contract: leaks are
 /// what blocks a *new* session, not what's normal in the current one).

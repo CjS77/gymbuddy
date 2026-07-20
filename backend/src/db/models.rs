@@ -304,35 +304,6 @@ impl fmt::Display for AccessLevel {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ReminderType {
-    Text,
-    Voice,
-}
-
-impl ReminderType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Text => "text",
-            Self::Voice => "voice",
-        }
-    }
-
-    pub fn from_str_loose(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "voice" => Self::Voice,
-            _ => Self::Text,
-        }
-    }
-}
-
-impl fmt::Display for ReminderType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum ConversationRole {
     User,
     Assistant,
@@ -456,7 +427,6 @@ pub struct ExerciseType {
     pub aliases: Option<String>,
     pub purpose: Option<String>,
     pub measurement_type: Option<MeasurementType>,
-    pub description: Option<String>,
     pub url: Option<String>,
     pub created_at: String,
 }
@@ -475,7 +445,6 @@ pub struct User {
     pub id: i64,
     pub name: String,
     pub telegram_id: Option<String>,
-    pub signal_id: Option<String>,
     /// ed25519 public key (hex) of a confide client. NULL for Telegram-only users.
     #[serde(default)]
     pub pubkey: Option<String>,
@@ -587,29 +556,6 @@ pub struct ExerciseSet {
     pub perceived_difficulty: Difficulty,
     pub comment: Option<String>,
     pub logged_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Schedule {
-    pub id: i64,
-    pub user_id: i64,
-    pub name: String,
-    pub cron_expr: String,
-    pub reminder_type: ReminderType,
-    pub reminder_notice_mins: i32,
-    pub enabled: bool,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScheduleExercise {
-    pub schedule_id: i64,
-    pub exercise_type_id: i64,
-    pub order_idx: i32,
-    pub target_sets: Option<i32>,
-    pub target_reps: Option<i32>,
-    pub target_weight_kg: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -741,7 +687,6 @@ pub fn new_user(name: &str, telegram_id: Option<&str>, timezone: &str) -> User {
         id: 0,
         name: name.to_string(),
         telegram_id: telegram_id.map(String::from),
-        signal_id: None,
         pubkey: None,
         timezone: timezone.to_string(),
         created_at: now.clone(),
@@ -752,14 +697,13 @@ pub fn new_user(name: &str, telegram_id: Option<&str>, timezone: &str) -> User {
 }
 
 /// Construct a user identified by a confide ed25519 public key (hex), used by the
-/// confide transport at registration. Has no `telegram_id`/`signal_id`.
+/// confide transport at registration. Has no `telegram_id`.
 pub fn new_user_with_pubkey(name: &str, pubkey: &str, timezone: &str) -> User {
     let now = now_str();
     User {
         id: 0,
         name: name.to_string(),
         telegram_id: None,
-        signal_id: None,
         pubkey: Some(pubkey.to_string()),
         timezone: timezone.to_string(),
         created_at: now.clone(),
@@ -914,15 +858,20 @@ pub enum PlanStatus {
 }
 
 impl PlanStatus {
+    /// Schema v2 spells the first state `draft`, so a roster and a programme share one lifecycle
+    /// vocabulary — the two enums merge into `LifecycleStatus` when the Rust types are renamed.
+    /// The variant is still called `Proposed`; only the stored value has moved.
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Proposed => "proposed",
+            Self::Proposed => "draft",
             Self::Active => "active",
             Self::Completed => "completed",
             Self::Abandoned => "abandoned",
         }
     }
 
+    /// `draft` and v1's `proposed` both parse to [`Self::Proposed`], since this also reads rows
+    /// that came from a legacy database by way of a dump.
     pub fn from_str_loose(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "active" => Self::Active,
@@ -1136,7 +1085,7 @@ impl fmt::Display for SlotStatus {
 }
 
 /// A long-term training programme: a skeleton, not a script. It persists the
-/// goals served (via `program_goals`), dates, split and progression policy;
+/// goals served (via `programme_goals`), dates, split and progression policy;
 /// each session keeps being designed on demand against it. `split` and
 /// `progression_policy` are free text the LLM reads — no query looks inside.
 #[derive(Debug, Clone, Serialize, Deserialize)]

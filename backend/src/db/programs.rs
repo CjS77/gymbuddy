@@ -54,11 +54,11 @@ fn row_to_slot(row: &rusqlite::Row) -> rusqlite::Result<ProgramSlot> {
 
 const SELECT_PROGRAM: &str = "\
     SELECT id, user_id, title, start_date, target_end_date, days_per_week, split, progression_policy, status, created_at, updated_at \
-    FROM programs";
+    FROM programmes";
 
-const SELECT_BLOCK: &str = "SELECT id, program_id, start_week, end_week, focus, notes FROM program_blocks";
+const SELECT_BLOCK: &str = "SELECT id, programme_id, start_week, end_week, focus, notes FROM programme_blocks";
 
-const SELECT_SLOT: &str = "SELECT id, program_id, week_idx, day_idx, focus, status, updated_at FROM program_slots";
+const SELECT_SLOT: &str = "SELECT id, programme_id, week_idx, day_idx, focus, status, updated_at FROM programme_slots";
 
 impl Database {
     // ── Programmes ────────────────────────────────────────────────────────────────
@@ -68,11 +68,11 @@ impl Database {
     /// earlier `proposed` plans.
     pub fn create_program(&self, p: &Program) -> anyhow::Result<i64> {
         self.conn().execute(
-            "UPDATE programs SET status = ?1, updated_at = datetime('now') WHERE user_id = ?2 AND status = ?3",
+            "UPDATE programmes SET status = ?1, updated_at = datetime('now') WHERE user_id = ?2 AND status = ?3",
             params![ProgramStatus::Abandoned.as_str(), p.user_id, ProgramStatus::Draft.as_str()],
         )?;
         self.conn().execute(
-            "INSERT INTO programs (user_id, title, start_date, target_end_date, days_per_week, split, progression_policy) \
+            "INSERT INTO programmes (user_id, title, start_date, target_end_date, days_per_week, split, progression_policy) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![p.user_id, p.title, p.start_date, p.target_end_date, p.days_per_week, p.split, p.progression_policy],
         )?;
@@ -108,12 +108,12 @@ impl Database {
     /// one live proposal.
     pub fn activate_program(&self, program_id: i64) -> anyhow::Result<()> {
         self.conn().execute(
-            "UPDATE programs SET status = 'abandoned', updated_at = datetime('now') \
-             WHERE status = 'active' AND id != ?1 AND user_id = (SELECT user_id FROM programs WHERE id = ?1)",
+            "UPDATE programmes SET status = 'abandoned', updated_at = datetime('now') \
+             WHERE status = 'active' AND id != ?1 AND user_id = (SELECT user_id FROM programmes WHERE id = ?1)",
             params![program_id],
         )?;
         let rows = self.conn().execute(
-            "UPDATE programs SET status = 'active', updated_at = datetime('now') WHERE id = ?1",
+            "UPDATE programmes SET status = 'active', updated_at = datetime('now') WHERE id = ?1",
             params![program_id],
         )?;
         anyhow::ensure!(rows > 0, "Program with id {program_id} not found");
@@ -122,7 +122,7 @@ impl Database {
 
     pub fn set_program_status(&self, program_id: i64, status: ProgramStatus) -> anyhow::Result<()> {
         let rows = self.conn().execute(
-            "UPDATE programs SET status = ?1, updated_at = datetime('now') WHERE id = ?2",
+            "UPDATE programmes SET status = ?1, updated_at = datetime('now') WHERE id = ?2",
             params![status.as_str(), program_id],
         )?;
         anyhow::ensure!(rows > 0, "Program with id {program_id} not found");
@@ -134,7 +134,7 @@ impl Database {
     /// Link a goal to the programme that serves it. Idempotent.
     pub fn add_program_goal(&self, program_id: i64, goal_id: i64) -> anyhow::Result<()> {
         self.conn().execute(
-            "INSERT INTO program_goals (program_id, goal_id) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+            "INSERT INTO programme_goals (programme_id, goal_id) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
             params![program_id, goal_id],
         )?;
         Ok(())
@@ -143,7 +143,7 @@ impl Database {
     /// The goals a programme serves, highest priority first.
     pub fn list_program_goals(&self, program_id: i64) -> anyhow::Result<Vec<Goal>> {
         let sql = format!(
-            "{SELECT_GOAL} WHERE id IN (SELECT goal_id FROM program_goals WHERE program_id = ?1) ORDER BY priority DESC, id"
+            "{SELECT_GOAL} WHERE id IN (SELECT goal_id FROM programme_goals WHERE programme_id = ?1) ORDER BY priority DESC, id"
         );
         let mut stmt = self.conn().prepare(&sql)?;
         let rows = stmt.query_map(params![program_id], row_to_goal)?;
@@ -154,14 +154,14 @@ impl Database {
 
     pub fn add_program_block(&self, b: &ProgramBlock) -> anyhow::Result<i64> {
         self.conn().execute(
-            "INSERT INTO program_blocks (program_id, start_week, end_week, focus, notes) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO programme_blocks (programme_id, start_week, end_week, focus, notes) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![b.program_id, b.start_week, b.end_week, b.focus, b.notes],
         )?;
         Ok(self.conn().last_insert_rowid())
     }
 
     pub fn list_program_blocks(&self, program_id: i64) -> anyhow::Result<Vec<ProgramBlock>> {
-        let sql = format!("{SELECT_BLOCK} WHERE program_id = ?1 ORDER BY start_week");
+        let sql = format!("{SELECT_BLOCK} WHERE programme_id = ?1 ORDER BY start_week");
         let mut stmt = self.conn().prepare(&sql)?;
         let rows = stmt.query_map(params![program_id], row_to_block)?;
         rows.collect::<Result<Vec<_>, _>>().context("Failed to list program blocks")
@@ -171,7 +171,7 @@ impl Database {
 
     pub fn add_program_slot(&self, s: &ProgramSlot) -> anyhow::Result<i64> {
         self.conn().execute(
-            "INSERT INTO program_slots (program_id, week_idx, day_idx, focus) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO programme_slots (programme_id, week_idx, day_idx, focus) VALUES (?1, ?2, ?3, ?4)",
             params![s.program_id, s.week_idx, s.day_idx, s.focus],
         )?;
         Ok(self.conn().last_insert_rowid())
@@ -185,7 +185,7 @@ impl Database {
     }
 
     pub fn list_program_slots(&self, program_id: i64) -> anyhow::Result<Vec<ProgramSlot>> {
-        let sql = format!("{SELECT_SLOT} WHERE program_id = ?1 ORDER BY week_idx, day_idx");
+        let sql = format!("{SELECT_SLOT} WHERE programme_id = ?1 ORDER BY week_idx, day_idx");
         let mut stmt = self.conn().prepare(&sql)?;
         let rows = stmt.query_map(params![program_id], row_to_slot)?;
         rows.collect::<Result<Vec<_>, _>>().context("Failed to list program slots")
@@ -193,7 +193,7 @@ impl Database {
 
     pub fn set_slot_status(&self, slot_id: i64, status: SlotStatus) -> anyhow::Result<()> {
         let rows = self.conn().execute(
-            "UPDATE program_slots SET status = ?1, updated_at = datetime('now') WHERE id = ?2",
+            "UPDATE programme_slots SET status = ?1, updated_at = datetime('now') WHERE id = ?2",
             params![status.as_str(), slot_id],
         )?;
         anyhow::ensure!(rows > 0, "Program slot with id {slot_id} not found");
@@ -209,9 +209,9 @@ impl Database {
     /// settled history and never come back.
     pub fn next_design_slot(&self, program_id: i64) -> anyhow::Result<Option<ProgramSlot>> {
         let sql = format!(
-            "{SELECT_SLOT} WHERE program_id = ?1 AND (status = 'pending' \
+            "{SELECT_SLOT} WHERE programme_id = ?1 AND (status = 'pending' \
                 OR (status = 'filled' AND NOT EXISTS ( \
-                    SELECT 1 FROM workout_plans p WHERE p.program_slot_id = program_slots.id AND p.status IN ('active', 'completed')))) \
+                    SELECT 1 FROM session_rosters p WHERE p.programme_slot_id = programme_slots.id AND p.status IN ('active', 'completed')))) \
              ORDER BY week_idx, day_idx LIMIT 1"
         );
         let mut stmt = self.conn().prepare(&sql)?;
@@ -246,7 +246,7 @@ impl Database {
     /// filled. Ad-hoc plans never call this — their `program_slot_id` stays NULL.
     pub fn bind_plan_to_slot(&self, plan_id: i64, slot_id: i64) -> anyhow::Result<()> {
         let rows = self.conn().execute(
-            "UPDATE workout_plans SET program_slot_id = ?1, updated_at = datetime('now') WHERE id = ?2",
+            "UPDATE session_rosters SET programme_slot_id = ?1, updated_at = datetime('now') WHERE id = ?2",
             params![slot_id, plan_id],
         )?;
         anyhow::ensure!(rows > 0, "Workout plan with id {plan_id} not found");
@@ -255,7 +255,7 @@ impl Database {
 
     /// The plan that filled a slot, if one has bound to it.
     pub fn plan_for_slot(&self, slot_id: i64) -> anyhow::Result<Option<WorkoutPlan>> {
-        let sql = format!("{SELECT_PLAN} WHERE program_slot_id = ?1 ORDER BY created_at DESC, id DESC LIMIT 1");
+        let sql = format!("{SELECT_PLAN} WHERE programme_slot_id = ?1 ORDER BY created_at DESC, id DESC LIMIT 1");
         let mut stmt = self.conn().prepare(&sql)?;
         let mut rows = stmt.query_map(params![slot_id], row_to_plan)?;
         rows.next().transpose().context("Failed to read plan for slot")

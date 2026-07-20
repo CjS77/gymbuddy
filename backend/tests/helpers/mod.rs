@@ -59,7 +59,7 @@ fn seed_alice_history(db: &Database, user_id: i64, bench: i64, deadlift: i64, pl
         let ended = format!("{date} 10:30:00");
         db.conn()
             .execute(
-                "INSERT INTO sessions (user_id, started_at, ended_at, notes) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO sessions (user_id, started_at, ended_at, intent) VALUES (?1, ?2, ?3, ?4)",
                 rusqlite::params![user_id, started, ended, format!("Week {}", week + 1)],
             )
             .unwrap();

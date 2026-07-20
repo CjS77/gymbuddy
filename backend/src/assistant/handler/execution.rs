@@ -350,7 +350,7 @@ impl AssistantHandler {
         if let Some(session) = self.db.lock().await.get_active_session(user.id)? {
             return Ok(session);
         }
-        // Auto-start path: no active session exists, so any open exercise_entries
+        // Auto-start path: no active session exists, so any open exercise_entry
         // for this user are leaks from a previously-ended session. Close them
         // silently before starting fresh.
         self.silent_close_leaked_entries(user.id).await?;
@@ -616,7 +616,7 @@ impl AssistantHandler {
         }
     }
 
-    /// Close any open exercise_entries that belong to already-ended sessions for
+    /// Close any open exercise_entry that belong to already-ended sessions for
     /// this user. Best-effort: uses the parent session's `ended_at` when present,
     /// otherwise `datetime('now')`.
     async fn silent_close_leaked_entries(&self, user_id: i64) -> anyhow::Result<()> {
@@ -631,7 +631,7 @@ impl AssistantHandler {
             match session.and_then(|s| s.ended_at) {
                 Some(ended_at) => {
                     db.conn().execute(
-                        "UPDATE exercise_entry SET end_timestamp = ?1 WHERE id = ?2 AND end_timestamp IS NULL",
+                        "UPDATE exercise_entries SET end_timestamp = ?1 WHERE id = ?2 AND end_timestamp IS NULL",
                         rusqlite::params![ended_at, entry.id],
                     )?;
                 }
@@ -1179,60 +1179,6 @@ mod tests {
         let user = db.get_user_by_telegram_id("12345").unwrap().unwrap();
         let leftover = db.list_open_entries_for_user(user.id).unwrap();
         assert!(leftover.is_empty());
-    }
-
-    #[tokio::test]
-    async fn start_session_with_plan_stores_sentinel_in_notes() {
-        // Seed a schedule named "Push Day" for the user.
-        let (handler, llm) = setup_handler(r#"{"message": "hi", "actions": []}"#).await;
-        let msg = make_message(12345, "hello");
-        let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
-        let user_id = {
-            let db = handler.db.lock().await;
-            let u = db.get_user_by_telegram_id("12345").unwrap().unwrap();
-            let bp = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
-            let pull = db.get_exercise_type_by_name("Pull-Up").unwrap().unwrap();
-            let sched_id = db
-                .insert_schedule(&crate::db::Schedule {
-                    id: 0,
-                    user_id: u.id,
-                    name: "Push Day".to_string(),
-                    cron_expr: "0 0 6 * * 1".to_string(),
-                    reminder_type: crate::db::ReminderType::Text,
-                    reminder_notice_mins: 30,
-                    enabled: true,
-                    created_at: String::new(),
-                    updated_at: String::new(),
-                })
-                .unwrap();
-            db.add_schedule_exercise(&crate::db::ScheduleExercise {
-                schedule_id: sched_id,
-                exercise_type_id: bp.id,
-                order_idx: 0,
-                target_sets: Some(3),
-                target_reps: Some(8),
-                target_weight_kg: Some(80.0),
-            })
-            .unwrap();
-            db.add_schedule_exercise(&crate::db::ScheduleExercise {
-                schedule_id: sched_id,
-                exercise_type_id: pull.id,
-                order_idx: 1,
-                target_sets: Some(3),
-                target_reps: Some(10),
-                target_weight_kg: None,
-            })
-            .unwrap();
-            u.id
-        };
-
-        llm.set_response(r#"{"message": "Starting.", "actions": [{"type": "start_session", "plan": "Push Day"}]}"#);
-        let _ = handler.handle_text_message(&msg, "start push day").await.unwrap();
-
-        let db = handler.db.lock().await;
-        let session = db.get_active_session(user_id).unwrap().unwrap();
-        let notes = session.notes.unwrap();
-        assert!(notes.starts_with("plan:Push Day"));
     }
 
     // ─── get_last_exercise ────────────────────────────────────────────────────

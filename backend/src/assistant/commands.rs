@@ -185,7 +185,6 @@ mod tests {
             id: 1,
             name: "Alice".into(),
             telegram_id: None,
-            signal_id: None,
             pubkey: None,
             timezone: "UTC".into(),
             created_at: String::new(),

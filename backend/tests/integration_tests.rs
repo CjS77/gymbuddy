@@ -27,14 +27,14 @@ fn invariant_closed_sessions_have_no_open_entries() {
     let leaks: i64 =
         f.db.conn()
             .query_row(
-                "SELECT COUNT(*) FROM exercise_entry ee \
+                "SELECT COUNT(*) FROM exercise_entries ee \
              JOIN sessions s ON ee.session_id = s.id \
              WHERE s.ended_at IS NOT NULL AND ee.end_timestamp IS NULL",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-    assert_eq!(leaks, 0, "ended sessions must have no open exercise_entries");
+    assert_eq!(leaks, 0, "ended sessions must have no open exercise_entry");
 }
 
 #[test]

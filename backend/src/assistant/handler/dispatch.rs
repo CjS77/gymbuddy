@@ -507,7 +507,7 @@ mod tests {
     #[test]
     fn build_feedback_body_appends_reporter_footer() {
         let user =
-            User { id: 7, name: "Alice".into(), telegram_id: Some("999".into()), signal_id: None, pubkey: None, timezone: "UTC".into(),
+            User { id: 7, name: "Alice".into(), telegram_id: Some("999".into()), pubkey: None, timezone: "UTC".into(),
                 created_at: String::new(), updated_at: String::new(), beta_tester: true, timers_enabled: true };
         let body = build_feedback_body(&user, "the squat rack is broken");
         assert!(body.starts_with("the squat rack is broken"));
@@ -518,7 +518,7 @@ mod tests {
     // ─── command lists ────────────────────────────────────────────────────────
 
     fn command_list_user(beta_tester: bool) -> User {
-        User { id: 7, name: "Alice".into(), telegram_id: None, signal_id: None, pubkey: None, timezone: "UTC".into(),
+        User { id: 7, name: "Alice".into(), telegram_id: None, pubkey: None, timezone: "UTC".into(),
             created_at: String::new(), updated_at: String::new(), beta_tester, timers_enabled: true }
     }
 

@@ -45,14 +45,14 @@ impl Database {
              ) \
              SELECT date(s.logged_at) AS d, MAX(s.value) AS value \
              FROM sets s \
-             JOIN exercise_entry ee ON s.exercise_entry_id = ee.id \
+             JOIN exercise_entries ee ON s.exercise_entry_id = ee.id \
              WHERE ee.user_id = ?1 AND s.exercise_type_id IN (SELECT id FROM tree) \
                AND s.logged_at >= ?3 AND s.logged_at <= ?4 \
              GROUP BY date(s.logged_at) ORDER BY date(s.logged_at)"
         } else {
             "SELECT date(s.logged_at) AS d, MAX(s.value) AS value \
              FROM sets s \
-             JOIN exercise_entry ee ON s.exercise_entry_id = ee.id \
+             JOIN exercise_entries ee ON s.exercise_entry_id = ee.id \
              WHERE ee.user_id = ?1 AND s.exercise_type_id = ?2 \
                AND s.logged_at >= ?3 AND s.logged_at <= ?4 \
              GROUP BY date(s.logged_at) ORDER BY date(s.logged_at)"
@@ -87,7 +87,7 @@ impl Database {
              SELECT DISTINCT et.id, et.name, et.measurement_type_id \
              FROM exercise_types et \
              JOIN sets s ON s.exercise_type_id = et.id \
-             JOIN exercise_entry ee ON s.exercise_entry_id = ee.id \
+             JOIN exercise_entries ee ON s.exercise_entry_id = ee.id \
              WHERE et.id IN (SELECT id FROM tree) \
                AND ee.user_id = ?1 \
                AND s.logged_at >= ?3 AND s.logged_at <= ?4",
@@ -149,7 +149,9 @@ impl Database {
         // LEFT JOIN so non-exercise goals (metric-denominated) still surface; their
         // exercise_type_id is NULL and et.* comes back NULL.
         let mut stmt = self.conn().prepare(
-            "SELECT g.id, g.user_id, g.kind, g.exercise_type_id, g.metric, g.target_value, g.direction, \
+            "SELECT g.id, g.user_id, g.kind, g.exercise_type_id, \
+                    (SELECT name FROM metrics WHERE metrics.id = g.metric_id) AS metric, \
+                    g.target_value, g.direction, \
                     g.priority, g.start_date, g.target_date, g.achieved, g.notes, g.created_at, g.updated_at, \
                     et.name AS exercise_name \
              FROM goals g \
@@ -229,7 +231,7 @@ impl Database {
                 let sql = format!(
                     "WITH g_days(d) AS ( \
                          SELECT date(s.logged_at) \
-                         FROM sets s JOIN exercise_entry ee ON s.exercise_entry_id = ee.id \
+                         FROM sets s JOIN exercise_entries ee ON s.exercise_entry_id = ee.id \
                          WHERE ee.user_id = ? AND s.exercise_type_id IN ({placeholders}) \
                      ) \
                      SELECT (SELECT MAX(d) FROM g_days) AS last_trained, \
@@ -269,7 +271,7 @@ impl Database {
                  SELECT et.id FROM exercise_types et JOIN tree t ON et.parent_id = t.id \
              ) \
              SELECT {agg}(s.value) FROM sets s \
-             JOIN exercise_entry ee ON s.exercise_entry_id = ee.id \
+             JOIN exercise_entries ee ON s.exercise_entry_id = ee.id \
              WHERE ee.user_id = ?1 AND s.exercise_type_id IN (SELECT id FROM tree) \
                AND s.logged_at >= ?3 AND s.logged_at <= ?4"
         );

@@ -76,15 +76,15 @@ fn row_to_plan_exercise(row: &rusqlite::Row) -> rusqlite::Result<WorkoutPlanExer
     })
 }
 
-const SELECT_PHILOSOPHY: &str = "SELECT id, user_id, content, source, created_at FROM workout_philosophy";
+const SELECT_PHILOSOPHY: &str = "SELECT id, user_id, content, source, created_at FROM philosophies";
 
 pub(super) const SELECT_PLAN: &str = "\
-    SELECT id, user_id, title, rationale, philosophy_id, status, session_id, override_note, program_slot_id, created_at, updated_at \
-    FROM workout_plans";
+    SELECT id, user_id, title, rationale, philosophy_id, status, session_id, override_note, programme_slot_id, created_at, updated_at \
+    FROM session_rosters";
 
 const SELECT_PLAN_EXERCISE: &str = "\
-    SELECT id, plan_id, exercise_type_id, order_idx, target_sets, target_reps, target_weight_kg, target_secs, notes \
-    FROM workout_plan_exercises";
+    SELECT id, roster_id, exercise_type_id, order_idx, target_sets, target_reps, target_weight_kg, target_secs, notes \
+    FROM roster_exercises";
 
 impl Database {
     // ── Philosophy ──────────────────────────────────────────────────────────────
@@ -92,7 +92,7 @@ impl Database {
     /// Append a philosophy entry (the table is append-only). Returns its row id.
     pub fn insert_philosophy(&self, user_id: i64, content: &str, source: &str) -> anyhow::Result<i64> {
         self.conn().execute(
-            "INSERT INTO workout_philosophy (user_id, content, source) VALUES (?1, ?2, ?3)",
+            "INSERT INTO philosophies (user_id, content, source) VALUES (?1, ?2, ?3)",
             params![user_id, content, source],
         )?;
         Ok(self.conn().last_insert_rowid())
@@ -120,7 +120,7 @@ impl Database {
     pub fn get_interview_state(&self, user_id: i64, platform: &str) -> anyhow::Result<Option<InterviewState>> {
         let mut stmt = self.conn().prepare(
             "SELECT user_id, platform, mode, draft, turns, started_at \
-             FROM interview_state WHERE user_id = ?1 AND platform = ?2",
+             FROM interview_states WHERE user_id = ?1 AND platform = ?2",
         )?;
         let mut rows = stmt.query_map(params![user_id, platform], row_to_interview_state)?;
         rows.next().transpose().context("Failed to read interview state")
@@ -128,7 +128,7 @@ impl Database {
 
     pub fn set_interview_state(&self, user_id: i64, platform: &str, mode: &str, draft: &str, turns: i32) -> anyhow::Result<()> {
         self.conn().execute(
-            "INSERT INTO interview_state (user_id, platform, mode, draft, turns) VALUES (?1, ?2, ?3, ?4, ?5) \
+            "INSERT INTO interview_states (user_id, platform, mode, draft, turns) VALUES (?1, ?2, ?3, ?4, ?5) \
              ON CONFLICT(user_id, platform) DO UPDATE SET mode = excluded.mode, draft = excluded.draft, turns = excluded.turns",
             params![user_id, platform, mode, draft, turns],
         )?;
@@ -137,7 +137,7 @@ impl Database {
 
     pub fn clear_interview_state(&self, user_id: i64, platform: &str) -> anyhow::Result<()> {
         self.conn()
-            .execute("DELETE FROM interview_state WHERE user_id = ?1 AND platform = ?2", params![user_id, platform])?;
+            .execute("DELETE FROM interview_states WHERE user_id = ?1 AND platform = ?2", params![user_id, platform])?;
         Ok(())
     }
 
@@ -147,11 +147,11 @@ impl Database {
         // A user keeps at most one live proposal: supersede any earlier `proposed`
         // plans so they neither accumulate nor bind to a later session.
         self.conn().execute(
-            "UPDATE workout_plans SET status = ?1, updated_at = datetime('now') WHERE user_id = ?2 AND status = ?3",
+            "UPDATE session_rosters SET status = ?1, updated_at = datetime('now') WHERE user_id = ?2 AND status = ?3",
             params![PlanStatus::Abandoned.as_str(), user_id, PlanStatus::Proposed.as_str()],
         )?;
         self.conn().execute(
-            "INSERT INTO workout_plans (user_id, title, rationale, philosophy_id) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO session_rosters (user_id, title, rationale, philosophy_id) VALUES (?1, ?2, ?3, ?4)",
             params![user_id, title, rationale, philosophy_id],
         )?;
         Ok(self.conn().last_insert_rowid())
@@ -159,8 +159,8 @@ impl Database {
 
     pub fn add_plan_exercise(&self, e: &WorkoutPlanExercise) -> anyhow::Result<i64> {
         self.conn().execute(
-            "INSERT INTO workout_plan_exercises \
-                 (plan_id, exercise_type_id, order_idx, target_sets, target_reps, target_weight_kg, target_secs, notes) \
+            "INSERT INTO roster_exercises \
+                 (roster_id, exercise_type_id, order_idx, target_sets, target_reps, target_weight_kg, target_secs, notes) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![e.plan_id, e.exercise_type_id, e.order_idx, e.target_sets, e.target_reps, e.target_weight_kg, e.target_secs, e.notes],
         )?;
@@ -175,7 +175,7 @@ impl Database {
     }
 
     pub fn list_plan_exercises(&self, plan_id: i64) -> anyhow::Result<Vec<WorkoutPlanExercise>> {
-        let sql = format!("{SELECT_PLAN_EXERCISE} WHERE plan_id = ?1 ORDER BY order_idx");
+        let sql = format!("{SELECT_PLAN_EXERCISE} WHERE roster_id = ?1 ORDER BY order_idx");
         let mut stmt = self.conn().prepare(&sql)?;
         let rows = stmt.query_map(params![plan_id], row_to_plan_exercise)?;
         rows.collect::<Result<Vec<_>, _>>().context("Failed to list plan exercises")
@@ -183,7 +183,7 @@ impl Database {
 
     /// The most recent plan still awaiting execution (used to activate after `/nextworkout`).
     pub fn latest_proposed_plan(&self, user_id: i64) -> anyhow::Result<Option<WorkoutPlan>> {
-        let sql = format!("{SELECT_PLAN} WHERE user_id = ?1 AND status = 'proposed' ORDER BY created_at DESC, id DESC LIMIT 1");
+        let sql = format!("{SELECT_PLAN} WHERE user_id = ?1 AND status = 'draft' ORDER BY created_at DESC, id DESC LIMIT 1");
         let mut stmt = self.conn().prepare(&sql)?;
         let mut rows = stmt.query_map(params![user_id], row_to_plan)?;
         rows.next().transpose().context("Failed to read proposed plan")
@@ -199,7 +199,7 @@ impl Database {
 
     pub fn set_plan_status(&self, plan_id: i64, status: PlanStatus) -> anyhow::Result<()> {
         let rows = self.conn().execute(
-            "UPDATE workout_plans SET status = ?1, updated_at = datetime('now') WHERE id = ?2",
+            "UPDATE session_rosters SET status = ?1, updated_at = datetime('now') WHERE id = ?2",
             params![status.as_str(), plan_id],
         )?;
         anyhow::ensure!(rows > 0, "Workout plan with id {plan_id} not found");
@@ -209,7 +209,7 @@ impl Database {
     /// Bind a proposed plan to a session and mark it active for guided execution.
     pub fn bind_plan_to_session(&self, plan_id: i64, session_id: i64) -> anyhow::Result<()> {
         let rows = self.conn().execute(
-            "UPDATE workout_plans SET session_id = ?1, status = 'active', updated_at = datetime('now') WHERE id = ?2",
+            "UPDATE session_rosters SET session_id = ?1, status = 'active', updated_at = datetime('now') WHERE id = ?2",
             params![session_id, plan_id],
         )?;
         anyhow::ensure!(rows > 0, "Workout plan with id {plan_id} not found");
@@ -236,7 +236,7 @@ impl Database {
             None => format!("- {note}"),
         };
         let rows = self.conn().execute(
-            "UPDATE workout_plans SET override_note = ?1, updated_at = datetime('now') WHERE id = ?2",
+            "UPDATE session_rosters SET override_note = ?1, updated_at = datetime('now') WHERE id = ?2",
             params![combined, plan_id],
         )?;
         anyhow::ensure!(rows > 0, "Workout plan with id {plan_id} not found");

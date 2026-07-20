@@ -82,7 +82,6 @@ mod tests {
                 aliases: if aliases.is_empty() { None } else { Some(aliases.to_string()) },
                 purpose: Some("strength".to_string()),
                 measurement_type: Some(MeasurementType::WeightReps),
-                description: None,
                 url: None,
                 created_at: String::new(),
             },

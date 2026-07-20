@@ -23,7 +23,7 @@ fn row_to_session(row: &Row) -> rusqlite::Result<Session> {
 }
 
 const SELECT_SESSION: &str =
-    "SELECT id, user_id, started_at, ended_at, notes, overall_effort, felt, cut_short, cut_short_reason FROM sessions";
+    "SELECT id, user_id, started_at, ended_at, intent, overall_effort, felt, cut_short, cut_short_reason FROM sessions";
 
 /// The perceived difficulty of the LAST set of each distinct exercise in a
 /// session — the sets that best capture how the session finished.
@@ -31,10 +31,10 @@ fn last_set_difficulties(conn: &Connection, session_id: i64) -> anyhow::Result<V
     let mut stmt = conn.prepare(
         "SELECT s.perceived_difficulty \
          FROM sets s \
-         JOIN exercise_entry ee ON ee.id = s.exercise_entry_id \
+         JOIN exercise_entries ee ON ee.id = s.exercise_entry_id \
          WHERE ee.session_id = ?1 \
            AND s.id = (SELECT s2.id FROM sets s2 \
-                       JOIN exercise_entry ee2 ON ee2.id = s2.exercise_entry_id \
+                       JOIN exercise_entries ee2 ON ee2.id = s2.exercise_entry_id \
                        WHERE ee2.session_id = ?1 AND s2.exercise_type_id = s.exercise_type_id \
                        ORDER BY s2.logged_at DESC, s2.id DESC LIMIT 1)",
     )?;
@@ -55,7 +55,7 @@ fn distil_overall_effort(last_sets: &[Difficulty]) -> Option<Difficulty> {
 
 impl Database {
     pub fn start_session(&self, user_id: i64, notes: Option<&str>) -> anyhow::Result<Session> {
-        self.conn().execute("INSERT INTO sessions (user_id, notes) VALUES (?1, ?2)", params![user_id, notes])?;
+        self.conn().execute("INSERT INTO sessions (user_id, intent) VALUES (?1, ?2)", params![user_id, notes])?;
         let id = self.conn().last_insert_rowid();
         let session = self.get_session(id)?.context("Session disappeared immediately after insert")?;
         Ok(session)
@@ -72,7 +72,7 @@ impl Database {
         let rows = tx.execute("UPDATE sessions SET ended_at = datetime('now') WHERE id = ?1 AND ended_at IS NULL", params![session_id])?;
         anyhow::ensure!(rows > 0, "session id {session_id} not found or already ended");
         tx.execute(
-            "UPDATE exercise_entry \
+            "UPDATE exercise_entries \
              SET end_timestamp = (SELECT ended_at FROM sessions WHERE id = ?1) \
              WHERE session_id = ?1 AND end_timestamp IS NULL",
             params![session_id],
@@ -151,13 +151,13 @@ impl Database {
 
     pub fn list_session_summaries(&self, user_id: i64, from: Option<&str>, to: Option<&str>) -> anyhow::Result<Vec<SessionSummary>> {
         let mut stmt = self.conn().prepare(
-            "SELECT s.id, s.user_id, s.started_at, s.ended_at, s.notes, s.overall_effort, s.felt, s.cut_short, s.cut_short_reason, \
+            "SELECT s.id, s.user_id, s.started_at, s.ended_at, s.intent, s.overall_effort, s.felt, s.cut_short, s.cut_short_reason, \
                     COUNT(DISTINCT ee.id) AS exercise_count, \
                     CASE WHEN s.ended_at IS NULL THEN NULL \
                          ELSE CAST((julianday(s.ended_at) - julianday(s.started_at)) * 24 * 60 AS INTEGER) \
                     END AS duration_mins \
              FROM sessions s \
-             LEFT JOIN exercise_entry ee ON ee.session_id = s.id \
+             LEFT JOIN exercise_entries ee ON ee.session_id = s.id \
              WHERE s.user_id = ?1 \
                AND (?2 IS NULL OR s.started_at >= ?2) \
                AND (?3 IS NULL OR s.started_at <= ?3) \
@@ -199,12 +199,12 @@ fn row_to_entry(row: &Row) -> rusqlite::Result<ExerciseEntry> {
     })
 }
 
-const SELECT_ENTRY: &str = "SELECT id, user_id, session_id, start_timestamp, end_timestamp, comment FROM exercise_entry";
+const SELECT_ENTRY: &str = "SELECT id, user_id, session_id, start_timestamp, end_timestamp, comment FROM exercise_entries";
 
 impl Database {
     pub fn insert_entry(&self, entry: &ExerciseEntry) -> anyhow::Result<i64> {
         self.conn().execute(
-            "INSERT INTO exercise_entry (user_id, session_id, start_timestamp, end_timestamp, comment) \
+            "INSERT INTO exercise_entries (user_id, session_id, start_timestamp, end_timestamp, comment) \
              VALUES (?1, ?2, COALESCE(?3, datetime('now')), ?4, ?5)",
             params![
                 entry.user_id,
@@ -219,7 +219,7 @@ impl Database {
 
     pub fn end_entry(&self, entry_id: i64) -> anyhow::Result<()> {
         let rows = self.conn().execute(
-            "UPDATE exercise_entry SET end_timestamp = datetime('now') WHERE id = ?1 AND end_timestamp IS NULL",
+            "UPDATE exercise_entries SET end_timestamp = datetime('now') WHERE id = ?1 AND end_timestamp IS NULL",
             params![entry_id],
         )?;
         anyhow::ensure!(rows > 0, "exercise_entry id {entry_id} not found or already closed");
@@ -264,7 +264,7 @@ impl Database {
     ) -> anyhow::Result<Option<ExerciseEntry>> {
         let mut stmt = self.conn().prepare(
             "SELECT ee.id, ee.user_id, ee.session_id, ee.start_timestamp, ee.end_timestamp, ee.comment \
-             FROM exercise_entry ee \
+             FROM exercise_entries ee \
              WHERE ee.user_id = ?1 AND ee.session_id = ?2 AND ee.end_timestamp IS NULL \
                AND EXISTS (SELECT 1 FROM sets s \
                            WHERE s.exercise_entry_id = ee.id AND s.exercise_type_id = ?3) \
@@ -296,7 +296,7 @@ impl Database {
              related(id) AS (SELECT id FROM ancestors UNION SELECT id FROM descendants) \
              SELECT ee.id, ee.user_id, ee.session_id, ee.start_timestamp, ee.end_timestamp, ee.comment, \
                     s.exercise_type_id \
-             FROM exercise_entry ee \
+             FROM exercise_entries ee \
              JOIN sets s ON s.exercise_entry_id = ee.id \
              WHERE ee.session_id = ?1 AND ee.end_timestamp IS NULL \
                AND s.exercise_type_id IN (SELECT id FROM related) \
@@ -306,7 +306,7 @@ impl Database {
         rows.next().transpose().context("Failed to read open related entry")
     }
 
-    /// All open exercise_entries in a session, oldest first. >1 row = a superset.
+    /// All open exercise_entry in a session, oldest first. >1 row = a superset.
     pub fn list_open_entries_for_session(&self, session_id: i64) -> anyhow::Result<Vec<ExerciseEntry>> {
         let sql = format!("{SELECT_ENTRY} WHERE session_id = ?1 AND end_timestamp IS NULL ORDER BY start_timestamp");
         let mut stmt = self.conn().prepare(&sql)?;
@@ -314,19 +314,19 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().context("Failed to list open entries for session")
     }
 
-    /// Whether the session is mid-superset: ≥2 exercise_entries open at once. The
+    /// Whether the session is mid-superset: ≥2 exercise_entry open at once. The
     /// one place the superset rule is defined, so callers don't re-derive the
     /// threshold.
     pub fn is_supersetting(&self, session_id: i64) -> anyhow::Result<bool> {
         let open: i64 = self.conn().query_row(
-            "SELECT COUNT(*) FROM exercise_entry WHERE session_id = ?1 AND end_timestamp IS NULL",
+            "SELECT COUNT(*) FROM exercise_entries WHERE session_id = ?1 AND end_timestamp IS NULL",
             params![session_id],
             |row| row.get(0),
         )?;
         Ok(open >= 2)
     }
 
-    /// All open exercise_entries for a user, across sessions. Used to detect leaks
+    /// All open exercise_entry for a user, across sessions. Used to detect leaks
     /// from previously-ended sessions and from older code paths that did not close
     /// entries.
     pub fn list_open_entries_for_user(&self, user_id: i64) -> anyhow::Result<Vec<ExerciseEntry>> {
@@ -349,12 +349,12 @@ impl Database {
     pub fn close_open_entries_for_session(&self, session_id: i64, end_timestamp: Option<&str>) -> anyhow::Result<usize> {
         let rows = match end_timestamp {
             Some(ts) => self.conn().execute(
-                "UPDATE exercise_entry SET end_timestamp = ?2 \
+                "UPDATE exercise_entries SET end_timestamp = ?2 \
                  WHERE session_id = ?1 AND end_timestamp IS NULL",
                 params![session_id, ts],
             )?,
             None => self.conn().execute(
-                "UPDATE exercise_entry SET end_timestamp = datetime('now') \
+                "UPDATE exercise_entries SET end_timestamp = datetime('now') \
                  WHERE session_id = ?1 AND end_timestamp IS NULL",
                 params![session_id],
             )?,
@@ -363,7 +363,7 @@ impl Database {
     }
 
     pub fn delete_entry(&self, entry_id: i64) -> anyhow::Result<()> {
-        let rows = self.conn().execute("DELETE FROM exercise_entry WHERE id = ?1", params![entry_id])?;
+        let rows = self.conn().execute("DELETE FROM exercise_entries WHERE id = ?1", params![entry_id])?;
         anyhow::ensure!(rows > 0, "exercise_entry id {entry_id} not found");
         Ok(())
     }
@@ -460,7 +460,7 @@ impl Database {
             "SELECT s.id, s.exercise_entry_id, s.exercise_type_id, s.order_idx, \
                     s.measurement_type_id, s.count, s.value, s.perceived_difficulty, s.comment, s.logged_at \
              FROM sets s \
-             JOIN exercise_entry ee ON s.exercise_entry_id = ee.id \
+             JOIN exercise_entries ee ON s.exercise_entry_id = ee.id \
              WHERE ee.user_id = ?1 \
                AND (?2 IS NULL OR s.logged_at >= ?2) \
                AND (?3 IS NULL OR s.logged_at <= ?3) \
@@ -488,14 +488,14 @@ impl Database {
              SELECT s.id, s.exercise_entry_id, s.exercise_type_id, s.order_idx, \
                     s.measurement_type_id, s.count, s.value, s.perceived_difficulty, s.comment, s.logged_at \
              FROM sets s \
-             JOIN exercise_entry ee ON s.exercise_entry_id = ee.id \
+             JOIN exercise_entries ee ON s.exercise_entry_id = ee.id \
              WHERE ee.user_id = ?2 AND s.exercise_type_id IN (SELECT id FROM tree) \
              ORDER BY s.logged_at DESC LIMIT ?3"
         } else {
             "SELECT s.id, s.exercise_entry_id, s.exercise_type_id, s.order_idx, \
                     s.measurement_type_id, s.count, s.value, s.perceived_difficulty, s.comment, s.logged_at \
              FROM sets s \
-             JOIN exercise_entry ee ON s.exercise_entry_id = ee.id \
+             JOIN exercise_entries ee ON s.exercise_entry_id = ee.id \
              WHERE ee.user_id = ?2 AND s.exercise_type_id = ?1 \
              ORDER BY s.logged_at DESC LIMIT ?3"
         };
@@ -510,7 +510,7 @@ impl Database {
             "SELECT s.id, s.exercise_entry_id, s.exercise_type_id, s.order_idx, \
                     s.measurement_type_id, s.count, s.value, s.perceived_difficulty, s.comment, s.logged_at \
              FROM sets s \
-             JOIN exercise_entry ee ON s.exercise_entry_id = ee.id \
+             JOIN exercise_entries ee ON s.exercise_entry_id = ee.id \
              WHERE ee.user_id = ?1 AND s.logged_at >= datetime('now', ?2) \
              ORDER BY s.logged_at DESC",
         )?;
@@ -530,14 +530,14 @@ impl Database {
              SELECT s.id, s.exercise_entry_id, s.exercise_type_id, s.order_idx, \
                     s.measurement_type_id, s.count, s.value, s.perceived_difficulty, s.comment, s.logged_at \
              FROM sets s \
-             JOIN exercise_entry ee ON s.exercise_entry_id = ee.id \
+             JOIN exercise_entries ee ON s.exercise_entry_id = ee.id \
              WHERE ee.user_id = ?2 AND s.exercise_type_id IN (SELECT id FROM tree) \
              ORDER BY s.value DESC LIMIT 1"
         } else {
             "SELECT s.id, s.exercise_entry_id, s.exercise_type_id, s.order_idx, \
                     s.measurement_type_id, s.count, s.value, s.perceived_difficulty, s.comment, s.logged_at \
              FROM sets s \
-             JOIN exercise_entry ee ON s.exercise_entry_id = ee.id \
+             JOIN exercise_entries ee ON s.exercise_entry_id = ee.id \
              WHERE ee.user_id = ?2 AND s.exercise_type_id = ?1 \
              ORDER BY s.value DESC LIMIT 1"
         };
@@ -625,7 +625,7 @@ impl Database {
     pub fn set_owner(&self, set_id: i64) -> anyhow::Result<Option<i64>> {
         let mut stmt = self.conn().prepare(
             "SELECT ee.user_id FROM sets s \
-             JOIN exercise_entry ee ON s.exercise_entry_id = ee.id \
+             JOIN exercise_entries ee ON s.exercise_entry_id = ee.id \
              WHERE s.id = ?1",
         )?;
         let mut rows = stmt.query_map(params![set_id], |row| row.get::<_, i64>(0))?;
@@ -640,7 +640,7 @@ impl Database {
             "SELECT s.id, s.exercise_entry_id, s.exercise_type_id, s.order_idx, \
                     s.measurement_type_id, s.count, s.value, s.perceived_difficulty, s.comment, s.logged_at \
              FROM sets s \
-             JOIN exercise_entry ee ON s.exercise_entry_id = ee.id \
+             JOIN exercise_entries ee ON s.exercise_entry_id = ee.id \
              WHERE ee.user_id = ?1 AND (?2 IS NULL OR s.exercise_type_id = ?2) \
              ORDER BY s.logged_at DESC, s.id DESC LIMIT 1",
         )?;
@@ -673,7 +673,7 @@ impl Database {
                  SELECT et.id, t.depth + 1 FROM exercise_types et JOIN tree t ON et.parent_id = t.id \
              ) \
              SELECT ee.id, ee.user_id, ee.session_id, ee.start_timestamp, ee.end_timestamp, ee.comment \
-             FROM exercise_entry ee \
+             FROM exercise_entries ee \
              JOIN ( \
                  SELECT s.exercise_entry_id AS entry_id, MIN(t.depth) AS depth \
                  FROM sets s JOIN tree t ON t.id = s.exercise_type_id \
@@ -683,7 +683,7 @@ impl Database {
              ORDER BY m.depth ASC, ee.start_timestamp DESC, ee.id DESC LIMIT 1"
         } else {
             "SELECT ee.id, ee.user_id, ee.session_id, ee.start_timestamp, ee.end_timestamp, ee.comment \
-             FROM exercise_entry ee \
+             FROM exercise_entries ee \
              WHERE ee.user_id = ?1 \
                AND EXISTS (SELECT 1 FROM sets s \
                            WHERE s.exercise_entry_id = ee.id AND s.exercise_type_id = ?2) \
@@ -1267,7 +1267,7 @@ mod tests {
         let (db, user_id, bp_id) = fixture();
         let older = db.insert_entry(&new_exercise_entry(user_id, None, None)).unwrap();
         db.conn()
-            .execute("UPDATE exercise_entry SET start_timestamp = ?1 WHERE id = ?2", params!["2025-01-01 09:00:00", older])
+            .execute("UPDATE exercise_entries SET start_timestamp = ?1 WHERE id = ?2", params!["2025-01-01 09:00:00", older])
             .unwrap();
         let mut s = new_exercise_set(older, bp_id, MeasurementType::WeightReps, 60.0);
         s.count = Some(8);
@@ -1275,7 +1275,7 @@ mod tests {
 
         let newer = db.insert_entry(&new_exercise_entry(user_id, None, None)).unwrap();
         db.conn()
-            .execute("UPDATE exercise_entry SET start_timestamp = ?1 WHERE id = ?2", params!["2025-02-01 09:00:00", newer])
+            .execute("UPDATE exercise_entries SET start_timestamp = ?1 WHERE id = ?2", params!["2025-02-01 09:00:00", newer])
             .unwrap();
         let mut s = new_exercise_set(newer, bp_id, MeasurementType::WeightReps, 75.0);
         s.count = Some(5);
@@ -1312,7 +1312,7 @@ mod tests {
         // Older entry against the parent (depth 0 relative to the bp_id seed).
         let older = db.insert_entry(&new_exercise_entry(user_id, None, None)).unwrap();
         db.conn()
-            .execute("UPDATE exercise_entry SET start_timestamp = ?1 WHERE id = ?2", params!["2025-01-01 09:00:00", older])
+            .execute("UPDATE exercise_entries SET start_timestamp = ?1 WHERE id = ?2", params!["2025-01-01 09:00:00", older])
             .unwrap();
         let mut s = new_exercise_set(older, bp_id, MeasurementType::WeightReps, 60.0);
         s.count = Some(8);
@@ -1321,7 +1321,7 @@ mod tests {
         // Newer entry against a child variation (depth 1).
         let newer = db.insert_entry(&new_exercise_entry(user_id, None, None)).unwrap();
         db.conn()
-            .execute("UPDATE exercise_entry SET start_timestamp = ?1 WHERE id = ?2", params!["2025-02-01 09:00:00", newer])
+            .execute("UPDATE exercise_entries SET start_timestamp = ?1 WHERE id = ?2", params!["2025-02-01 09:00:00", newer])
             .unwrap();
         let mut s = new_exercise_set(newer, flat_id, MeasurementType::WeightReps, 90.0);
         s.count = Some(5);

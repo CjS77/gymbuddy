@@ -51,23 +51,27 @@ fn row_to_body_metric(row: &rusqlite::Row) -> rusqlite::Result<BodyMetric> {
     Ok(BodyMetric { id: row.get(0)?, user_id: row.get(1)?, metric: row.get(2)?, value: row.get(3)?, measured_at: row.get(4)? })
 }
 
-const SELECT_METRIC: &str = "SELECT id, user_id, metric, value, measured_at FROM body_metrics";
+/// Rows come back with the metric's *name*, not its id: `BodyMetric` is what the renderers and the
+/// prompts see, and a number would mean nothing to either. The id is a storage detail that stops at
+/// this module's edge.
+const SELECT_METRIC: &str =
+    "SELECT b.id, b.user_id, m.name, b.value, b.measured_at FROM body_metrics b JOIN metrics m ON m.id = b.metric_id";
 
 impl Database {
     pub fn insert_body_metric(&self, metric: &BodyMetric) -> anyhow::Result<i64> {
-        let name = canonical_body_metric(&metric.metric);
+        let metric_id = self.get_or_create_metric(&metric.metric)?;
         self.conn().execute(
-            "INSERT INTO body_metrics (user_id, metric, value, measured_at) VALUES (?1, ?2, ?3, COALESCE(?4, datetime('now')))",
-            params![metric.user_id, name, metric.value, if metric.measured_at.is_empty() { None } else { Some(&metric.measured_at) }],
+            "INSERT INTO body_metrics (user_id, metric_id, value, measured_at) VALUES (?1, ?2, ?3, COALESCE(?4, datetime('now')))",
+            params![metric.user_id, metric_id, metric.value, if metric.measured_at.is_empty() { None } else { Some(&metric.measured_at) }],
         )?;
         let id = self.conn().last_insert_rowid();
-        tracing::debug!(id, metric = %name, value = metric.value, "DB: inserted body metric");
+        tracing::debug!(id, metric = %metric.metric, value = metric.value, "DB: inserted body metric");
         Ok(id)
     }
 
     /// The most recent measurement of one metric, or `None` if never measured.
     pub fn latest_body_metric(&self, user_id: i64, metric: &str) -> anyhow::Result<Option<BodyMetric>> {
-        let sql = format!("{SELECT_METRIC} WHERE user_id = ?1 AND metric = ?2 ORDER BY measured_at DESC, id DESC LIMIT 1");
+        let sql = format!("{SELECT_METRIC} WHERE b.user_id = ?1 AND m.name = ?2 ORDER BY b.measured_at DESC, b.id DESC LIMIT 1");
         let mut stmt = self.conn().prepare(&sql)?;
         let mut rows = stmt.query_map(params![user_id, canonical_body_metric(metric)], row_to_body_metric)?;
         rows.next().transpose().context("Failed to read latest body metric")
@@ -79,9 +83,9 @@ impl Database {
     pub fn latest_body_metric_value(&self, user_id: i64, metric: &str, upto: &str) -> anyhow::Result<Option<f64>> {
         self.conn()
             .query_row(
-                "SELECT value FROM body_metrics \
-                 WHERE user_id = ?1 AND metric = ?2 AND date(measured_at) <= date(?3) \
-                 ORDER BY measured_at DESC, id DESC LIMIT 1",
+                "SELECT b.value FROM body_metrics b JOIN metrics m ON m.id = b.metric_id \
+                 WHERE b.user_id = ?1 AND m.name = ?2 AND date(b.measured_at) <= date(?3) \
+                 ORDER BY b.measured_at DESC, b.id DESC LIMIT 1",
                 params![user_id, canonical_body_metric(metric), upto],
                 |row| row.get(0),
             )
@@ -94,8 +98,8 @@ impl Database {
     /// day all appear; aggregation is the renderer's call.
     pub fn list_body_metrics(&self, user_id: i64, metric: &str, from: &str, to: &str) -> anyhow::Result<Vec<BodyMetric>> {
         let sql = format!(
-            "{SELECT_METRIC} WHERE user_id = ?1 AND metric = ?2 AND date(measured_at) >= date(?3) AND date(measured_at) <= date(?4) \
-             ORDER BY measured_at, id"
+            "{SELECT_METRIC} WHERE b.user_id = ?1 AND m.name = ?2 AND date(b.measured_at) >= date(?3) \
+             AND date(b.measured_at) <= date(?4) ORDER BY b.measured_at, b.id"
         );
         let mut stmt = self.conn().prepare(&sql)?;
         let rows = stmt.query_map(params![user_id, canonical_body_metric(metric), from, to], row_to_body_metric)?;

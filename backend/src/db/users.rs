@@ -9,26 +9,25 @@ pub(super) fn row_to_user(row: &rusqlite::Row) -> rusqlite::Result<User> {
         id: row.get(0)?,
         name: row.get(1)?,
         telegram_id: row.get(2)?,
-        signal_id: row.get(3)?,
-        pubkey: row.get(4)?,
-        timezone: row.get(5)?,
-        created_at: row.get(6)?,
-        updated_at: row.get(7)?,
-        beta_tester: row.get::<_, i64>(8)? != 0,
-        timers_enabled: row.get::<_, i64>(9)? != 0,
+        pubkey: row.get(3)?,
+        timezone: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+        beta_tester: row.get::<_, i64>(7)? != 0,
+        timers_enabled: row.get::<_, i64>(8)? != 0,
     })
 }
 
 const SELECT_USER: &str =
-    "SELECT id, name, telegram_id, signal_id, pubkey, timezone, created_at, updated_at, beta_tester, timers_enabled FROM users";
+    "SELECT id, name, telegram_id, pubkey, timezone, created_at, updated_at, beta_tester, timers_enabled FROM users";
 
 impl Database {
     /// Insert a user. Returns the generated id.
     pub fn insert_user(&self, user: &User) -> anyhow::Result<i64> {
         self.conn().execute(
-            "INSERT INTO users (name, telegram_id, signal_id, pubkey, timezone, beta_tester, timers_enabled) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![user.name, user.telegram_id, user.signal_id, user.pubkey, user.timezone, user.beta_tester as i64, user.timers_enabled as i64],
+            "INSERT INTO users (name, telegram_id, pubkey, timezone, beta_tester, timers_enabled) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![user.name, user.telegram_id, user.pubkey, user.timezone, user.beta_tester as i64, user.timers_enabled as i64],
         )?;
         let id = self.conn().last_insert_rowid();
         tracing::debug!(id, name = %user.name, telegram_id = ?user.telegram_id, "DB: inserted user");
@@ -49,13 +48,6 @@ impl Database {
         rows.next().transpose().context("Failed to read user row")
     }
 
-    pub fn get_user_by_signal_id(&self, signal_id: &str) -> anyhow::Result<Option<User>> {
-        let sql = format!("{SELECT_USER} WHERE signal_id = ?1");
-        let mut stmt = self.conn().prepare(&sql)?;
-        let mut rows = stmt.query_map(params![signal_id], row_to_user)?;
-        rows.next().transpose().context("Failed to read user row")
-    }
-
     /// Look up a user by their confide ed25519 public key (hex). Used by the
     /// confide transport to resolve the connecting peer to a registered user.
     pub fn get_user_by_pubkey(&self, pubkey: &str) -> anyhow::Result<Option<User>> {
@@ -67,9 +59,9 @@ impl Database {
 
     pub fn update_user(&self, user: &User) -> anyhow::Result<()> {
         let rows = self.conn().execute(
-            "UPDATE users SET name = ?1, telegram_id = ?2, signal_id = ?3, pubkey = ?4, timezone = ?5, beta_tester = ?6, \
-             updated_at = datetime('now') WHERE id = ?7",
-            params![user.name, user.telegram_id, user.signal_id, user.pubkey, user.timezone, user.beta_tester as i64, user.id],
+            "UPDATE users SET name = ?1, telegram_id = ?2, pubkey = ?3, timezone = ?4, beta_tester = ?5, \
+             updated_at = datetime('now') WHERE id = ?6",
+            params![user.name, user.telegram_id, user.pubkey, user.timezone, user.beta_tester as i64, user.id],
         )?;
         anyhow::ensure!(rows > 0, "User with id {} not found", user.id);
         tracing::debug!(id = user.id, "DB: updated user");

@@ -1,7 +1,7 @@
 use chrono::NaiveDate;
 
 use crate::db::{
-    ExerciseSet, ExerciseTypeWithAncestry, GoalProgress, HealthEntry, MeasurementType, MuscleRecovery, Schedule, Session, SessionSummary,
+    ExerciseSet, ExerciseTypeWithAncestry, GoalProgress, HealthEntry, MeasurementType, MuscleRecovery, Session, SessionSummary,
 };
 
 pub struct PromptContext {
@@ -19,7 +19,6 @@ pub struct PromptContext {
     pub recent_sets: Vec<ExerciseSet>,
     pub exercise_types: Vec<ExerciseTypeWithAncestry>,
     pub active_goals: Vec<GoalProgress>,
-    pub schedules: Vec<Schedule>,
     /// Hours since the user's last logged set (or session start, if no sets yet).
     /// Only populated when an active session exists; drives the SESSION CONTINUITY
     /// rule (auto-new ≥12h, ask <12h).
@@ -892,7 +891,6 @@ mod tests {
                 aliases: if aliases.is_empty() { None } else { Some(aliases.to_string()) },
                 purpose: Some("strength".to_string()),
                 measurement_type: Some(mt),
-                description: None,
                 url: None,
                 created_at: String::new(),
             },
@@ -921,7 +919,6 @@ mod tests {
                 make_exercise_type(2, "Running", "run,jogging", "Cardio", MeasurementType::DistanceBased),
             ],
             active_goals: vec![],
-            schedules: vec![],
             last_activity_age_hours: None,
         }
     }

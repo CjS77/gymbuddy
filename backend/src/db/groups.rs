@@ -66,7 +66,7 @@ impl Database {
 
     pub fn list_group_members(&self, group_id: i64) -> anyhow::Result<Vec<(User, AccessLevel)>> {
         let mut stmt = self.conn().prepare(
-            "SELECT u.id, u.name, u.telegram_id, u.signal_id, u.pubkey, u.timezone, u.created_at, u.updated_at, u.beta_tester, \
+            "SELECT u.id, u.name, u.telegram_id, u.pubkey, u.timezone, u.created_at, u.updated_at, u.beta_tester, \
                     u.timers_enabled, gm.level \
              FROM users u \
              JOIN group_members gm ON u.id = gm.user_id \
@@ -74,7 +74,7 @@ impl Database {
         )?;
         let rows = stmt.query_map(params![group_id], |row| {
             let user = row_to_user(row)?;
-            let level = AccessLevel::from_str_loose(&row.get::<_, String>(10)?);
+            let level = AccessLevel::from_str_loose(&row.get::<_, String>(9)?);
             Ok((user, level))
         })?;
         rows.collect::<Result<Vec<_>, _>>().context("Failed to list group members")

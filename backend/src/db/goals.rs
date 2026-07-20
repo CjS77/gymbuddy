@@ -23,22 +23,30 @@ pub(super) fn row_to_goal(row: &rusqlite::Row) -> rusqlite::Result<Goal> {
     })
 }
 
+/// `metric` reaches the caller as a name. It comes out of a correlated subquery rather than a join
+/// so that every `WHERE` clause built on top of this string keeps working with unqualified column
+/// names — a join would make bare `id` ambiguous between `goals` and `metrics`.
 pub(super) const SELECT_GOAL: &str = "\
-    SELECT id, user_id, kind, exercise_type_id, metric, target_value, direction, priority, \
+    SELECT id, user_id, kind, exercise_type_id, \
+           (SELECT name FROM metrics WHERE metrics.id = goals.metric_id) AS metric, \
+           target_value, direction, priority, \
            start_date, target_date, achieved, notes, created_at, updated_at \
     FROM goals";
 
 impl Database {
     pub fn insert_goal(&self, goal: &Goal) -> anyhow::Result<i64> {
+        // A metric-denominated goal interns its metric on the way in, so it and the weigh-ins it is
+        // judged against necessarily point at one row.
+        let metric_id = goal.metric.as_deref().map(|name| self.get_or_create_metric(name)).transpose()?;
         self.conn().execute(
-            "INSERT INTO goals (user_id, kind, exercise_type_id, metric, target_value, direction, priority, \
+            "INSERT INTO goals (user_id, kind, exercise_type_id, metric_id, target_value, direction, priority, \
                                 start_date, target_date, achieved, notes) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 goal.user_id,
                 goal.kind.as_str(),
                 goal.exercise_type_id,
-                goal.metric,
+                metric_id,
                 goal.target_value,
                 goal.direction.as_str(),
                 goal.priority,

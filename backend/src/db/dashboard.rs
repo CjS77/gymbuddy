@@ -20,7 +20,7 @@ impl Database {
                     r.root_name AS muscle_group, \
                     SUM(s.count * s.value) AS total_volume \
              FROM sets s \
-             JOIN exercise_entry ee ON s.exercise_entry_id = ee.id \
+             JOIN exercise_entries ee ON s.exercise_entry_id = ee.id \
              JOIN roots r ON r.id = s.exercise_type_id \
              WHERE ee.user_id = ?1 \
                AND s.logged_at >= datetime('now', ?2) \
@@ -47,7 +47,7 @@ impl Database {
                  SELECT s.exercise_type_id, s.value, s.logged_at, s.measurement_type_id, \
                         ROW_NUMBER() OVER (PARTITION BY s.exercise_type_id ORDER BY s.value DESC) AS rn \
                  FROM sets s \
-                 JOIN exercise_entry ee ON s.exercise_entry_id = ee.id \
+                 JOIN exercise_entries ee ON s.exercise_entry_id = ee.id \
                  WHERE ee.user_id = ?1 \
              ) \
              SELECT et.id, et.name, r.root_name, mt.name, ranked.value, ranked.logged_at \
@@ -108,7 +108,7 @@ impl Database {
                     COALESCE(SUM(CASE WHEN st.measurement_type_id = 1 AND st.count IS NOT NULL \
                                       THEN st.count * st.value ELSE 0 END), 0) \
              FROM sessions s \
-             LEFT JOIN exercise_entry ee ON ee.session_id = s.id \
+             LEFT JOIN exercise_entries ee ON ee.session_id = s.id \
              LEFT JOIN sets st ON st.exercise_entry_id = ee.id \
              WHERE s.user_id = ?1 \
                AND s.started_at >= date('now', '-6 days', 'weekday 1') \
@@ -161,7 +161,7 @@ impl Database {
                          UNION ALL SELECT et.id FROM exercise_types et JOIN tree t ON et.parent_id = t.id \
                      ) \
                      SELECT COUNT(*) FROM sets s \
-                     JOIN exercise_entry ee ON s.exercise_entry_id = ee.id \
+                     JOIN exercise_entries ee ON s.exercise_entry_id = ee.id \
                      WHERE ee.user_id = ?1 \
                        AND s.exercise_type_id IN (SELECT id FROM tree) \
                        AND (?3 IS NULL OR s.logged_at >= ?3) \
@@ -177,7 +177,7 @@ impl Database {
                      SELECT s.id, s.exercise_entry_id, s.exercise_type_id, s.order_idx, \
                             s.measurement_type_id, s.count, s.value, s.perceived_difficulty, s.comment, s.logged_at \
                      FROM sets s \
-                     JOIN exercise_entry ee ON s.exercise_entry_id = ee.id \
+                     JOIN exercise_entries ee ON s.exercise_entry_id = ee.id \
                      WHERE ee.user_id = ?1 \
                        AND s.exercise_type_id IN (SELECT id FROM tree) \
                        AND (?3 IS NULL OR s.logged_at >= ?3) \
@@ -194,7 +194,7 @@ impl Database {
                 let et_filter = exercise_type_id;
                 let count: i64 = self.conn().query_row(
                     "SELECT COUNT(*) FROM sets s \
-                     JOIN exercise_entry ee ON s.exercise_entry_id = ee.id \
+                     JOIN exercise_entries ee ON s.exercise_entry_id = ee.id \
                      WHERE ee.user_id = ?1 \
                        AND (?2 IS NULL OR s.exercise_type_id = ?2) \
                        AND (?3 IS NULL OR s.logged_at >= ?3) \
@@ -206,7 +206,7 @@ impl Database {
                     "SELECT s.id, s.exercise_entry_id, s.exercise_type_id, s.order_idx, \
                             s.measurement_type_id, s.count, s.value, s.perceived_difficulty, s.comment, s.logged_at \
                      FROM sets s \
-                     JOIN exercise_entry ee ON s.exercise_entry_id = ee.id \
+                     JOIN exercise_entries ee ON s.exercise_entry_id = ee.id \
                      WHERE ee.user_id = ?1 \
                        AND (?2 IS NULL OR s.exercise_type_id = ?2) \
                        AND (?3 IS NULL OR s.logged_at >= ?3) \
