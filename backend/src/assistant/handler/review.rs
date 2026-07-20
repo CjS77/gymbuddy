@@ -363,7 +363,8 @@ impl ReviewFacts {
             Some(_) => Vec::new(),
             None => db.session_performed(session_id)?,
         };
-        let position = roster.as_ref().and_then(|r| r.programme_slot_id).map(|slot_id| position_for_slot(db, slot_id)).transpose()?.flatten();
+        let slot_id = roster.as_ref().and_then(|r| r.programme_slot_id);
+        let position = slot_id.map(|slot_id| position_for_slot(db, slot_id)).transpose()?.flatten();
 
         let goals = db.goal_progress_report(user.id, None, None)?;
         let achieved_goals = mark_and_collect_achieved(db, &goals)?;
