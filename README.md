@@ -131,7 +131,23 @@ indefinitely, erased completely on request.
 
 **HealthEntry** — an injury, illness or wellbeing note, with a type and a severity. Table `health_entries`, type
 `HealthEntry`. Active entries are a **hard constraint** on session design, not a tie-breaker: the designer substitutes
-away from a movement that loads an injured area rather than ranking it lower.
+away from a movement that loads an injured area rather than ranking it lower. **Severity**
+(`mild`/`moderate`/`severe`, type `Severity`) graduates that response — mild works around the pattern, moderate removes
+it, severe does not load the area at all — and the type is *ordered*, so `Mild < Moderate < Severe` is load-bearing
+rather than incidental.
+
+**MovementPattern** — a class of movement an injured body part may not tolerate ("loaded spinal flexion", "overhead
+pressing"). Type `MovementPattern` in `backend/src/science/contraindications.rs`. Deliberately coarser than an exercise
+and finer than a muscle group: the corpus reasons in patterns, and a muscle group is too blunt to be a rail — "no back
+work" would bar the chest-supported row that `injury-lower-back` actually prescribes.
+
+**Contraindication** — one rule pairing a MovementPattern with the Severity at which it stops being a modification and
+becomes a bar, plus the substitutions that keep the session's intent. Type `Contraindication`; the table is `RAILS`,
+one entry per body part the corpus has a document for. It is a **rail, not a preference**: `violations()` runs after the
+designer's response is parsed and before anything is persisted, and a roster containing a barred movement is rejected
+outright rather than softened. Every rule is transcribed from the curated document it cites, so a change here without a
+matching change to `backend/science/injury-*.md` is a bug. This is decision support, not medical advice, and nothing in
+it diagnoses: the rules key off the body part and severity the *user* reported.
 
 ### Looking back
 

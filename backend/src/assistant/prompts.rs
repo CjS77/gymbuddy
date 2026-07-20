@@ -5,7 +5,7 @@ use crate::db::{
     SessionSummary,
 };
 use crate::progression::{BlockIntent, ProgressionAction, ProgressionDirective, ProgressionPolicy, reps_in_reserve};
-use crate::science::ScienceChunk;
+use crate::science::{Contraindication, ScienceChunk};
 
 pub struct PromptContext {
     pub user_name: String,
@@ -503,6 +503,7 @@ pub fn build_designer_prompt(input: &DesignerInputs<'_>) -> String {
     let science_section = format_training_science(science);
     let progression_section = format_progression_policy(progression);
     let health_section = format_health_entries(health_entries);
+    let contraindications_section = format_contraindications(health_entries);
     let exercise_list = format_exercise_list(catalogue);
 
     format!(
@@ -524,9 +525,11 @@ treat a group shown as never trained, or not trained in a long time, as a strong
 This is a decreasing priority order, not a filter: a lower item never vetoes a higher one — it \
 only breaks ties between options the higher items rank equally. EXCEPTION: ACTIVE HEALTH ISSUES \
 are a HARD constraint, not a tie-breaker — never prescribe a movement that loads an injured area; \
-substitute away (e.g. swap heavy spinal-loading deadlifts/squats for a focused one-arm row when \
-the lower back is flaring).\n\
+substitute away. Where CONTRAINDICATIONS below lists movements, that list is checked \
+deterministically after you answer: a roster containing one is rejected outright and the user gets \
+no session, so substitute rather than explain.\n\
 \n\
+{contraindications_section}\
 HOW TO DESIGN (reason like a real trainer):\n\
 - Honour the EQUIPMENT in the philosophy and its weight limits — never prescribe a weight the \
 user cannot load, or equipment they do not have.\n\
@@ -1013,6 +1016,50 @@ pub fn format_health_entries(entries: &[HealthEntry]) -> String {
         ));
     }
     result
+}
+
+/// The contraindication rails for the user's active injuries, rendered for the designer prompt
+/// ([C5.4]).
+///
+/// Built from [`crate::science::contraindications`] — the same table the post-parse rail enforces,
+/// so the prompt cannot drift from the check. That is the point of rendering it rather than writing
+/// it out: the previous prompt described the lower-back case in prose and covered no other joint,
+/// and prose has no way to stay in step with a rule.
+///
+/// Empty when nothing is contraindicated, so a user with no injuries — or an injury the corpus has
+/// no document for — never sees a section listing nothing. The injuries themselves still reach the
+/// model through [`format_health_entries`] either way.
+pub fn format_contraindications(entries: &[HealthEntry]) -> String {
+    let rendered: Vec<String> = crate::science::contraindications::active_injuries(entries)
+        .filter_map(|(body_part, severity)| {
+            let rails = crate::science::contraindications::rails_for(body_part)?;
+            let barred: Vec<&Contraindication> = rails.contraindications.iter().filter(|rule| severity >= rule.bars_from).collect();
+            if barred.is_empty() {
+                return None;
+            }
+            let patterns = barred.iter().map(|rule| rule.pattern.as_str()).collect::<Vec<_>>().join("; ");
+            let swaps = barred.iter().flat_map(|rule| rule.substitutions.iter().copied()).collect::<Vec<_>>();
+            Some(format!(
+                "- {} ({severity}) — DO NOT prescribe: {patterns}.\n  Use instead: {}.\n",
+                body_part.replace('_', " "),
+                dedup_preserving_order(swaps).join(", "),
+            ))
+        })
+        .collect();
+
+    match rendered.is_empty() {
+        true => String::new(),
+        false => format!(
+            "CONTRAINDICATIONS (hard rails for the injuries above; checked after you answer):\n{}\n",
+            rendered.concat()
+        ),
+    }
+}
+
+/// The distinct items of `items`, keeping first-appearance order. Two rails for one body part often
+/// recommend the same swap, and a list that says "hip thrust, hip thrust" reads as a mistake.
+fn dedup_preserving_order(items: Vec<&'static str>) -> Vec<&'static str> {
+    items.iter().enumerate().filter(|(idx, item)| !items[..*idx].contains(item)).map(|(_, item)| *item).collect()
 }
 
 /// The session-level verdict as one compact phrase, e.g.
@@ -1583,6 +1630,53 @@ mod tests {
         let goals = vec![goal(GoalKind::Strength, 5, "Bench Press"), goal(GoalKind::Strength, 1, "Squat")];
         let prompt = designer_prompt_for(&goals, &[], &science_for(&goals));
         assert!(!prompt.contains("COMPETING GOALS"));
+    }
+
+    // ── Contraindications [C5.4] ──────────────────────────────────────────────
+
+    fn injury(body_part: &str, severity: crate::db::Severity) -> HealthEntry {
+        let mut entry = crate::db::new_health_entry(1, HealthEntryType::Injury, "sore");
+        entry.body_part = Some(body_part.to_string());
+        entry.severity = severity;
+        entry
+    }
+
+    /// The section states the barred patterns and the way out, and graduates with severity — the
+    /// same table the post-parse rail enforces, so prompt and check cannot drift apart.
+    #[test]
+    fn contraindications_render_from_the_rail_table() {
+        let block = format_contraindications(&[injury("shoulder", crate::db::Severity::Moderate)]);
+        assert!(block.contains("CONTRAINDICATIONS"), "{block}");
+        assert!(block.contains("overhead pressing"), "the barred pattern must be named: {block}");
+        assert!(block.contains("landmine press"), "and the substitution that keeps the session: {block}");
+        assert!(block.contains("shoulder (moderate)"), "severity must be visible: {block}");
+    }
+
+    /// Mild bars less than moderate, which bars less than severe.
+    #[test]
+    fn the_rendered_section_graduates_with_severity() {
+        let mild = format_contraindications(&[injury("lower back", crate::db::Severity::Mild)]);
+        let severe = format_contraindications(&[injury("lower back", crate::db::Severity::Severe)]);
+        assert!(!mild.contains("axial spinal compression"), "mild keeps the pattern with less load: {mild}");
+        assert!(severe.contains("axial spinal compression"), "severe does not load the spine: {severe}");
+    }
+
+    /// No injuries, or an injury the corpus has no document for, means no section at all — a heading
+    /// over an empty list reads as a rule the model cannot see.
+    #[test]
+    fn nothing_to_bar_renders_nothing() {
+        assert!(format_contraindications(&[]).is_empty());
+        assert!(format_contraindications(&[injury("elbow", crate::db::Severity::Severe)]).is_empty(), "no document, no rail");
+        let illness = crate::db::new_health_entry(1, HealthEntryType::Illness, "flu");
+        assert!(format_contraindications(&[illness]).is_empty(), "an illness contraindicates no movement");
+    }
+
+    /// Two rails for one body part often share a substitution; the list should read like advice.
+    #[test]
+    fn substitutions_are_not_repeated() {
+        let block = format_contraindications(&[injury("knee", crate::db::Severity::Severe)]);
+        let cycling = block.matches("cycling").count();
+        assert_eq!(cycling, 1, "`cycling` substitutes for three knee patterns but should be listed once:\n{block}");
     }
 
     // ── Budget ────────────────────────────────────────────────────────────────

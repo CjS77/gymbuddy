@@ -25,7 +25,8 @@ use crate::db::{
     SessionWithSets, TrainingMode, User,
 };
 use crate::progression::{BlockIntent, ExerciseClass, ExerciseRecord, Outing, ProgressionPolicy, build_policy};
-use crate::science::{ScienceQuery, normalise_body_part, prescription_doc};
+use crate::science::contraindications::{REFER_OUT, rail_doc_ids};
+use crate::science::{ScienceQuery, Violation, normalise_body_part, prescription_doc, violations};
 
 use super::AssistantHandler;
 use super::continuity::parse_sqlite_datetime;
@@ -115,6 +116,25 @@ impl AssistantHandler {
                  optionally adding a hint like /nextworkout upper body.",
             ));
         };
+
+        // The injury rail ([C5.4]). The prompt asks the model to substitute away from an injured
+        // area, and mostly it does — but an active health entry is a hard constraint on the design,
+        // and a hard constraint that is only ever *requested* is not one. Same fail-loud shape as the
+        // unparseable case above: persist nothing, say plainly what was wrong, and log it.
+        //
+        // The whole roster goes, not just the offending exercise. A session is a coherent thing; the
+        // exercise the model chose to load an injured area with was doing a job in it, and silently
+        // returning the remainder would present a design nobody sanctioned as though it had been.
+        let proposed_names: Vec<String> = exercises.iter().map(|ex| ex.exercise.clone()).collect();
+        let blocked = violations(&injuries, &proposed_names);
+        if !blocked.is_empty() {
+            tracing::warn!(
+                user_id = user.id,
+                blocked = ?blocked.iter().map(Violation::describe).collect::<Vec<_>>(),
+                "session design rejected: contraindicated movements for an active injury"
+            );
+            return Ok(View::notice(contraindication_notice(&blocked)));
+        }
 
         self.persist_and_view_roster(user, &philosophy, &mode, title, rationale, exercises).await
     }
@@ -354,7 +374,11 @@ fn build_outing(date: &str, sets: &[ExerciseSet], prescribed: Option<&RosterExer
 /// - each goal kind's canonical prescription ([`crate::science::prescription_doc`]), highest
 ///   priority first, so the bands for the goals in play always reach the model;
 /// - `competing-goals` when the kinds actually differ, so the rule that stops the model averaging
-///   two goals into a session serving neither cannot be ranked away.
+///   two goals into a session serving neither cannot be ranked away;
+/// - the `injury-<part>` document for every active injury the corpus covers ([C5.4]). An injury
+///   already scores far above everything else, but a *score* is a ranking, and a ranking change can
+///   drop a rail. Pinning is the difference between a contraindication that usually arrives and one
+///   that always does, and this is the one place in the system where the distinction hurts someone.
 ///
 /// Nothing here decides *how* goals combine; that judgement lives in the corpus, which is where it
 /// can be reviewed as science.
@@ -364,13 +388,34 @@ fn science_query(goals: &[GoalProgress], injuries: &[HealthEntry], guidance: &st
     let goal_kinds = distinct_kinds_by_priority(goals);
     let prescriptions = goal_kinds.iter().map(|kind| prescription_doc(*kind).to_string());
     let resolution = (goal_kinds.len() > 1).then(|| COMPETING_GOALS_DOC.to_string());
+    let body_parts: Vec<&'static str> =
+        injuries.iter().filter_map(|e| e.body_part.as_deref()).filter_map(normalise_body_part).collect();
+    let rails = rail_doc_ids(body_parts.clone()).map(str::to_string);
     ScienceQuery {
-        injuries: injuries.iter().filter_map(|e| e.body_part.as_deref()).filter_map(normalise_body_part).collect(),
-        pinned_docs: prescriptions.chain(resolution).collect(),
+        pinned_docs: prescriptions.chain(resolution).chain(rails).collect(),
+        injuries: body_parts,
         guidance: guidance.to_string(),
         focus,
         goal_kinds,
     }
+}
+
+/// What the user sees when the rail fires ([C5.4]).
+///
+/// Three things, in this order: what was withheld and why, what to do instead, and where this stops
+/// being the app's business. The last is not boilerplate — a physiotherapist refers out, and the
+/// corpus's injury documents all open with the screen for features that need a clinician. Nothing
+/// here names a condition or offers a diagnosis; the movement and the body part come from what the
+/// user themselves logged.
+fn contraindication_notice(blocked: &[Violation]) -> String {
+    let lines = blocked.iter().map(|v| format!("\u{2022} {}", v.describe())).collect::<Vec<_>>().join("\n");
+    format!(
+        "I designed a session that worked against an injury you have logged, so I haven't saved it:\n\
+         {lines}\n\n\
+         Run /nextworkout again and I'll try once more \u{2014} adding a hint like \
+         \"/nextworkout upper body\" helps. If the injury has cleared up, tell me and I'll update it.\n\n\
+         {REFER_OUT}"
+    )
 }
 
 /// The goal kinds in play, highest priority first, each appearing once. Two strength goals are one
@@ -559,7 +604,7 @@ fn mode_view(mode: &TrainingMode) -> Option<TrainingModeView> {
 mod tests {
     use super::*;
     use super::super::test_support::*;
-    use crate::db::{Difficulty, new_exercise_entry_at, new_exercise_goal, new_exercise_set, new_user};
+    use crate::db::{Difficulty, HealthEntryType, Severity, new_exercise_entry_at, new_exercise_goal, new_exercise_set, new_user};
     use crate::telegram::Message as TgMessage;
 
     #[tokio::test]
@@ -605,6 +650,110 @@ mod tests {
         // The crucial guarantee: designing logs NOTHING.
         assert!(db.get_active_session(user.id).unwrap().is_none(), "nextworkout must not start a session");
         assert!(db.recent_sessions_with_sets(user.id, 5).unwrap().is_empty(), "nextworkout must not log sets");
+    }
+
+    /// Stand up a handler whose designer will return `design`, with a philosophy on file and one
+    /// active injury. Returns the handler, the user and the `/nextworkout` reply text.
+    async fn design_with_injury(design: &str, body_part: &str, severity: Severity) -> (AssistantHandler, crate::db::User, String) {
+        let (handler, _) = setup_handler(design).await;
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
+
+        let user = { handler.db.lock().await.get_user_by_telegram_id("12345").unwrap().unwrap() };
+        {
+            let db = handler.db.lock().await;
+            db.insert_philosophy(user.id, "goal=strength; barbell gym, full rack", "interview").unwrap();
+            let mut entry = crate::db::new_health_entry(user.id, HealthEntryType::Injury, "tweaked it moving house");
+            entry.body_part = Some(body_part.to_string());
+            entry.severity = severity;
+            db.insert_health_entry(&entry).unwrap();
+        }
+
+        let reply = handler.handle_text_message(&msg, "/nextworkout").await.unwrap();
+        let text = shown(&reply);
+        (handler, user, text)
+    }
+
+    /// The ticket's headline requirement, end to end: given an active injury, the design that
+    /// reaches the user contains no contraindicated movement. The model here does exactly what the
+    /// old prompt could only ask it not to.
+    #[tokio::test]
+    async fn nextworkout_rejects_a_roster_that_loads_an_active_injury() {
+        let design = r#"{"message": "Let's go heavy.", "actions": [
+            {"type": "propose_session_roster", "title": "Lower power", "exercises": [
+                {"exercise": "Conventional Deadlift", "target_sets": 5, "target_reps": 3, "target_weight_kg": 140.0},
+                {"exercise": "Back Squat", "target_sets": 3, "target_reps": 5, "target_weight_kg": 100.0}
+            ]}
+        ]}"#;
+        let (handler, user, text) = design_with_injury(design, "lower back", Severity::Moderate).await;
+
+        assert!(!text.contains("Lower power"), "a contraindicated design must not be presented: {text}");
+        assert!(text.contains("Conventional Deadlift"), "the user should be told what was withheld: {text}");
+        assert!(text.contains("hip thrust"), "and what would work instead: {text}");
+
+        // Nothing was written. A rejected design is not a draft the user can start training against.
+        let db = handler.db.lock().await;
+        assert!(db.latest_draft_roster(user.id).unwrap().is_none(), "a rejected design must persist nothing");
+    }
+
+    /// The decision-support boundary, on the surface the user actually reads.
+    #[tokio::test]
+    async fn a_rejected_design_refers_out_rather_than_advising() {
+        let design = r#"{"message": "Push day.", "actions": [
+            {"type": "propose_session_roster", "title": "Shoulders", "exercises": [
+                {"exercise": "Barbell Overhead Press", "target_sets": 4, "target_reps": 6, "target_weight_kg": 50.0}
+            ]}
+        ]}"#;
+        let (_handler, _user, text) = design_with_injury(design, "shoulder", Severity::Severe).await;
+
+        assert!(text.contains("not medical advice"), "the boundary must be explicit: {text}");
+        assert!(text.contains("physiotherapist"), "a PT refers out; so should this: {text}");
+        assert!(text.contains("/nextworkout"), "the user needs a way forward: {text}");
+    }
+
+    /// Mild means work around it, not cancel the day. A rail that rejected every design for a user
+    /// with a niggle would teach them to stop logging niggles.
+    #[tokio::test]
+    async fn a_mild_injury_still_gets_a_session() {
+        let design = r#"{"message": "Steady session.", "actions": [
+            {"type": "propose_session_roster", "title": "Lower steady", "exercises": [
+                {"exercise": "Conventional Deadlift", "target_sets": 3, "target_reps": 5, "target_weight_kg": 80.0},
+                {"exercise": "Leg Press", "target_sets": 3, "target_reps": 10, "target_weight_kg": 120.0}
+            ]}
+        ]}"#;
+        let (handler, user, text) = design_with_injury(design, "lower back", Severity::Mild).await;
+
+        assert!(text.contains("Lower steady"), "mild keeps the pattern with less load and range: {text}");
+        let db = handler.db.lock().await;
+        assert!(db.latest_draft_roster(user.id).unwrap().is_some(), "a mild injury should still produce a roster");
+    }
+
+    /// A design that already substitutes correctly is the fast path, and must not be second-guessed.
+    #[tokio::test]
+    async fn a_correctly_substituted_design_passes_the_rail() {
+        let design = r#"{"message": "Working around your back.", "actions": [
+            {"type": "propose_session_roster", "title": "Back-friendly lower", "exercises": [
+                {"exercise": "Leg Press", "target_sets": 4, "target_reps": 10, "target_weight_kg": 120.0},
+                {"exercise": "Barbell Hip Thrust", "target_sets": 3, "target_reps": 12, "target_weight_kg": 60.0},
+                {"exercise": "Side Plank", "target_sets": 3, "target_secs": 40}
+            ]}
+        ]}"#;
+        let (handler, user, text) = design_with_injury(design, "lower back", Severity::Severe).await;
+
+        assert!(text.contains("Back-friendly lower"), "a compliant design must go through untouched: {text}");
+        let db = handler.db.lock().await;
+        let roster = db.latest_draft_roster(user.id).unwrap().expect("a compliant design persists");
+        assert_eq!(db.list_roster_exercises(roster.id).unwrap().len(), 3);
+    }
+
+    /// The injury document is pinned, not merely ranked — a rail must not be droppable by a change
+    /// to the scoring, which is exactly what [R5.1]/K-50 will replace.
+    #[test]
+    fn an_active_injury_pins_its_corpus_document() {
+        let mut entry = crate::db::new_health_entry(1, HealthEntryType::Injury, "sore");
+        entry.body_part = Some("Lower-Back".to_string());
+        let query = science_query(&[], &[entry], "", Vec::new());
+        assert!(query.pinned_docs.contains(&"injury-lower-back".to_string()), "pinned: {:?}", query.pinned_docs);
     }
 
     #[tokio::test]
@@ -946,8 +1095,8 @@ mod tests {
     }
 
     /// An active injury is a hard constraint, so its contraindications outrank the goal for the
-    /// scarce science budget. [C5.4] turns this into a check on the design itself; here it is only
-    /// a guarantee that the guidance is in front of the model at all.
+    /// scarce science budget. [C5.4] turned this into a check on the design itself; the prompt half
+    /// remains the fast path, and now states the rule rather than gesturing at it.
     #[tokio::test]
     async fn an_active_injury_puts_its_contraindications_in_the_prompt() {
         let prompt = designer_system_prompt(|db, user_id| {
@@ -960,6 +1109,10 @@ mod tests {
         })
         .await;
         assert!(prompt.contains("[S:injury-lower-back]"), "the injury document must reach the prompt:\n{prompt}");
+        // [C5.4]: the prose is only half of it — the rail the roster is checked against is stated as
+        // data, so the model is told the rule it will actually be held to.
+        assert!(prompt.contains("CONTRAINDICATIONS"), "the rails must be stated, not implied:\n{prompt}");
+        assert!(prompt.contains("end-range spinal flexion"), "even a mild back bars end-range flexion:\n{prompt}");
     }
 
     #[test]
