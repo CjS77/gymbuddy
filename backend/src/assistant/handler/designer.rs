@@ -1,7 +1,12 @@
 //! The `/nextworkout` designer: builds a tailored workout from philosophy,
-//! recent history, recovery, goals, injuries and the curated training science
-//! retrieved for them, persists it as a draft session roster, and bounds how long
-//! that draft stays eligible to bind to a session.
+//! recent history, recovery, goals, injuries, the curated training science
+//! retrieved for them and the progression policy computed from their log
+//! ([C5.3]), persists it as a draft session roster, and bounds how long that
+//! draft stays eligible to bind to a session.
+//!
+//! The division of labour in the prompt: the science fixes the *bands* (reps,
+//! intensity, rest, volume), the progression policy fixes the *loads*, and the
+//! model chooses the *exercises*.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -554,7 +559,7 @@ fn mode_view(mode: &TrainingMode) -> Option<TrainingModeView> {
 mod tests {
     use super::*;
     use super::super::test_support::*;
-    use crate::db::{new_exercise_entry_at, new_exercise_goal, new_exercise_set, new_user};
+    use crate::db::{Difficulty, new_exercise_entry_at, new_exercise_goal, new_exercise_set, new_user};
     use crate::telegram::Message as TgMessage;
 
     #[tokio::test]
@@ -1177,5 +1182,151 @@ mod tests {
         assert!(out.contains("Bench Press*:"), "the goal lift trend survives the budget:\n{out}");
         assert!(!out.contains("Bicep Curl"), "the accessory trend is dropped under budget:\n{out}");
         assert!(out.contains("omitted to fit the history budget"), "a truncation note is emitted:\n{out}");
+    }
+
+    // ── Progressive overload policy, through the production path [C5.3] ───────
+
+    /// Log one session at `started_at`, every set at `effort` — the effort the policy reads.
+    fn seed_session_at_effort(db: &Database, user_id: i64, started_at: &str, et_id: i64, weight: f64, reps: i32, effort: Difficulty) -> i64 {
+        let session_id = db.start_session_at(user_id, started_at, None, None).unwrap();
+        let entry_id = db.insert_entry(&new_exercise_entry_at(user_id, Some(session_id), None, started_at)).unwrap();
+        let mut set = new_exercise_set(entry_id, et_id, MeasurementType::WeightReps, weight);
+        set.count = Some(reps);
+        set.perceived_difficulty = effort;
+        set.logged_at = started_at.to_string();
+        db.insert_set(&set).unwrap();
+        session_id
+    }
+
+    /// Bind a one-exercise roster prescribing `target_reps` to `session_id`, so the session has a
+    /// prescription for the policy to measure the performance against ([C1.5]).
+    fn bind_prescription(db: &Database, user_id: i64, session_id: i64, et_id: i64, target_reps: i32, target_weight_kg: f64) {
+        let roster_id = db.create_roster(user_id, "Seeded", None, None).unwrap();
+        db.add_roster_exercise(&RosterExercise {
+            id: 0,
+            roster_id,
+            exercise_type_id: et_id,
+            order_idx: 0,
+            target_sets: Some(3),
+            target_reps: Some(target_reps),
+            target_weight_kg: Some(target_weight_kg),
+            target_secs: None,
+            notes: None,
+        })
+        .unwrap();
+        db.bind_roster_to_session(roster_id, session_id).unwrap();
+    }
+
+    /// The whole ticket, end to end: two easy sessions on the same load, and `/nextworkout` puts a
+    /// concrete increment in front of the model instead of "if the last sets were easy, progress".
+    #[tokio::test]
+    async fn nextworkout_carries_a_computed_increment_for_a_lift_that_earned_it() {
+        let prompt = designer_system_prompt(|db, user_id| {
+            let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+            seed_session_at_effort(db, user_id, "2026-07-11 10:00:00", bench.id, 60.0, 8, Difficulty::Easy);
+            seed_session_at_effort(db, user_id, "2026-07-15 10:00:00", bench.id, 60.0, 8, Difficulty::Easy);
+        })
+        .await;
+
+        assert!(prompt.contains("PROGRESSION POLICY"), "the computed policy must reach the designer:\n{prompt}");
+        assert!(prompt.contains("Bench Press: PROGRESS 60.0kg -> 62.5kg"), "an upper-body compound moves by 2.5%:\n{prompt}");
+        assert!(prompt.contains("it is BINDING, not advisory"));
+    }
+
+    /// The prescribed-vs-actual half ([C1.5]): with a roster bound to each session, the 2-for-2 rule
+    /// is measured against what was actually prescribed rather than against effort alone. Both
+    /// sessions here were logged `medium`, so only the rep surplus can have earned the increment.
+    #[tokio::test]
+    async fn nextworkout_progresses_on_reps_beaten_against_the_roster_prescription() {
+        let prompt = designer_system_prompt(|db, user_id| {
+            let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+            for date in ["2026-07-11 10:00:00", "2026-07-15 10:00:00"] {
+                let session = seed_session_at_effort(db, user_id, date, bench.id, 60.0, 10, Difficulty::Medium);
+                bind_prescription(db, user_id, session, bench.id, 8, 60.0);
+            }
+        })
+        .await;
+        assert!(prompt.contains("Bench Press: PROGRESS 60.0kg -> 62.5kg"), "beating the prescription by 2 twice earns load:\n{prompt}");
+        assert!(prompt.contains("the 2-for-2 rule is met"), "the reason must name the rule it applied:\n{prompt}");
+    }
+
+    /// Two sessions at or beyond failure back the load off, and the prompt says so where the model
+    /// sets weights. This is the half of the policy that keeps people training.
+    #[tokio::test]
+    async fn nextworkout_backs_off_a_lift_that_keeps_hitting_failure() {
+        let prompt = designer_system_prompt(|db, user_id| {
+            let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+            seed_session_at_effort(db, user_id, "2026-07-11 10:00:00", bench.id, 60.0, 5, Difficulty::Failure);
+            seed_session_at_effort(db, user_id, "2026-07-15 10:00:00", bench.id, 60.0, 5, Difficulty::Failure);
+        })
+        .await;
+        assert!(prompt.contains("Bench Press: BACK OFF 60.0kg -> 55.0kg"), "repeated failure must reduce the load:\n{prompt}");
+    }
+
+    /// [C4.3] → [C5.3]: the programme block covering the current slot's week says deload, so the
+    /// design is told to hold every load and cut volume — overriding an increment the lift had
+    /// otherwise earned outright.
+    #[tokio::test]
+    async fn a_deload_block_overrides_progression_in_the_designer_prompt() {
+        let prompt = designer_system_prompt(|db, user_id| {
+            let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+            seed_session_at_effort(db, user_id, "2026-07-11 10:00:00", bench.id, 60.0, 8, Difficulty::Easy);
+            seed_session_at_effort(db, user_id, "2026-07-15 10:00:00", bench.id, 60.0, 8, Difficulty::Easy);
+
+            let programme = crate::db::new_programme(user_id, "12-week hypertrophy", 2, "upper/lower", "double progression");
+            let programme_id = db.create_programme(&programme).unwrap();
+            db.activate_programme(programme_id).unwrap();
+            db.add_programme_block(&crate::db::new_programme_block(programme_id, 1, 2, "deload")).unwrap();
+            db.add_programme_slot(&crate::db::new_programme_slot(programme_id, 1, 1, "upper")).unwrap();
+        })
+        .await;
+
+        assert!(prompt.contains("PROGRESSION POLICY — DELOAD WEEK"), "the deload must head the section:\n{prompt}");
+        assert!(prompt.contains("Bench Press: DELOAD at 60.0kg"), "an earned increment is overridden by the block:\n{prompt}");
+        assert!(!prompt.contains("Bench Press: PROGRESS"), "nothing may progress during a deload week:\n{prompt}");
+        // The block's focus also reaches retrieval, so the deload science lands alongside the rule.
+        assert!(prompt.contains("[S:progressive-overload]"), "the deload block should pull in the progression document:\n{prompt}");
+    }
+
+    /// Block and slot focus become retrieval terms, split into words because the corpus matches
+    /// whole tags. Ad-hoc mode contributes nothing — there is no slot to read a focus from.
+    #[test]
+    fn focus_terms_split_block_and_slot_focus_into_corpus_words() {
+        let programme = crate::db::new_programme(1, "P", 3, "upper/lower", "linear");
+        let slot = crate::db::new_programme_slot(1, 5, 1, "upper");
+        let mode = TrainingMode::Programme { programme: programme.clone(), slot };
+        let deload = BlockIntent::Deload { focus: "Deload / technique".to_string() };
+
+        assert_eq!(focus_terms(&mode, &deload), ["upper", "deload", "technique"]);
+        assert_eq!(focus_terms(&mode, &BlockIntent::Ordinary), ["upper"]);
+        assert!(focus_terms(&TrainingMode::AdHoc { programme: None }, &BlockIntent::Ordinary).is_empty());
+        // A word repeated across the slot and the block is one term, not two.
+        let repeated = BlockIntent::Deload { focus: "upper deload".to_string() };
+        assert_eq!(focus_terms(&mode, &repeated), ["upper", "deload"]);
+    }
+
+    /// An exercise revisited later in the same session is one outing, not two — otherwise a user who
+    /// comes back to the bench after squats looks like they trained it on two separate days, and the
+    /// two-session rules fire on a single session's work.
+    #[test]
+    fn sets_are_grouped_per_exercise_across_a_session_entries() {
+        let db = Database::open_in_memory().unwrap();
+        let user_id = db.insert_user(&new_user("Tester", None, "UTC")).unwrap();
+        let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+        let squat = db.get_exercise_type_by_name("Squat").unwrap().unwrap();
+
+        let session_id = db.start_session_at(user_id, "2026-07-15 10:00:00", None, None).unwrap();
+        for (et_id, weight) in [(bench.id, 60.0), (squat.id, 100.0), (bench.id, 62.5)] {
+            let entry_id = db.insert_entry(&new_exercise_entry_at(user_id, Some(session_id), None, "2026-07-15 10:00:00")).unwrap();
+            let mut set = new_exercise_set(entry_id, et_id, MeasurementType::WeightReps, weight);
+            set.count = Some(8);
+            db.insert_set(&set).unwrap();
+        }
+
+        let sessions = db.recent_sessions_with_sets(user_id, 5).unwrap();
+        let grouped = sets_by_exercise(&sessions[0].1);
+        assert_eq!(grouped.len(), 2, "one group per exercise, not one per entry");
+        let bench_sets = grouped.iter().find(|(id, _)| *id == bench.id).expect("bench group").1.len();
+        assert_eq!(bench_sets, 2, "both bench entries roll into one outing");
     }
 }

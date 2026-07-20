@@ -10,7 +10,7 @@ science corpus rather than the model's unaided recall, and in a long-term progra
 
 | Path              | What it is                                                                              |
 | ----------------- | --------------------------------------------------------------------------------------- |
-| `backend/`        | The server: SQLite store (`db/`), the assistant loop (`assistant/`), the training science corpus and index (`science/`), the v1→v2 import path (`dump/`), and the Telegram client (`telegram/`) |
+| `backend/`        | The server: SQLite store (`db/`), the assistant loop (`assistant/`), the training science corpus and index (`science/`), the progressive-overload policy (`progression/`), the v1→v2 import path (`dump/`), and the Telegram client (`telegram/`) |
 | `backend/migrations/` | The schema. `01-schema/up.sql` is the v2 baseline and the best single description of the domain |
 | `backend/science/`| The curated science corpus: markdown with YAML front-matter, compiled into the binary     |
 | `crates/proto/`   | Wire types shared by server and clients. postcard-encoded, so variant *order* is the format |
@@ -84,6 +84,32 @@ designed for that slot and stamped with its id.
 **LifecycleStatus** — the four states `draft`/`active`/`completed`/`abandoned`, shared by SessionRoster and Programme
 because they are genuinely the same four states over the same stored strings. Distinct from **SlotStatus**, which is
 the ProgrammeSlot's own `pending`/`filled`/`missed`/`skipped`.
+
+### Deciding what comes next
+
+**ProgressionDirective** — one exercise's instruction for the next session: `PROGRESS` / `HOLD` / `BACK OFF` /
+`DELOAD`, the load it applies to, and the reason it was reached. Type `ProgressionDirective` in
+`backend/src/progression/`. Never persisted — recomputed per design from the log, so it can never disagree with the
+sets it was derived from. The designer prompt carries it as a **binding** instruction, not a suggestion.
+
+**ProgressionPolicy** — a whole design's worth of directives, plus the week's BlockIntent and an optional
+unplanned-deload recommendation for when back-off signals accumulate across several exercises at once. Type
+`ProgressionPolicy`, same module.
+
+**BlockIntent** — what a ProgrammeBlock says this week is for, as the progression policy reads it: `Ordinary`, or
+`Deload` when the block's focus text says so. A deload overrides ordinary progression outright. Only programme mode
+resolves one, and *no* block is `Ordinary` — never an implied deload.
+
+**ExerciseClass** — how big a load step a movement takes: `LowerBodyCompound`, `UpperBodyCompound`, `Isolation`,
+`Conditioning`. Derived from catalogue data (top-level muscle group plus the exercise-level `purpose`, which
+variations inherit), never stored. It exists because the same 5kg is a routine step on a squat and a 25% jump on a
+lateral raise.
+
+*On effort:* sets are logged on the four-point `Difficulty` scale (`easy`/`medium`/`hard`/`failure`) because that is
+how people describe a set out loud. There is deliberately **no** RPE or RIR field anywhere in the schema: the scale
+is *read* as repetitions in reserve (easy = 4+, medium = 2-3, hard = 1-2, failure = 0) by
+`progression::reps_in_reserve`, and that reading is how the log is held against the science corpus's
+RIR-denominated prescriptions.
 
 ### What the coach knows about you
 
