@@ -13,7 +13,7 @@ use crate::db::{
     SetEditError, User, new_body_metric, new_exercise_entry_at, new_exercise_set, new_goal, new_health_entry,
 };
 
-use super::designer::proposed_plan_within_window;
+use super::designer::draft_roster_within_window;
 use super::{AssistantHandler, format_set_short};
 use gymbuddy_proto::TimerSignal;
 
@@ -181,11 +181,11 @@ impl AssistantHandler {
                 };
                 tracing::debug!(id = session.id, "Ending session");
                 db.end_session(session.id)?;
-                // Complete a guided workout plan bound to this session.
-                if let Some(plan) = db.active_roster_for_user(user.id)?
-                    && plan.session_id == Some(session.id)
+                // Complete a guided roster bound to this session.
+                if let Some(roster) = db.active_roster_for_user(user.id)?
+                    && roster.session_id == Some(session.id)
                 {
-                    db.set_roster_status(plan.id, crate::db::LifecycleStatus::Completed)?;
+                    db.set_roster_status(roster.id, crate::db::LifecycleStatus::Completed)?;
                 }
                 // end_session distilled a proposed verdict from the final set of each
                 // exercise; ask the user to confirm or override it. Resting is over
@@ -300,12 +300,12 @@ impl AssistantHandler {
             }
             AssistantAction::SetSessionOverride { note } => {
                 let db = self.db.lock().await;
-                // A one-off attaches to the plan in flight so it expires with that plan
-                // and never touches the philosophy. With no plan in flight there is
-                // nothing to scope it to, so drop it rather than leak it anywhere durable.
+                // A one-off attaches to the roster in flight so it expires with that
+                // roster and never touches the philosophy. With no roster in flight there
+                // is nothing to scope it to, so drop it rather than leak it durably.
                 match db.inflight_roster_for_user(user.id)? {
-                    Some(plan) => {
-                        db.append_roster_override(plan.id, note)?;
+                    Some(roster) => {
+                        db.append_roster_override(roster.id, note)?;
                         Ok(Some("Got it -- just for this workout.".to_string()).into())
                     }
                     None => Ok(Some("There's no workout in progress to apply that to right now.".to_string()).into()),
@@ -366,7 +366,7 @@ impl AssistantHandler {
         let Some(roster) = db.latest_draft_roster(user_id)? else {
             return Ok(());
         };
-        if proposed_plan_within_window(&roster.created_at, Utc::now().naive_utc()) {
+        if draft_roster_within_window(&roster.created_at, Utc::now().naive_utc()) {
             db.bind_roster_to_session(roster.id, session_id)?;
             tracing::debug!(roster_id = roster.id, session_id, "Bound draft roster to session for guided execution");
         } else {

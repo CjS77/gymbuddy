@@ -115,7 +115,7 @@ AMBIGUOUS EXERCISE / SUPERSET DETECTION below).\n\
 \"perceived_difficulty\": \"easy|medium|hard|failure\", \"superset\": <bool, optional>}}\n\
 - {{\"type\": \"log_exercise_distance\", \"exercise\": \"<EXACT NAME>\", \"distance_m\": N.N, \
 \"duration_secs\": N, \"perceived_difficulty\": \"easy|medium|hard|failure\", \"superset\": <bool, optional>}}\n\
-- {{\"type\": \"start_session\", \"notes\": \"<optional>\", \"plan\": \"<optional schedule name>\"}}\n\
+- {{\"type\": \"start_session\", \"notes\": \"<optional>\"}}\n\
 - {{\"type\": \"end_session\"}}\n\
 - {{\"type\": \"close_exercise_entry\", \"exercise\": \"<EXACT NAME, optional>\", \"entry_id\": <optional>}}\n\
 - {{\"type\": \"confirm_close_exercise_entry\", \"exercise\": \"<EXACT NAME, optional>\", \"entry_id\": <optional>}}\n\
@@ -154,7 +154,7 @@ before→after summary to your reply.\n\
 goblet squats to barbell\", \"keep deadlifts light, my back is fragile\") to their \
 training philosophy so FUTURE /nextworkout designs respect it. Use it only for \
 durable, FROM-NOW-ON preferences — never for a one-off change to today's workout.\n\
-- {{\"type\": \"set_session_override\", \"note\": \"<today-only change to the plan in flight>\"}}\n\
+- {{\"type\": \"set_session_override\", \"note\": \"<today-only change to the roster in flight>\"}}\n\
   Records a one-off, TODAY-ONLY override the user voices for the current workout \
 (e.g. \"I don't feel like bench today, let's do flys\", \"skip legs this session\"). \
 It attaches to the workout in flight only, is honoured for the rest of THIS session, \
@@ -215,8 +215,8 @@ decision (\"one more\" → log_exercise; \"move on\" / \"done\" → close_exerci
 automatically (\"You've only done {{m}} sets...\"). On the user's reaffirmation, emit \
 confirm_close_exercise_entry to bypass the pushback. If they decide to keep going, emit \
 log_exercise as normal.\n\
-- After an entry is closed and the active plan has a `next` exercise, suggest that exercise \
-to the user (mention target sets/reps/weight from the plan if present).\n\
+- After an entry is closed and the SESSION ROSTER has a NEXT SET, suggest that exercise \
+to the user (mention its target sets/reps/weight).\n\
 - end_session automatically closes any still-open entries.\n\
 \n\
 AMBIGUOUS EXERCISE / SUPERSET DETECTION:\n\
@@ -476,8 +476,8 @@ pub fn build_designer_prompt(
     format!(
         "You are a personal gym trainer DESIGNING one training session for the user right now. \
 Produce a highly tailored, specific session that pushes the user toward their goals, from the \
-TRAINING SCIENCE and the user-specific information below. You are only designing a plan — you do \
-NOT log any sets and do NOT start a session.\n\
+TRAINING SCIENCE and the user-specific information below. You are only designing a session roster \
+— you do NOT log any sets and do NOT start a session.\n\
 \n\
 {science_rule}\
 \n\

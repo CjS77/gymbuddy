@@ -179,8 +179,8 @@ pub enum AssistantAction {
         note: String,
     },
     /// Record a today-only override the user voices mid-workout (e.g. "I don't feel
-    /// like bench today, let's do flys"). Applies ONLY to the plan in flight — it is
-    /// stored on that plan, never written to the philosophy, and gone by the next
+    /// like bench today, let's do flys"). Applies ONLY to the roster in flight — it is
+    /// stored on that roster, never written to the philosophy, and gone by the next
     /// design. Use this for one-offs; use AppendPhilosophyNote for durable changes.
     SetSessionOverride {
         #[serde(alias = "content", alias = "override")]

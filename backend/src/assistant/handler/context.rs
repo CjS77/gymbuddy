@@ -8,7 +8,7 @@ use crate::assistant::prompts::{EntryView, PromptContext, RosterExerciseView, Ro
 use crate::db::{Database, ExerciseSet, ExerciseTypeWithAncestry, Session, User};
 
 use super::continuity::compute_last_activity_age_hours;
-use super::designer::proposed_plan_within_window;
+use super::designer::draft_roster_within_window;
 use super::{AssistantHandler, format_set_short};
 
 impl AssistantHandler {
@@ -106,7 +106,7 @@ impl AssistantHandler {
         // Otherwise a freshly designed roster ready to start — but only while it is
         // recent, so a stale design does not resurface as "ready" days later.
         if let Some(roster) = db.latest_draft_roster(user_id)?
-            && proposed_plan_within_window(&roster.created_at, Utc::now().naive_utc())
+            && draft_roster_within_window(&roster.created_at, Utc::now().naive_utc())
         {
             return Ok(Some(self.roster_progress(db, &roster, &std::collections::HashSet::new(), false)?));
         }

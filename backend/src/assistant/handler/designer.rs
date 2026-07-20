@@ -119,10 +119,10 @@ impl AssistantHandler {
         let mut notes: Vec<String> = Vec::new();
 
         let db = self.db.lock().await;
-        let plan_id = db.create_roster(user.id, &title, rationale.as_deref(), Some(philosophy.id))?;
+        let roster_id = db.create_roster(user.id, &title, rationale.as_deref(), Some(philosophy.id))?;
         if let TrainingMode::Programme { slot, .. } = mode {
-            db.bind_roster_to_slot(plan_id, slot.id)?;
-            tracing::debug!(plan_id, slot_id = slot.id, "Designed workout bound to programme slot");
+            db.bind_roster_to_slot(roster_id, slot.id)?;
+            tracing::debug!(roster_id, slot_id = slot.id, "Designed roster bound to programme slot");
         }
 
         for (idx, ex) in exercises.into_iter().enumerate() {
@@ -132,7 +132,7 @@ impl AssistantHandler {
             };
             db.add_roster_exercise(&RosterExercise {
                 id: 0,
-                roster_id: plan_id,
+                roster_id,
                 exercise_type_id: et.exercise_type.id,
                 order_idx: idx as i32,
                 target_sets: ex.target_sets,
@@ -352,17 +352,17 @@ fn format_set_desc(set: &ExerciseSet) -> String {
     }
 }
 
-/// How long a designed-but-unstarted `/nextworkout` plan stays eligible to bind to a
+/// How long a designed-but-unstarted `/nextworkout` roster stays eligible to bind to a
 /// new session. After this it is stale: a week-old design must not silently attach to
-/// an unrelated workout the user happens to start.
-const PROPOSED_PLAN_BIND_WINDOW_HOURS: i64 = 12;
+/// an unrelated session the user happens to start.
+const DRAFT_ROSTER_BIND_WINDOW_HOURS: i64 = 12;
 
-/// Whether a `proposed` plan created at `created_at` is still recent enough to bind to
+/// Whether a draft roster created at `created_at` is still recent enough to bind to
 /// a session. An unparseable timestamp fails open (treated as in-window — we just
 /// wrote it), matching `compute_last_activity_age_hours`'s lenient parsing.
-pub(super) fn proposed_plan_within_window(created_at: &str, now: NaiveDateTime) -> bool {
+pub(super) fn draft_roster_within_window(created_at: &str, now: NaiveDateTime) -> bool {
     match parse_sqlite_datetime(created_at) {
-        Some(ts) => (now - ts).num_hours() < PROPOSED_PLAN_BIND_WINDOW_HOURS,
+        Some(ts) => (now - ts).num_hours() < DRAFT_ROSTER_BIND_WINDOW_HOURS,
         None => true,
     }
 }
@@ -442,10 +442,10 @@ mod tests {
         assert!(!text.contains("Programme:") && !text.contains("Ad-hoc session"), "no mode line without a programme: {text}");
 
         let db = handler.db.lock().await;
-        let plan = db.latest_draft_roster(user.id).unwrap().expect("a proposed plan should be persisted");
-        assert_eq!(plan.title, "Upper push");
-        assert_eq!(plan.programme_slot_id, None, "a plan designed with no programme is ad-hoc");
-        assert_eq!(db.list_roster_exercises(plan.id).unwrap().len(), 2);
+        let roster = db.latest_draft_roster(user.id).unwrap().expect("a draft roster should be persisted");
+        assert_eq!(roster.title, "Upper push");
+        assert_eq!(roster.programme_slot_id, None, "a roster designed with no programme is ad-hoc");
+        assert_eq!(db.list_roster_exercises(roster.id).unwrap().len(), 2);
         // The crucial guarantee: designing logs NOTHING.
         assert!(db.get_active_session(user.id).unwrap().is_none(), "nextworkout must not start a session");
         assert!(db.recent_sessions_with_sets(user.id, 5).unwrap().is_empty(), "nextworkout must not log sets");
@@ -473,8 +473,8 @@ mod tests {
         assert!(text.contains("Skipped") && text.contains("Jetpack Flips"), "unresolved exercise should be noted, not fatal");
 
         let db = handler.db.lock().await;
-        let plan = db.latest_draft_roster(user.id).unwrap().unwrap();
-        assert_eq!(db.list_roster_exercises(plan.id).unwrap().len(), 1, "only the resolved exercise is persisted");
+        let roster = db.latest_draft_roster(user.id).unwrap().unwrap();
+        assert_eq!(db.list_roster_exercises(roster.id).unwrap().len(), 1, "only the resolved exercise is persisted");
     }
 
     const DESIGN_RESPONSE: &str = r#"{"message": "Here's your session.", "actions": [
@@ -497,7 +497,7 @@ mod tests {
     }
 
     /// [C1.4]: with an active programme, `/nextworkout` designs against the current
-    /// slot — the plan records it, the slot fills, and the user is told which slot
+    /// slot — the roster records it, the slot fills, and the user is told which slot
     /// today's session is.
     #[tokio::test]
     async fn nextworkout_under_active_programme_fills_the_current_slot() {
@@ -515,8 +515,8 @@ mod tests {
         assert!(text.contains("Programme: 12-week hypertrophy — week 1, day 1: upper"), "mode line missing: {text}");
 
         let db = handler.db.lock().await;
-        let plan = db.latest_draft_roster(user.id).unwrap().unwrap();
-        assert_eq!(plan.programme_slot_id, Some(slots[0]), "the plan records the slot it fills");
+        let roster = db.latest_draft_roster(user.id).unwrap().unwrap();
+        assert_eq!(roster.programme_slot_id, Some(slots[0]), "the roster records the slot it fills");
         assert_eq!(db.get_programme_slot(slots[0]).unwrap().unwrap().status, crate::db::SlotStatus::Filled);
         assert_eq!(db.get_programme_slot(slots[1]).unwrap().unwrap().status, crate::db::SlotStatus::Pending);
     }
@@ -545,12 +545,12 @@ mod tests {
 
         {
             let db = handler.db.lock().await;
-            let plan = db.latest_draft_roster(user.id).unwrap().unwrap();
-            assert_eq!(plan.programme_slot_id, None, "an ad-hoc plan records no slot");
+            let roster = db.latest_draft_roster(user.id).unwrap().unwrap();
+            assert_eq!(roster.programme_slot_id, None, "an ad-hoc roster records no slot");
         }
 
         // Run the design through its whole lifecycle: start a session (binding the
-        // plan for guided execution), then end it (completing the plan).
+        // roster for guided execution), then end it (completing the roster).
         llm.set_response(r#"{"message": "Let's go!", "actions": [{"type": "start_session"}]}"#);
         let _ = handler.handle_text_message(&msg, "start my workout").await.unwrap();
         llm.set_response(r#"{"message": "Nice work!", "actions": [{"type": "end_session"}]}"#);
@@ -571,7 +571,7 @@ mod tests {
     async fn nextworkout_without_valid_proposal_fails_loud_and_persists_nothing() {
         // The designer replies with prose but never emits a `propose_session_roster` action.
         // The old behaviour rendered that prose as if a workout had been created while
-        // saving nothing; now it must fail loudly and persist no plan (ticket C1.7).
+        // saving nothing; now it must fail loudly and persist no roster (ticket C1.7).
         let (handler, _) = setup_handler("Here's a great session: heavy bench and some squats. Have fun!").await;
         let msg = make_message(12345, "hello");
         let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
@@ -585,11 +585,11 @@ mod tests {
         assert!(text.contains("couldn't design a valid workout"), "should surface a clear retry notice, got: {text}");
 
         let db = handler.db.lock().await;
-        assert!(db.latest_draft_roster(user.id).unwrap().is_none(), "no phantom plan may be persisted on a failed design");
+        assert!(db.latest_draft_roster(user.id).unwrap().is_none(), "no phantom roster may be persisted on a failed design");
     }
 
     /// Register a user, give them a philosophy, design a one-exercise workout, then
-    /// start a session — returning the user once a guided plan is bound.
+    /// start a session — returning the user once a guided roster is bound.
     async fn start_guided_workout(handler: &AssistantHandler, llm: &MockLlm, msg: &TgMessage) -> User {
         let _ = handler.handle_text_message(msg, "hello").await.unwrap();
         let user = { handler.db.lock().await.get_user_by_telegram_id("12345").unwrap().unwrap() };
@@ -617,9 +617,9 @@ mod tests {
 
         {
             let db = handler.db.lock().await;
-            let plan = db.active_roster_for_user(user.id).unwrap().expect("plan should be active after start");
+            let roster = db.active_roster_for_user(user.id).unwrap().expect("roster should be active after start");
             let session = db.get_active_session(user.id).unwrap().unwrap();
-            assert_eq!(plan.session_id, Some(session.id), "plan bound to the session");
+            assert_eq!(roster.session_id, Some(session.id), "roster bound to the session");
             assert!(db.latest_draft_roster(user.id).unwrap().is_none(), "no longer 'proposed' once active");
         }
 
@@ -637,7 +637,7 @@ mod tests {
         let (handler, llm) = setup_handler("").await;
         let msg = make_message(12345, "hello");
         let user = start_guided_workout(&handler, &llm, &msg).await;
-        let plan_id = handler.db.lock().await.active_roster_for_user(user.id).unwrap().unwrap().id;
+        let roster_id = handler.db.lock().await.active_roster_for_user(user.id).unwrap().unwrap().id;
 
         // A durable preference voiced mid-workout is appended to the philosophy.
         llm.set_response(r#"{"message": "Got it.", "actions": [{"type": "append_philosophy_note", "note": "prefers goblet squats"}]}"#);
@@ -649,12 +649,12 @@ mod tests {
             assert_eq!(latest.source, "note");
         }
 
-        // Ending the session completes the bound plan.
+        // Ending the session completes the bound roster.
         llm.set_response(r#"{"message": "Nice work!", "actions": [{"type": "end_session"}]}"#);
         let _ = handler.handle_text_message(&msg, "done").await.unwrap();
         let db = handler.db.lock().await;
         assert!(db.active_roster_for_user(user.id).unwrap().is_none());
-        assert_eq!(db.get_roster(plan_id).unwrap().unwrap().status, crate::db::LifecycleStatus::Completed);
+        assert_eq!(db.get_roster(roster_id).unwrap().unwrap().status, crate::db::LifecycleStatus::Completed);
     }
 
     #[tokio::test]
@@ -662,9 +662,9 @@ mod tests {
         let (handler, llm) = setup_handler("").await;
         let msg = make_message(12345, "hello");
         let user = start_guided_workout(&handler, &llm, &msg).await;
-        let plan_id = handler.db.lock().await.active_roster_for_user(user.id).unwrap().unwrap().id;
+        let roster_id = handler.db.lock().await.active_roster_for_user(user.id).unwrap().unwrap().id;
 
-        // A one-off voiced mid-workout attaches to the plan in flight, NOT the philosophy.
+        // A one-off voiced mid-workout attaches to the roster in flight, NOT the philosophy.
         llm.set_response(
             r#"{"message": "Sure, flys today.", "actions": [{"type": "set_session_override", "note": "no bench today, do flys instead"}]}"#,
         );
@@ -673,15 +673,15 @@ mod tests {
 
         {
             let db = handler.db.lock().await;
-            let plan = db.get_roster(plan_id).unwrap().unwrap();
-            assert!(plan.override_note.as_deref().unwrap().contains("flys"), "override stored on the plan");
+            let roster = db.get_roster(roster_id).unwrap().unwrap();
+            assert!(roster.override_note.as_deref().unwrap().contains("flys"), "override stored on the roster");
             // The philosophy must be untouched — a one-off there would ban bench forever.
             let latest = db.latest_philosophy(user.id).unwrap().unwrap();
             assert_eq!(latest.source, "interview", "no philosophy note should have been appended");
             assert!(!latest.content.contains("bench"), "one-off must not reach the philosophy");
         }
 
-        // On the next turn the override surfaces in the coaching prompt for the plan in flight.
+        // On the next turn the override surfaces in the coaching prompt for the roster in flight.
         llm.set_response(r#"{"message": "ok", "actions": []}"#);
         let _ = handler.handle_text_message(&msg, "what's next?").await.unwrap();
         let last = llm.recorded_requests().pop().unwrap();
@@ -689,7 +689,7 @@ mod tests {
         assert!(system.contains("TODAY-ONLY OVERRIDES"), "override must reach the coaching prompt");
         assert!(system.contains("flys"));
 
-        // End the session, then design a fresh plan: the one-off does NOT carry over.
+        // End the session, then design a fresh roster: the one-off does NOT carry over.
         llm.set_response(r#"{"message": "Done!", "actions": [{"type": "end_session"}]}"#);
         let _ = handler.handle_text_message(&msg, "done").await.unwrap();
         llm.set_response(
@@ -701,7 +701,7 @@ mod tests {
 
         let db = handler.db.lock().await;
         let fresh = db.latest_draft_roster(user.id).unwrap().unwrap();
-        assert_ne!(fresh.id, plan_id, "a new plan was designed");
+        assert_ne!(fresh.id, roster_id, "a new roster was designed");
         assert!(fresh.override_note.is_none(), "the one-off must not survive into the next design");
     }
 
@@ -887,13 +887,13 @@ mod tests {
     fn proposed_plan_window_excludes_stale_designs() {
         let now = parse_sqlite_datetime("2026-06-19 12:00:00").unwrap();
         // Designed an hour ago → still bindable.
-        assert!(proposed_plan_within_window("2026-06-19 11:00:00", now));
+        assert!(draft_roster_within_window("2026-06-19 11:00:00", now));
         // Designed yesterday → stale, must not bind to today's session.
-        assert!(!proposed_plan_within_window("2026-06-18 11:00:00", now));
+        assert!(!draft_roster_within_window("2026-06-18 11:00:00", now));
         // Exactly at the 12h cutoff → stale (the window is exclusive).
-        assert!(!proposed_plan_within_window("2026-06-19 00:00:00", now));
+        assert!(!draft_roster_within_window("2026-06-19 00:00:00", now));
         // Unparseable timestamp fails open (we just wrote it).
-        assert!(proposed_plan_within_window("not a date", now));
+        assert!(draft_roster_within_window("not a date", now));
     }
 
     // ── Designer history window ───────────────────────────────────────────────
