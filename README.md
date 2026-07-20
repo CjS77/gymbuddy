@@ -83,6 +83,20 @@ as week 1 of the grid. The ProgrammeSlots *are* the durable form; the template i
 *What varies week to week is the ProgrammeBlock, not the template* — that is what makes week 9 harder than week 1
 while both train the same days.
 
+**ProgrammeContext** — where one design sits in its Programme, as the designer prompt states it: week N of M, the day
+within the week, the ProgrammeBlock covering that week, the ProgrammeSlot's focus, and adherence so far. Type
+`ProgrammeContext`, read per design by `Database::programme_context` and never persisted — every field is derived from
+the programme grid, so it cannot drift from it. Only programme mode resolves one: an ad-hoc design fills no slot, so it
+has no position to report and the prompt carries no programme section at all. It states the block's **focus** and stops
+there — what that focus does to the *loads* is the ProgressionPolicy's to say, and saying it twice is how a prompt
+starts arguing with itself.
+
+**SlotAdherence** — the count half of a ProgrammeContext: of the ProgrammeSlots scheduled before the one being
+designed, how many were actually trained, and how many were `missed` or `skipped`. Type `SlotAdherence`. "Trained" is
+the same test `next_design_slot` applies — a SessionRoster bound to the slot that reached `active` or `completed` — so
+a slot merely `filled` with a design nobody executed is not adherence, and slot selection can never disagree with the
+adherence the prompt reports.
+
 **TrainingMode** — the mode a session design runs in. Type `TrainingMode`; resolved per design, never persisted.
 - `AdHoc` — a one-off. The first-class default: it never requires a Programme, and it stays available *while* one is
   active as a deliberate one-off that leaves every slot untouched.

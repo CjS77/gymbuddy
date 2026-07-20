@@ -1,8 +1,8 @@
 use chrono::NaiveDate;
 
 use crate::db::{
-    Difficulty, ExerciseSet, ExerciseTypeWithAncestry, GoalProgress, HealthEntry, MeasurementType, MuscleRecovery, Session,
-    SessionSummary,
+    Difficulty, ExerciseSet, ExerciseTypeWithAncestry, GoalProgress, HealthEntry, MeasurementType, MuscleRecovery, ProgrammeContext,
+    Session, SessionSummary, SlotAdherence,
 };
 use crate::progression::{BlockIntent, ProgressionAction, ProgressionDirective, ProgressionPolicy, reps_in_reserve};
 use crate::science::{Contraindication, ScienceChunk};
@@ -555,7 +555,7 @@ anything becomes active.",
 const PROGRAMME_WRAP_UP_TURNS: i32 = 4;
 
 /// Everything [`build_designer_prompt`] reads. A struct rather than a parameter list because the
-/// designer draws on eight distinct inputs, several of them string blocks, and a positional call of
+/// designer draws on nine distinct inputs, several of them string blocks, and a positional call of
 /// that length is one transposition away from a prompt that is wrong in a way no type catches.
 pub struct DesignerInputs<'a> {
     /// The user's distilled training philosophy, or an empty string when they have none yet.
@@ -570,6 +570,9 @@ pub struct DesignerInputs<'a> {
     pub science: &'a [ScienceChunk],
     /// The computed progressive-overload policy ([C5.3]).
     pub progression: &'a ProgressionPolicy,
+    /// Where this design sits in the user's programme ([C4.3]), or `None` for an ad-hoc design —
+    /// which fills no slot and so has no position to state.
+    pub programme: Option<&'a ProgrammeContext>,
     pub catalogue: &'a [ExerciseTypeWithAncestry],
 }
 
@@ -588,14 +591,21 @@ pub struct DesignerInputs<'a> {
 /// logged; the prompt carries it as a binding instruction rather than leaving the model
 /// to infer progression from the history block.
 ///
-/// Both degrade gracefully: an empty `science` drops back to the pre-[C5.2] prompt and
-/// an empty `progression` to a conservative starting rule, rather than asserting bands
-/// or loads the prompt does not actually carry.
+/// `programme` ([C4.3]) says where in a long-term programme this session falls — the
+/// week, the block's intent, the slot's focus and adherence so far — which is what
+/// turns a standalone design into one that builds on the last. It states the block's
+/// *focus*; what that block means for load stays the progression policy's to say.
+///
+/// All three degrade gracefully: an empty `science` drops back to the pre-[C5.2]
+/// prompt, an empty `progression` to a conservative starting rule, and a `None`
+/// `programme` to the ad-hoc prompt, rather than asserting bands, loads or a
+/// position the prompt does not actually carry.
 pub fn build_designer_prompt(input: &DesignerInputs<'_>) -> String {
-    let DesignerInputs { philosophy, history, recovery, goals, health_entries, science, progression, catalogue } = *input;
+    let DesignerInputs { philosophy, history, recovery, goals, health_entries, science, progression, programme, catalogue } = *input;
     let goals_section = format_active_goals(goals);
     let competing_section = format_competing_goals(goals);
     let science_section = format_training_science(science);
+    let programme_section = format_programme_context(programme, progression);
     let progression_section = format_progression_policy(progression);
     let health_section = format_health_entries(health_entries);
     let contraindications_section = format_contraindications(health_entries);
@@ -633,6 +643,7 @@ user cannot load, or equipment they do not have.\n\
 and a target weight within the user's equipment limits. Add a short per-exercise cue when useful.\n\
 \n\
 {philosophy_section}\n\
+{programme_section}\
 {history}\n\
 {progression_section}\
 {recovery}\n\
@@ -686,6 +697,94 @@ advisory. Do not add load to an exercise it marks HOLD, BACK OFF or DELOAD, and 
 load it states for one marked PROGRESS. Use your own judgement only for exercises it does not list. \
 Avoid repeating yesterday's heavy work.\n"
         .to_string()
+}
+
+/// The PROGRAMME CONTEXT section ([C4.3]): where this design sits in the user's programme — week
+/// N of M, the block covering that week, the slot's focus, and adherence so far.
+///
+/// This is the join that makes a programme mean anything: without it the designer produces a
+/// session in a vacuum, and "builds on the last one" is left to whatever the history block happens
+/// to imply.
+///
+/// It states the block's **focus** and stops there. What the block means for *load* — the deload
+/// override in particular — is the PROGRESSION POLICY section's to say ([C5.3]), where it is
+/// already a binding instruction computed per exercise. Two renderings of one rule in two voices
+/// is how a prompt starts contradicting itself, so this section points at that one instead of
+/// restating it.
+///
+/// Absent entirely for an ad-hoc design, which fills no slot: the pre-programme prompt is the
+/// degraded case, not a special case bolted on beside it.
+fn format_programme_context(programme: Option<&ProgrammeContext>, progression: &ProgressionPolicy) -> String {
+    let Some(ctx) = programme else { return String::new() };
+    let catch_up = match ctx.adherence.trained < ctx.adherence.due {
+        true => "Adherence has slipped: design for what the user has actually trained, not for what the grid \
+assumed they would have by now.\n",
+        false => "",
+    };
+    // Only when there *is* a policy section to point at — a pointer at an absent section is worse
+    // than none, since the model invents the section.
+    let defer_loads = match progression.is_empty() {
+        true => "",
+        false => "What this week's block means for LOADS is stated in PROGRESSION POLICY below; follow it there \
+rather than inferring it here.\n",
+    };
+
+    format!(
+        "PROGRAMME CONTEXT — this session is not a standalone design: it fills one slot of the user's \
+active programme.\n\
+- Programme: \"{title}\" — {week}, {day}.\n\
+- {block}\n\
+- This slot's focus: \"{focus}\". A focus is an intent, not an exercise list — choose the movements that \
+serve it, and do not design for a different focus.\n\
+- {adherence}\n\
+Design this session to follow on from RECENT HISTORY within the block's focus. The SELECTION PRIORITY \
+order still decides between candidate exercises; the slot's focus is what today is *for*. Name the week, \
+the block and the slot focus in the rationale.\n\
+{catch_up}{defer_loads}\n",
+        title = ctx.programme_title,
+        week = format_of_total("week", ctx.week_idx, ctx.total_weeks),
+        day = format_of_total("day", ctx.day_idx, ctx.days_per_week),
+        block = format_block_line(ctx),
+        focus = ctx.slot_focus,
+        adherence = format_adherence_line(&ctx.adherence),
+    )
+}
+
+/// "week 3 of 8", or plain "week 3" when the total is not a number the fraction can be stated
+/// against — a grid whose span was never filled in should not be reported as "week 3 of 0".
+fn format_of_total(unit: &str, idx: i32, total: i32) -> String {
+    match total >= idx {
+        true => format!("{unit} {idx} of {total}"),
+        false => format!("{unit} {idx}"),
+    }
+}
+
+/// The block line. Blocks are not required to tile a programme, so a week between them genuinely
+/// has none — said plainly, because an absent block is ordinary progression and never an implied
+/// intent the model should guess at.
+fn format_block_line(ctx: &ProgrammeContext) -> String {
+    match &ctx.block {
+        Some(b) => format!("Block covering week {}: \"{}\" (weeks {}-{}).", ctx.week_idx, b.focus, b.start_week, b.end_week),
+        None => format!("No mesocycle block covers week {}: the programme states no block intent for this week.", ctx.week_idx),
+    }
+}
+
+/// The adherence line: how much of the grid so far was actually trained, with the unresolved slots
+/// broken out only when there are some.
+fn format_adherence_line(adherence: &SlotAdherence) -> String {
+    if adherence.due == 0 {
+        return "Adherence so far: this is the first session of the programme.".to_string();
+    }
+    let unresolved: Vec<String> = [(adherence.missed, "missed"), (adherence.skipped, "skipped")]
+        .iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, label)| format!("{count} {label}"))
+        .collect();
+    let detail = match unresolved.is_empty() {
+        true => String::new(),
+        false => format!(" ({})", unresolved.join(", ")),
+    };
+    format!("Adherence so far: {} of {} scheduled sessions trained{detail}.", adherence.trained, adherence.due)
 }
 
 /// The PROGRESSION POLICY section: the per-exercise directives [`crate::progression`] computed,
@@ -1260,7 +1359,7 @@ pub fn capitalize(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{ExerciseLevel, ExerciseType, Goal, GoalDirection, GoalKind, GoalProgress, GoalStatus};
+    use crate::db::{ExerciseLevel, ExerciseType, Goal, GoalDirection, GoalKind, GoalProgress, GoalStatus, ProgrammeBlock};
     use crate::progression::ExerciseClass;
     use crate::db::{HealthEntry, HealthEntryType, MeasurementType, Session};
 
@@ -1600,6 +1699,16 @@ mod tests {
         science: &[ScienceChunk],
         progression: &ProgressionPolicy,
     ) -> String {
+        designer_prompt_full(goals, health_entries, science, progression, None)
+    }
+
+    fn designer_prompt_full(
+        goals: &[GoalProgress],
+        health_entries: &[HealthEntry],
+        science: &[ScienceChunk],
+        progression: &ProgressionPolicy,
+        programme: Option<&ProgrammeContext>,
+    ) -> String {
         build_designer_prompt(&DesignerInputs {
             philosophy: "goal=hypertrophy. Home gym: dumbbells up to 24kg.",
             history: "RECENT HISTORY: No recent workouts\n",
@@ -1608,6 +1717,7 @@ mod tests {
             health_entries,
             science,
             progression,
+            programme,
             catalogue: &base_context().exercise_types,
         })
     }
@@ -2004,6 +2114,121 @@ mod tests {
         assert!(prompt.contains("OVERRIDES ordinary progression"));
         assert!(prompt.contains("cut the working sets by about a third"));
         assert!(prompt.contains("- Bench Press: DELOAD at 60.0kg"));
+    }
+
+    // ── Programme context ([C4.3]) ────────────────────────────────────────────
+    //
+    // The join that makes a programme mean anything: the designer is told where the user is
+    // rather than left to infer it. These assert the facts reach the prompt, that the section
+    // vanishes for an ad-hoc design, and — the reason this landed after [C5.3] — that it does not
+    // grow a second copy of the deload rule the progression policy already states.
+
+    /// Week 3 of 8, block "hypertrophy", slot focus "push", 7 of 9 trained: the card's own example.
+    fn programme_context() -> ProgrammeContext {
+        ProgrammeContext {
+            programme_title: "12-week hypertrophy".to_string(),
+            week_idx: 3,
+            total_weeks: 8,
+            day_idx: 2,
+            days_per_week: 4,
+            slot_focus: "push".to_string(),
+            block: Some(ProgrammeBlock {
+                id: 1,
+                programme_id: 1,
+                start_week: 1,
+                end_week: 4,
+                focus: "hypertrophy".to_string(),
+                notes: None,
+            }),
+            adherence: SlotAdherence { due: 9, trained: 7, missed: 1, skipped: 1 },
+        }
+    }
+
+    #[test]
+    fn programme_context_states_where_the_user_is() {
+        let prompt = designer_prompt_full(&[], &[], &[], &empty_policy(), Some(&programme_context()));
+
+        assert!(prompt.contains("PROGRAMME CONTEXT"), "the section must be present:\n{prompt}");
+        assert!(prompt.contains("\"12-week hypertrophy\" — week 3 of 8, day 2 of 4."), "position missing:\n{prompt}");
+        assert!(prompt.contains("Block covering week 3: \"hypertrophy\" (weeks 1-4)."), "block intent missing:\n{prompt}");
+        assert!(prompt.contains("This slot's focus: \"push\""), "slot focus missing:\n{prompt}");
+        assert!(prompt.contains("Adherence so far: 7 of 9 scheduled sessions trained (1 missed, 1 skipped)."), "{prompt}");
+        // A focus is an intent, not an exercise list — the one thing the model must not do with it.
+        assert!(prompt.contains("not an exercise list"), "the focus must be framed as an intent:\n{prompt}");
+    }
+
+    /// The ad-hoc path is the degraded case, not a special case: with no programme the prompt is
+    /// exactly the pre-programme one, with nothing claiming a position the design does not have.
+    #[test]
+    fn an_ad_hoc_design_carries_no_programme_context() {
+        let prompt = designer_prompt_full(&[], &[], &[], &empty_policy(), None);
+        assert!(!prompt.contains("PROGRAMME CONTEXT"), "an ad-hoc design must not render the section:\n{prompt}");
+        assert!(!prompt.contains("slot"), "nothing should mention a slot the design does not fill:\n{prompt}");
+    }
+
+    /// The composition rule with [C5.3]: PROGRAMME CONTEXT names the block, PROGRESSION POLICY says
+    /// what it does to the loads. Exactly one of them tells the model to back off in a deload week —
+    /// two instructions in two voices is how a prompt starts arguing with itself.
+    #[test]
+    fn a_deload_block_is_stated_once_not_twice() {
+        let mut ctx = programme_context();
+        ctx.block = Some(ProgrammeBlock {
+            id: 2,
+            programme_id: 1,
+            start_week: 5,
+            end_week: 6,
+            focus: "deload/technique".to_string(),
+            notes: None,
+        });
+        ctx.week_idx = 5;
+        let policy = ProgressionPolicy {
+            block: BlockIntent::Deload { focus: "deload/technique".to_string() },
+            directives: vec![directive("Bench Press", ProgressionAction::Deload { at: 60.0 })],
+            deload_advice: None,
+        };
+        let prompt = designer_prompt_full(&[], &[], &[], &policy, Some(&ctx));
+
+        assert!(prompt.contains("Block covering week 5: \"deload/technique\" (weeks 5-6)."), "{prompt}");
+        assert_eq!(prompt.matches("OVERRIDES ordinary progression").count(), 1, "the override is stated once:\n{prompt}");
+        assert_eq!(prompt.matches("cut the working sets by about a third").count(), 1, "the back-off is stated once:\n{prompt}");
+        // The context defers to the policy rather than restating it.
+        assert!(prompt.contains("stated in PROGRESSION POLICY below; follow it there"), "the context must defer:\n{prompt}");
+    }
+
+    /// A pointer at a section that is not rendered is worse than no pointer, since the model
+    /// invents the section. With no logged history there is no policy to defer to.
+    #[test]
+    fn programme_context_does_not_point_at_an_absent_progression_policy() {
+        let prompt = designer_prompt_full(&[], &[], &[], &empty_policy(), Some(&programme_context()));
+        assert!(!prompt.contains("PROGRESSION POLICY below"), "nothing may point at an unrendered section:\n{prompt}");
+    }
+
+    #[test]
+    fn slipped_adherence_is_called_out_and_clean_adherence_is_not() {
+        let mut ctx = programme_context();
+        let slipped = designer_prompt_full(&[], &[], &[], &empty_policy(), Some(&ctx));
+        assert!(slipped.contains("Adherence has slipped"), "a shortfall must reach the designer:\n{slipped}");
+
+        ctx.adherence = SlotAdherence { due: 9, trained: 9, missed: 0, skipped: 0 };
+        let kept = designer_prompt_full(&[], &[], &[], &empty_policy(), Some(&ctx));
+        let clean = "Adherence so far: 9 of 9 scheduled sessions trained.";
+        assert!(kept.contains(clean), "no parenthetical when nothing is unresolved:\n{kept}");
+        assert!(!kept.contains("Adherence has slipped"), "a kept programme must not be told it slipped:\n{kept}");
+    }
+
+    /// The two honest edge cases: the very first session of a programme, and a week no block covers.
+    #[test]
+    fn first_session_and_uncovered_week_read_plainly() {
+        let mut ctx = programme_context();
+        ctx.week_idx = 1;
+        ctx.day_idx = 1;
+        ctx.block = None;
+        ctx.adherence = SlotAdherence::default();
+        let prompt = designer_prompt_full(&[], &[], &[], &empty_policy(), Some(&ctx));
+
+        assert!(prompt.contains("this is the first session of the programme"), "{prompt}");
+        assert!(prompt.contains("No mesocycle block covers week 1"), "an absent block is said, not guessed at:\n{prompt}");
+        assert!(!prompt.contains("deload"), "an absent block is never an implied deload:\n{prompt}");
     }
 
     #[test]

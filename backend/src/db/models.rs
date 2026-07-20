@@ -1166,6 +1166,53 @@ pub enum TrainingMode {
     Programme { programme: Programme, slot: ProgrammeSlot },
 }
 
+/// Adherence over the slots scheduled before the one being designed: how many there were, how
+/// many were actually trained, and how the rest were resolved. Counts only — the designer needs
+/// to know whether the programme is being kept to, not to re-read the grid.
+///
+/// "Trained" is deliberately the same test
+/// [`next_design_slot`](super::Database::next_design_slot) applies: a [`SessionRoster`] bound to
+/// the slot that reached [`LifecycleStatus::Active`] or [`LifecycleStatus::Completed`]. A slot
+/// merely `filled` with a design nobody executed is not adherence, and using one rule in two
+/// places is what keeps slot selection and the adherence the prompt reports from disagreeing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SlotAdherence {
+    /// Slots earlier in the grid than the one being designed.
+    pub due: i32,
+    /// How many of those were actually trained.
+    pub trained: i32,
+    pub missed: i32,
+    pub skipped: i32,
+}
+
+/// Where one design sits in its [`Programme`] ([C4.3]): the week and day its slot names, the
+/// mesocycle [`ProgrammeBlock`] covering that week, the slot's focus, and adherence so far. This
+/// is what the designer prompt states so a session builds on the last one instead of being
+/// designed in a vacuum.
+///
+/// Read per design by [`Database::programme_context`](super::Database) and never persisted —
+/// every field is derived from the programme grid, so it cannot drift from it.
+///
+/// Only [`TrainingMode::Programme`] resolves one. An ad-hoc design fills no slot, including a
+/// deliberate one-off under an active programme, so there is no position for it to report and the
+/// prompt carries no programme section at all.
+#[derive(Debug, Clone)]
+pub struct ProgrammeContext {
+    pub programme_title: String,
+    /// 1-based week the slot sits in, and the last week the grid has slots for.
+    pub week_idx: i32,
+    pub total_weeks: i32,
+    /// 1-based training day within the week, and the programme's nominal days per week.
+    pub day_idx: i32,
+    pub days_per_week: i32,
+    /// The slot's own focus text ("push") — an intent, never an exercise list.
+    pub slot_focus: String,
+    /// The block covering `week_idx`, when the programme has one there. Blocks are not required
+    /// to tile the whole programme, so a week between them has none.
+    pub block: Option<ProgrammeBlock>,
+    pub adherence: SlotAdherence,
+}
+
 pub fn new_programme(user_id: i64, title: &str, days_per_week: i32, split: &str, progression_policy: &str) -> Programme {
     let now = now_str();
     Programme {

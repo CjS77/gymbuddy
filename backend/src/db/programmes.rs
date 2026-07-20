@@ -14,7 +14,9 @@ use rusqlite::params;
 
 use super::database::Database;
 use super::goals::{SELECT_GOAL, row_to_goal};
-use super::models::{Goal, LifecycleStatus, Programme, ProgrammeBlock, ProgrammeSlot, SlotStatus, TrainingMode};
+use super::models::{
+    Goal, LifecycleStatus, Programme, ProgrammeBlock, ProgrammeContext, ProgrammeSlot, SlotAdherence, SlotStatus, TrainingMode,
+};
 
 fn row_to_programme(row: &rusqlite::Row) -> rusqlite::Result<Programme> {
     Ok(Programme {
@@ -256,6 +258,54 @@ impl Database {
             None => Ok(TrainingMode::AdHoc { programme: Some(programme) }),
         }
     }
+
+    // ── Programme context for a design ([C4.3]) ───────────────────────────────────
+
+    /// Where a design sits in its programme: the slot's week and day against the grid's span, the
+    /// block covering that week, the slot's focus, and adherence over everything before it.
+    ///
+    /// `None` for every ad-hoc mode, including a deliberate one-off under an active programme: an
+    /// ad-hoc design fills no slot, so it has no position to report and nothing to build on.
+    pub fn programme_context(&self, mode: &TrainingMode) -> anyhow::Result<Option<ProgrammeContext>> {
+        let TrainingMode::Programme { programme, slot } = mode else { return Ok(None) };
+        Ok(Some(ProgrammeContext {
+            programme_title: programme.title.clone(),
+            week_idx: slot.week_idx,
+            total_weeks: self.programme_span_weeks(programme.id)?,
+            day_idx: slot.day_idx,
+            days_per_week: programme.days_per_week,
+            slot_focus: slot.focus.clone(),
+            block: self.block_for_week(programme.id, slot.week_idx)?,
+            adherence: self.slot_adherence(programme.id, slot)?,
+        }))
+    }
+
+    /// How many weeks the programme's slot grid actually spans. Read off the grid rather than off
+    /// `target_end_date`, which is a nullable aspiration — "week 3 of 8" has to mean eight weeks of
+    /// slots the user can train, or the fraction is not one.
+    fn programme_span_weeks(&self, programme_id: i64) -> anyhow::Result<i32> {
+        let sql = "SELECT COALESCE(MAX(week_idx), 0) FROM programme_slots WHERE programme_id = ?1";
+        self.conn().query_row(sql, params![programme_id], |row| row.get(0)).context("Failed to read the programme's week span")
+    }
+
+    /// Adherence over the slots strictly earlier in the grid than `slot` — the sessions that were
+    /// scheduled before the one being designed. The slot being designed is excluded on purpose: it
+    /// has not happened yet, and counting it would report the user short by one every session.
+    fn slot_adherence(&self, programme_id: i64, slot: &ProgrammeSlot) -> anyhow::Result<SlotAdherence> {
+        let sql = "\
+            SELECT COUNT(*), \
+                   COALESCE(SUM(EXISTS (SELECT 1 FROM session_rosters r \
+                       WHERE r.programme_slot_id = s.id AND r.status IN ('active', 'completed'))), 0), \
+                   COALESCE(SUM(s.status = 'missed'), 0), \
+                   COALESCE(SUM(s.status = 'skipped'), 0) \
+            FROM programme_slots s \
+            WHERE s.programme_id = ?1 AND (s.week_idx < ?2 OR (s.week_idx = ?2 AND s.day_idx < ?3))";
+        self.conn()
+            .query_row(sql, params![programme_id, slot.week_idx, slot.day_idx], |row| {
+                Ok(SlotAdherence { due: row.get(0)?, trained: row.get(1)?, missed: row.get(2)?, skipped: row.get(3)? })
+            })
+            .context("Failed to read programme slot adherence")
+    }
 }
 
 #[cfg(test)]
@@ -491,6 +541,77 @@ mod tests {
             TrainingMode::AdHoc { programme: Some(programme) } => assert_eq!(programme.id, programme_id),
             other => panic!("expected ad-hoc fallback, got {other:?}"),
         }
+    }
+
+    /// Train the slot at `slot_id`: a roster bound to it and executed against a session, which is
+    /// what makes a slot count toward adherence.
+    fn train_slot(db: &Database, user_id: i64, slot_id: i64) {
+        let roster = db.create_roster(user_id, "Trained", None, None).unwrap();
+        db.bind_roster_to_slot(roster, slot_id).unwrap();
+        let session = db.start_session(user_id, None).unwrap();
+        db.bind_roster_to_session(roster, session.id).unwrap();
+    }
+
+    /// [C4.3]: the context the designer prompt reads — the slot's position in the grid, the block
+    /// covering its week, and adherence over everything scheduled before it.
+    #[test]
+    fn programme_context_reports_position_block_and_adherence() {
+        let (db, user_id) = test_db();
+        let programme_id = draft_programme(&db, user_id, "12-week hypertrophy");
+        db.activate_programme(programme_id).unwrap();
+        db.add_programme_block(&new_programme_block(programme_id, 1, 2, "hypertrophy")).unwrap();
+        db.add_programme_block(&new_programme_block(programme_id, 3, 3, "deload")).unwrap();
+        let slots: Vec<i64> = [(1, 1, "upper"), (1, 2, "lower"), (2, 1, "push"), (2, 2, "pull"), (3, 1, "full body")]
+            .iter()
+            .map(|(w, d, focus)| db.add_programme_slot(&new_programme_slot(programme_id, *w, *d, focus)).unwrap())
+            .collect();
+
+        // Week 1 fully trained; week 2 day 1 skipped, so the design lands on week 2 day 2.
+        train_slot(&db, user_id, slots[0]);
+        train_slot(&db, user_id, slots[1]);
+        db.set_slot_status(slots[2], SlotStatus::Skipped).unwrap();
+
+        let mode = db.training_mode_for_design(user_id, false).unwrap();
+        let ctx = db.programme_context(&mode).unwrap().expect("programme mode resolves a context");
+        assert_eq!((ctx.week_idx, ctx.total_weeks), (2, 3), "the span comes off the grid, not the target date");
+        assert_eq!((ctx.day_idx, ctx.days_per_week), (2, 4));
+        assert_eq!(ctx.slot_focus, "pull");
+        assert_eq!(ctx.block.as_ref().map(|b| b.focus.as_str()), Some("hypertrophy"), "the block covering week 2");
+        assert_eq!(ctx.adherence, SlotAdherence { due: 3, trained: 2, missed: 0, skipped: 1 });
+    }
+
+    /// A slot merely `filled` with a design nobody executed is not adherence — the same test
+    /// `next_design_slot` applies, so the two can never disagree about what has been trained.
+    #[test]
+    fn a_designed_but_untrained_slot_does_not_count_as_adherence() {
+        let (db, user_id) = test_db();
+        let (programme_id, slots) = active_programme_with_grid(&db, user_id);
+        let designed = db.create_roster(user_id, "W1D1 upper", None, None).unwrap();
+        db.bind_roster_to_slot(designed, slots[0]).unwrap();
+        assert_eq!(db.get_programme_slot(slots[0]).unwrap().unwrap().status, SlotStatus::Filled);
+
+        // The design re-targets its own slot, so adherence is still the empty first-session case.
+        let ctx = db.programme_context(&db.training_mode_for_design(user_id, false).unwrap()).unwrap().unwrap();
+        assert_eq!(ctx.adherence, SlotAdherence::default(), "designing is not training");
+
+        // Executing it moves both: the next slot is targeted and the first one counts.
+        let session = db.start_session(user_id, None).unwrap();
+        db.bind_roster_to_session(designed, session.id).unwrap();
+        let ctx = db.programme_context(&db.training_mode_for_design(user_id, false).unwrap()).unwrap().unwrap();
+        assert_eq!(ctx.adherence, SlotAdherence { due: 1, trained: 1, missed: 0, skipped: 0 });
+        assert_eq!(programme_id, db.active_programme_for_user(user_id).unwrap().unwrap().id);
+    }
+
+    /// Every ad-hoc mode resolves no context: a one-off fills no slot, so it has no position to
+    /// report and nothing to build on — including under an active programme.
+    #[test]
+    fn ad_hoc_modes_resolve_no_programme_context() {
+        let (db, user_id) = test_db();
+        assert!(db.programme_context(&db.training_mode_for_design(user_id, false).unwrap()).unwrap().is_none());
+
+        active_programme_with_grid(&db, user_id);
+        assert!(db.programme_context(&db.training_mode_for_design(user_id, true).unwrap()).unwrap().is_none());
+        assert!(db.programme_context(&db.training_mode_for_design(user_id, false).unwrap()).unwrap().is_some());
     }
 
     #[test]

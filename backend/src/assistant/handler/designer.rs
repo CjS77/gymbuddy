@@ -21,8 +21,8 @@ use crate::assistant::prompts::{
 };
 use crate::config::DesignerHistoryConfig;
 use crate::db::{
-    Database, EntryWithSets, ExerciseSet, GoalKind, GoalProgress, HealthEntry, MeasurementType, Philosophy, RosterExercise, Session,
-    SessionWithSets, TrainingMode, User,
+    Database, EntryWithSets, ExerciseSet, GoalKind, GoalProgress, HealthEntry, MeasurementType, Philosophy, ProgrammeContext,
+    RosterExercise, Session, SessionWithSets, TrainingMode, User,
 };
 use crate::progression::{BlockIntent, ExerciseClass, ExerciseRecord, Outing, ProgressionPolicy, build_policy};
 use crate::science::contraindications::{REFER_OUT, rail_doc_ids};
@@ -46,17 +46,22 @@ impl AssistantHandler {
         let raw_guidance = text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
         let (force_ad_hoc, guidance) = split_ad_hoc_marker(&raw_guidance);
 
-        let (mode, philosophy, sessions, recovery, goals, injuries, goal_ids, progression) = {
+        let (mode, programme, philosophy, sessions, recovery, goals, injuries, goal_ids, progression) = {
             let db = self.db.lock().await;
             let goals = db.goal_progress_report(user.id, None, None)?;
             let goal_ids = goal_relevant_exercise_ids(&db, &goals)?;
             let mode = db.training_mode_for_design(user.id, force_ad_hoc)?;
+            // Where this design sits in the programme ([C4.3]), and — from the block it resolves —
+            // what the week is for ([C5.3]). One read of the block feeds both: the context states
+            // the block's focus, the policy decides what that focus does to the loads.
+            let programme = db.programme_context(&mode)?;
             // Pull a generous window (bounded by config); the summariser decides how
             // much of it survives into the prompt under the token budget.
             let sessions = db.recent_sessions_with_sets(user.id, self.config.designer_history.max_sessions)?;
-            let progression = self.progression_policy(&db, &sessions, &mode)?;
+            let progression = self.progression_policy(&db, &sessions, block_intent(programme.as_ref()))?;
             (
                 mode,
+                programme,
                 db.latest_philosophy(user.id)?,
                 sessions,
                 db.muscle_recovery(user.id)?,
@@ -87,6 +92,7 @@ impl AssistantHandler {
             health_entries: &injuries,
             science: &science,
             progression: &progression,
+            programme: programme.as_ref(),
             catalogue: &self.catalogue,
         });
         let user_text = if guidance.trim().is_empty() { "Design my next workout.".to_string() } else { guidance };
@@ -203,11 +209,13 @@ impl AssistantHandler {
     /// exercise the user has trained recently, plus the week's block intent.
     ///
     /// Reads the session window the designer already loaded rather than querying again; the only
-    /// extra reads are the roster bound to each of those sessions (the prescription half of
-    /// prescribed-vs-actual, [C1.5]) and the programme block covering the current week.
-    fn progression_policy(&self, db: &Database, sessions: &[SessionWithSets], mode: &TrainingMode) -> anyhow::Result<ProgressionPolicy> {
+    /// extra read is the roster bound to each of those sessions (the prescription half of
+    /// prescribed-vs-actual, [C1.5]). `block` comes from the [`ProgrammeContext`] the caller
+    /// already resolved, so the block is read once and the prompt's two programme-aware sections
+    /// can never disagree about which week this is.
+    fn progression_policy(&self, db: &Database, sessions: &[SessionWithSets], block: BlockIntent) -> anyhow::Result<ProgressionPolicy> {
         let records = self.progression_records(db, sessions)?;
-        Ok(build_policy(&records, block_intent(db, mode)?))
+        Ok(build_policy(&records, block))
     }
 
     /// Roll the recent sessions up into one [`ExerciseRecord`] per exercise trained, most
@@ -299,12 +307,12 @@ const MAX_PROGRESSION_DIRECTIVES: usize = 10;
 
 /// The week's block intent for the design ([C4.3] → [C5.3]): a deload block overrides progression.
 ///
-/// Only programme mode resolves a block, because only a filled slot says which week the user is in.
-/// An ad-hoc session — including a deliberate one-off under an active programme — progresses
-/// ordinarily, which is consistent with it leaving every slot untouched.
-fn block_intent(db: &Database, mode: &TrainingMode) -> anyhow::Result<BlockIntent> {
-    let TrainingMode::Programme { programme, slot } = mode else { return Ok(BlockIntent::Ordinary) };
-    Ok(BlockIntent::of_block(db.block_for_week(programme.id, slot.week_idx)?.as_ref()))
+/// Read off the [`ProgrammeContext`], which already holds the block covering the designed slot's
+/// week. Only programme mode resolves a context at all, because only a slot says which week the
+/// user is in; an ad-hoc session — including a deliberate one-off under an active programme —
+/// progresses ordinarily, which is consistent with it leaving every slot untouched.
+fn block_intent(programme: Option<&ProgrammeContext>) -> BlockIntent {
+    BlockIntent::of_block(programme.and_then(|ctx| ctx.block.as_ref()))
 }
 
 /// Focus terms for science retrieval, from the programme slot and the block covering it. Split into
@@ -829,6 +837,46 @@ mod tests {
         assert_eq!(db.get_programme_slot(slots[1]).unwrap().unwrap().status, crate::db::SlotStatus::Pending);
     }
 
+    /// The system prompt of the last recorded LLM call — what the designer actually read.
+    fn last_system_prompt(llm: &MockLlm) -> String {
+        llm.recorded_requests().pop().unwrap().messages.first().unwrap().content.clone()
+    }
+
+    /// [C4.3], end to end: under an active programme the designer is told where the user is —
+    /// week, block focus, slot focus and adherence so far — which is what makes today's session
+    /// build on the last rather than being designed in a vacuum.
+    #[tokio::test]
+    async fn nextworkout_under_a_programme_states_the_context_in_the_designer_prompt() {
+        let (handler, llm) = setup_handler(DESIGN_RESPONSE).await;
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
+        let user = { handler.db.lock().await.get_user_by_telegram_id("12345").unwrap().unwrap() };
+        {
+            handler.db.lock().await.insert_philosophy(user.id, "5x5, dumbbells to 24kg", "interview").unwrap();
+        }
+        let slots = activate_programme_with_slots(&handler, user.id).await;
+        {
+            let db = handler.db.lock().await;
+            let programme_id = db.active_programme_for_user(user.id).unwrap().unwrap().id;
+            db.add_programme_block(&crate::db::new_programme_block(programme_id, 1, 1, "hypertrophy")).unwrap();
+            // Train week 1 day 1, so the design targets day 2 with a session of adherence on file.
+            let roster = db.create_roster(user.id, "W1D1 upper", None, None).unwrap();
+            db.bind_roster_to_slot(roster, slots[0]).unwrap();
+            let session = db.start_session(user.id, None).unwrap();
+            db.bind_roster_to_session(roster, session.id).unwrap();
+            db.end_session(session.id).unwrap();
+        }
+
+        let _ = handler.handle_text_message(&msg, "/nextworkout").await.unwrap();
+        let prompt = last_system_prompt(&llm);
+
+        assert!(prompt.contains("PROGRAMME CONTEXT"), "the designer must be told it is filling a slot:\n{prompt}");
+        assert!(prompt.contains("\"12-week hypertrophy\" — week 1 of 1, day 2 of 2."), "position missing:\n{prompt}");
+        assert!(prompt.contains("Block covering week 1: \"hypertrophy\" (weeks 1-1)."), "block focus missing:\n{prompt}");
+        assert!(prompt.contains("This slot's focus: \"lower\""), "the slot's own focus missing:\n{prompt}");
+        assert!(prompt.contains("Adherence so far: 1 of 1 scheduled sessions trained."), "adherence missing:\n{prompt}");
+    }
+
     /// [C1.4]: "/nextworkout adhoc …" during an active programme is a legitimate
     /// one-off ("travelling, dumbbells only"): recorded and surfaced as ad-hoc, the
     /// marker stripped from the designer guidance, and adherence never moves — every
@@ -850,6 +898,9 @@ mod tests {
 
         let design_request = llm.recorded_requests().pop().unwrap();
         assert_eq!(design_request.messages.last().unwrap().content, "dumbbells only", "the adhoc marker is not designer guidance");
+        // [C4.3]: a one-off fills no slot, so it is given no slot to build on either.
+        let prompt = design_request.messages.first().unwrap().content.clone();
+        assert!(!prompt.contains("PROGRAMME CONTEXT"), "an ad-hoc design must not be told it is filling a slot:\n{prompt}");
 
         {
             let db = handler.db.lock().await;
