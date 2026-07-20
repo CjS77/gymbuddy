@@ -277,7 +277,13 @@ impl fmt::Display for HealthEntryType {
 /// It is not decoration: [C5.4] graduates the designer's response by severity —
 /// mild means work around it, severe means do not train it — and a free-text column
 /// cannot be matched exhaustively.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// **Ordered, and the variant order is the meaning**: `Mild < Moderate < Severe`, so
+/// the contraindication rails ask whether an entry reaches a rule's threshold
+/// (`severity >= rule.bars_from`) instead of matching all three cases at every site.
+/// Reordering the variants would silently invert a safety check — `severity_is_ordered`
+/// in `science::contraindications::tests` pins it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
     Mild,

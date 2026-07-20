@@ -46,8 +46,10 @@ use serde::Deserialize;
 
 use crate::db::GoalKind;
 
+pub mod contraindications;
 pub mod retrieval;
 
+pub use contraindications::{Contraindication, MovementPattern, Violation, rail_doc_ids, violations};
 pub use retrieval::{ScienceIndex, ScienceQuery, normalise_body_part};
 
 /// The five [`GoalKind`] variants, for exhaustive iteration in tests and callers that must cover
