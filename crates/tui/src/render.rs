@@ -867,6 +867,48 @@ mod tests {
         assert!(bars(40)[0] < chest, "a narrower transcript gets narrower bars: {:?}", bars(40));
     }
 
+    fn programme_view(status: Option<gymbuddy_proto::ProgrammeStatusView>) -> View {
+        View::Programme(Box::new(ProgrammeView {
+            title: "6-week base".into(),
+            start_date: "2026-07-01".into(),
+            target_end_date: None,
+            weeks: 6,
+            days_per_week: 2,
+            split: "upper/lower".into(),
+            progression_policy: "linear".into(),
+            blocks: vec![],
+            week_template: vec![],
+            goals: vec![],
+            notes: vec![],
+            active: status.is_some(),
+            status,
+        }))
+    }
+
+    /// [R2.1]: a live programme renders where the user is; a proposed one has no
+    /// position and renders the section not at all, as with any other empty list.
+    #[test]
+    fn programme_status_renders_position_next_and_counts() {
+        let text = flat(&render(&programme_view(Some(gymbuddy_proto::ProgrammeStatusView {
+            current_week: 3,
+            block_focus: Some("accumulation".into()),
+            next_slot: Some(gymbuddy_proto::ProgrammeSlotView { week_idx: 3, day_idx: 1, focus: "upper".into() }),
+            trained: 2,
+            missed: 2,
+            skipped: 0,
+            remaining: 8,
+        }))));
+        assert!(text.contains("Where you are"));
+        assert!(text.contains("Week 3 of 6 — accumulation"));
+        assert!(text.contains("Next: Week 3, day 1: upper"));
+        assert!(text.contains("2 trained · 2 missed · 0 skipped · 8 to go"));
+        assert!(!text.contains(PROGRAMME_LOCK_IN_ASK), "a live programme is not awaiting confirmation: {text}");
+
+        let draft = flat(&render(&programme_view(None)));
+        assert!(!draft.contains("Where you are"), "a draft has nowhere to be: {draft}");
+        assert!(draft.contains(PROGRAMME_LOCK_IN_ASK));
+    }
+
     #[test]
     fn catalog_columns_align() {
         let view = View::Catalog(CatalogView {

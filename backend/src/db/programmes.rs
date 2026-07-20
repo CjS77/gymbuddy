@@ -708,6 +708,185 @@ mod tests {
         assert!(db.programme_context(&db.training_mode_for_design(user_id, false).unwrap()).unwrap().is_some());
     }
 
+    // ── The missed-slot sweep ([R2.1]) ────────────────────────────────────────
+
+    /// A programme whose grid starts on `start_date`, with `weeks × 2` pending slots.
+    fn programme_starting(db: &Database, user_id: i64, start_date: &str, weeks: i32) -> i64 {
+        let mut draft = new_programme(user_id, "Sweep", 2, "upper/lower", "linear");
+        draft.start_date = start_date.into();
+        let programme_id = db.create_programme(&draft).unwrap();
+        db.activate_programme(programme_id).unwrap();
+        (1..=weeks).for_each(|week| {
+            db.add_programme_slot(&new_programme_slot(programme_id, week, 1, "upper")).unwrap();
+            db.add_programme_slot(&new_programme_slot(programme_id, week, 2, "lower")).unwrap();
+        });
+        programme_id
+    }
+
+    fn statuses(db: &Database, programme_id: i64) -> Vec<SlotStatus> {
+        db.list_programme_slots(programme_id).unwrap().iter().map(|s| s.status).collect()
+    }
+
+    /// The boundary the whole sweep turns on: week 1 covers the seven days from the
+    /// start date, so it is still trainable on its last day and only settles the day
+    /// after. Sweeping a day early would mark a session missed the user could still do.
+    #[test]
+    fn a_week_is_swept_only_once_it_has_fully_passed() {
+        let (db, user_id) = test_db();
+        let programme_id = programme_starting(&db, user_id, "2026-07-01", 3);
+
+        // Day 7 of week 1: the last day the user can still train it.
+        assert_eq!(db.mark_missed_slots(programme_id, "2026-07-07").unwrap(), 0);
+        assert!(statuses(&db, programme_id).iter().all(|s| *s == SlotStatus::Pending));
+
+        // Day 8: week 1 is over, and only week 1 goes.
+        assert_eq!(db.mark_missed_slots(programme_id, "2026-07-08").unwrap(), 2);
+        assert_eq!(
+            statuses(&db, programme_id),
+            vec![SlotStatus::Missed, SlotStatus::Missed, SlotStatus::Pending, SlotStatus::Pending, SlotStatus::Pending, SlotStatus::Pending]
+        );
+    }
+
+    /// Every later week that has also elapsed goes in the same pass — a user returning
+    /// after a month must not need one design per skipped week to catch the grid up.
+    #[test]
+    fn one_sweep_settles_every_elapsed_week_and_is_idempotent() {
+        let (db, user_id) = test_db();
+        let programme_id = programme_starting(&db, user_id, "2026-07-01", 4);
+
+        assert_eq!(db.mark_missed_slots(programme_id, "2026-07-25").unwrap(), 6, "weeks 1-3 have all passed");
+        assert_eq!(db.mark_missed_slots(programme_id, "2026-07-25").unwrap(), 0, "a second sweep has nothing left to do");
+        assert_eq!(statuses(&db, programme_id).iter().filter(|s| **s == SlotStatus::Missed).count(), 6);
+    }
+
+    /// Only `pending` moves. `filled` is a slot with a design against it — whether that
+    /// design was ever executed is [C4.4]'s drift question, not this sweep's — and
+    /// `skipped` is already settled by the user's own decision.
+    #[test]
+    fn the_sweep_moves_pending_slots_only() {
+        let (db, user_id) = test_db();
+        let programme_id = programme_starting(&db, user_id, "2026-07-01", 2);
+        let slots = db.list_programme_slots(programme_id).unwrap();
+
+        // Week 1: one designed but never executed, one deliberately skipped.
+        let roster = db.create_roster(user_id, "W1D1", None, None).unwrap();
+        db.bind_roster_to_slot(roster, slots[0].id).unwrap();
+        db.set_slot_status(slots[1].id, SlotStatus::Skipped).unwrap();
+
+        assert_eq!(db.mark_missed_slots(programme_id, "2026-07-08").unwrap(), 0, "week 1 has no pending slot left to sweep");
+        assert_eq!(statuses(&db, programme_id)[..2], [SlotStatus::Filled, SlotStatus::Skipped]);
+    }
+
+    /// A date the sweep cannot read must settle nothing. Marking a session missed is a
+    /// destructive, user-visible verdict, so the failure mode has to be "do nothing".
+    #[test]
+    fn the_sweep_fails_closed_on_a_date_it_cannot_read() {
+        let (db, user_id) = test_db();
+        let programme_id = programme_starting(&db, user_id, "2026-07-01", 2);
+
+        assert_eq!(db.mark_missed_slots(programme_id, "not a date").unwrap(), 0);
+        assert_eq!(db.mark_missed_slots(programme_id, "").unwrap(), 0);
+        assert!(statuses(&db, programme_id).iter().all(|s| *s == SlotStatus::Pending), "an unreadable date settles nothing");
+    }
+
+    /// The ordering the feature rests on: the sweep runs *before* the slot is chosen.
+    /// Without it, a user coming back in week 4 would be handed week 1 day 1 for ever
+    /// and the programme would quietly become a to-do list that never advances.
+    #[test]
+    fn training_mode_sweeps_stale_weeks_before_choosing_a_slot() {
+        let (db, user_id) = test_db();
+        let start = (chrono::Utc::now() - chrono::Duration::weeks(3)).format("%Y-%m-%d").to_string();
+        let programme_id = programme_starting(&db, user_id, &start, 6);
+
+        match db.training_mode_for_design(user_id, false).unwrap() {
+            TrainingMode::Programme { slot, .. } => assert_eq!(slot.week_idx, 4, "three whole weeks have passed untrained"),
+            other => panic!("expected programme mode, got {other:?}"),
+        }
+        assert_eq!(statuses(&db, programme_id).iter().filter(|s| **s == SlotStatus::Missed).count(), 6, "weeks 1-3 settled as missed");
+    }
+
+    /// A deliberate one-off still sweeps: the user's "leave my programme alone" is about
+    /// not *filling* a slot, not about pretending the calendar stopped.
+    #[test]
+    fn a_forced_ad_hoc_design_still_sweeps() {
+        let (db, user_id) = test_db();
+        let start = (chrono::Utc::now() - chrono::Duration::weeks(2)).format("%Y-%m-%d").to_string();
+        let programme_id = programme_starting(&db, user_id, &start, 4);
+
+        assert!(matches!(db.training_mode_for_design(user_id, true).unwrap(), TrainingMode::AdHoc { programme: Some(_) }));
+        assert_eq!(statuses(&db, programme_id).iter().filter(|s| **s == SlotStatus::Missed).count(), 4);
+    }
+
+    // ── Programme status ([R2.1]) ─────────────────────────────────────────────
+
+    /// The whole status read: calendar position, the block over it, the next session due,
+    /// and four counts that are disjoint and account for every slot in the grid.
+    #[test]
+    fn programme_status_reports_position_next_slot_and_whole_grid_counts() {
+        let (db, user_id) = test_db();
+        let programme_id = programme_starting(&db, user_id, "2026-07-01", 4);
+        db.add_programme_block(&new_programme_block(programme_id, 1, 2, "accumulation")).unwrap();
+        db.add_programme_block(&new_programme_block(programme_id, 3, 4, "intensification")).unwrap();
+        let slots = db.list_programme_slots(programme_id).unwrap();
+
+        // Week 1 trained, week 2 day 1 skipped by hand; the sweep settles the rest of week 2.
+        train_slot(&db, user_id, slots[0].id);
+        train_slot(&db, user_id, slots[1].id);
+        db.set_slot_status(slots[2].id, SlotStatus::Skipped).unwrap();
+
+        let programme = db.get_programme(programme_id).unwrap().unwrap();
+        let status = db.programme_status(&programme, "2026-07-15").unwrap();
+
+        assert_eq!((status.current_week, status.total_weeks), (3, 4));
+        assert_eq!(status.block.as_ref().map(|b| b.focus.as_str()), Some("intensification"), "the block over the *current* week");
+        let next = status.next_slot.expect("week 3 day 1 is due");
+        assert_eq!((next.week_idx, next.day_idx), (3, 1));
+        assert_eq!(status.counts, SlotCounts { total: 8, trained: 2, missed: 1, skipped: 1 });
+        assert_eq!(status.counts.remaining(), 4, "the four buckets account for every slot");
+    }
+
+    /// Designing a session is not training it — the status has to agree with
+    /// `next_design_slot`, which re-targets an unexecuted design rather than moving on.
+    #[test]
+    fn programme_status_does_not_count_a_designed_but_untrained_slot() {
+        let (db, user_id) = test_db();
+        let programme_id = programme_starting(&db, user_id, "2026-07-01", 2);
+        let slots = db.list_programme_slots(programme_id).unwrap();
+        let roster = db.create_roster(user_id, "W1D1", None, None).unwrap();
+        db.bind_roster_to_slot(roster, slots[0].id).unwrap();
+
+        let programme = db.get_programme(programme_id).unwrap().unwrap();
+        let status = db.programme_status(&programme, "2026-07-02").unwrap();
+        assert_eq!(status.counts.trained, 0, "designing is not training");
+        assert_eq!(status.next_slot.map(|s| s.id), Some(slots[0].id), "and the design re-targets its own slot");
+    }
+
+    /// A programme left running past its last week still reports a week the grid has,
+    /// and one whose start date is in the future has not begun rather than begun at zero.
+    #[test]
+    fn programme_status_clamps_the_current_week_into_the_grid() {
+        let (db, user_id) = test_db();
+        let programme_id = programme_starting(&db, user_id, "2026-07-01", 3);
+        let programme = db.get_programme(programme_id).unwrap().unwrap();
+
+        assert_eq!(db.programme_status(&programme, "2026-12-01").unwrap().current_week, 3, "clamped to the last week");
+        assert_eq!(db.programme_status(&programme, "2026-06-01").unwrap().current_week, 1, "a programme not yet begun is week 1");
+    }
+
+    /// Every slot settled means there is nothing left to design — the signal [R4.1] reads
+    /// to decide a programme is complete.
+    #[test]
+    fn a_fully_swept_grid_reports_no_next_slot() {
+        let (db, user_id) = test_db();
+        let programme_id = programme_starting(&db, user_id, "2026-07-01", 2);
+        let programme = db.get_programme(programme_id).unwrap().unwrap();
+
+        let status = db.programme_status(&programme, "2026-08-01").unwrap();
+        assert!(status.next_slot.is_none(), "a settled grid has nothing due");
+        assert_eq!(status.counts, SlotCounts { total: 4, trained: 0, missed: 4, skipped: 0 });
+        assert_eq!(status.counts.remaining(), 0);
+    }
+
     #[test]
     fn ad_hoc_rosters_stay_first_class_with_no_slot() {
         let (db, user_id) = test_db();

@@ -780,6 +780,76 @@ mod tests {
         assert!(html.contains("- &lt;not markup&gt;"), "got: {html}");
     }
 
+    fn programme(status: Option<gymbuddy_proto::ProgrammeStatusView>) -> View {
+        View::Programme(Box::new(ProgrammeView {
+            title: "6-week base".into(),
+            start_date: "2026-07-01".into(),
+            target_end_date: Some("2026-08-12".into()),
+            weeks: 6,
+            days_per_week: 2,
+            split: "upper/lower".into(),
+            progression_policy: "linear".into(),
+            blocks: vec![],
+            week_template: vec![],
+            goals: vec![],
+            notes: vec![],
+            active: status.is_some(),
+            status,
+        }))
+    }
+
+    /// [R2.1]: a live programme leads with where the user is — position, what is due
+    /// next, and the tally — before the skeleton they already know.
+    #[test]
+    fn programme_status_html_leads_with_the_position() {
+        let (html, mode) = Telegram.render(&programme(Some(gymbuddy_proto::ProgrammeStatusView {
+            current_week: 3,
+            block_focus: Some("accumulation".into()),
+            next_slot: Some(gymbuddy_proto::ProgrammeSlotView { week_idx: 3, day_idx: 1, focus: "upper".into() }),
+            trained: 2,
+            missed: 2,
+            skipped: 0,
+            remaining: 8,
+        })));
+        assert_eq!(mode, Some("HTML"));
+        let expected = "<b>6-week base</b>\n\
+                        <i>6 weeks × 2 days/week, upper/lower</i>\n\
+                        2026-07-01 to 2026-08-12\n\
+                        Progression: linear\n\
+                        \n<b>Where you are:</b>\n\
+                        Week 3 of 6 — accumulation\n\
+                        Next: Week 3, day 1: upper\n\
+                        2 trained · 2 missed · 0 skipped · 8 to go\n";
+        assert_eq!(html, expected);
+    }
+
+    /// A proposed programme has no position, so it renders exactly as it did before
+    /// [R2.1] — and still asks to be locked in.
+    #[test]
+    fn a_programme_without_a_status_renders_no_position_section() {
+        let (html, _) = Telegram.render(&programme(None));
+        assert!(!html.contains("Where you are"), "a draft has nowhere to be: {html}");
+        assert!(html.contains(PROGRAMME_LOCK_IN_ASK), "and is still awaiting confirmation: {html}");
+    }
+
+    /// A settled grid has nothing due, which must render as an omitted line rather than
+    /// an empty "Next:".
+    #[test]
+    fn a_settled_grid_renders_no_next_line() {
+        let (html, _) = Telegram.render(&programme(Some(gymbuddy_proto::ProgrammeStatusView {
+            current_week: 6,
+            block_focus: None,
+            next_slot: None,
+            trained: 10,
+            missed: 2,
+            skipped: 0,
+            remaining: 0,
+        })));
+        assert!(html.contains("Week 6 of 6\n"), "no block means no focus suffix: {html}");
+        assert!(!html.contains("Next:"), "nothing is due: {html}");
+        assert!(html.contains("10 trained · 2 missed · 0 skipped · 0 to go"));
+    }
+
     /// [C1.4]: an explicit one-off during an active programme says so, and says the
     /// programme is untouched.
     #[test]

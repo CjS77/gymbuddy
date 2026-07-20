@@ -54,8 +54,16 @@ impl AssistantHandler {
     pub(super) async fn cmd_programme(&self, user: &User, text: &str, platform: &str) -> anyhow::Result<View> {
         let active = self.db.lock().await.active_programme_for_user(user.id)?;
         match (programme_request(text), active) {
-            (ProgrammeRequest::New, _) | (_, None) => self.cmd_programme_start(user, platform).await,
-            (_, Some(programme)) => self.programme_status(user, &programme).await,
+            (ProgrammeRequest::New, _) => self.cmd_programme_start(user, platform).await,
+            (_, Some(programme)) => self.cmd_programme_status(user, &programme).await,
+            // Asking after a programme that isn't there is answered, not redirected: an
+            // interview is a side effect (it arms `interview_states`), and a read must
+            // never start one the user did not ask for.
+            (ProgrammeRequest::Status, None) => Ok(View::notice(
+                "You don't have an active programme yet, so there's nothing to report on. \
+                 Run /programme and we'll build one.",
+            )),
+            (ProgrammeRequest::Bare, None) => self.cmd_programme_start(user, platform).await,
         }
     }
 
@@ -65,7 +73,7 @@ impl AssistantHandler {
     /// artefact is the same [`View::Programme`] the interview emits, carrying a
     /// [`ProgrammeStatusView`] the draft has no equivalent of, so a client that can show
     /// a programme can already show this one.
-    async fn programme_status(&self, user: &User, programme: &Programme) -> anyhow::Result<View> {
+    async fn cmd_programme_status(&self, user: &User, programme: &Programme) -> anyhow::Result<View> {
         let db = self.db.lock().await;
         // Sweeps stale weeks before reading, so the counts can never show a week as
         // still owed that the calendar has already closed.
@@ -511,7 +519,7 @@ fn linked_goal_labels(db: &Database, user_id: i64, programme_id: i64) -> anyhow:
 mod tests {
     use super::super::test_support::*;
     use super::AssistantHandler;
-    use crate::db::{Database, LifecycleStatus, User, new_exercise_goal};
+    use crate::db::{Database, LifecycleStatus, SlotStatus, User, new_exercise_goal};
     use crate::telegram::Message as TgMessage;
 
     /// A valid three-day, six-week proposal — the happy path most tests start from.
@@ -833,6 +841,134 @@ mod tests {
         let reply = handler.handle_text_message(&msg, "/cancel").await.unwrap();
         assert!(shown(&reply).contains("no programme was created"), "got: {}", shown(&reply));
         assert!(handler.db.lock().await.latest_draft_programme(user.id).unwrap().is_none());
+    }
+
+    // ── /programme status ([R2.1]) ────────────────────────────────────────────
+
+    /// An active programme starting `weeks_ago`, with a two-day week over `weeks` weeks
+    /// and a block over the first half.
+    fn activate_programme_started(db: &Database, user_id: i64, weeks_ago: i64, weeks: i32) -> i64 {
+        let mut draft = crate::db::new_programme(user_id, "6-week base", 2, "upper/lower", "linear");
+        draft.start_date = (chrono::Utc::now() - chrono::Duration::weeks(weeks_ago)).format("%Y-%m-%d").to_string();
+        let programme_id = db.create_programme(&draft).unwrap();
+        db.activate_programme(programme_id).unwrap();
+        db.add_programme_block(&crate::db::new_programme_block(programme_id, 1, weeks / 2, "accumulation")).unwrap();
+        (1..=weeks).for_each(|week| {
+            db.add_programme_slot(&crate::db::new_programme_slot(programme_id, week, 1, "upper")).unwrap();
+            db.add_programme_slot(&crate::db::new_programme_slot(programme_id, week, 2, "lower")).unwrap();
+        });
+        programme_id
+    }
+
+    /// The ticket's headline: a live programme is legible in one command, and the whole
+    /// report is read from the grid — no LLM round-trip, so it stays free to ask.
+    #[tokio::test]
+    async fn bare_programme_reports_status_when_one_is_active() {
+        let (handler, llm) = setup_handler("").await;
+        let msg = make_message(12345, "hello");
+        let user = setup_ready_user(&handler, &msg).await;
+        {
+            let db = handler.db.lock().await;
+            let programme_id = activate_programme_started(&db, user.id, 2, 6);
+            // Week 1 fully trained, so week 2's two slots are what the sweep settles.
+            let slots = db.list_programme_slots(programme_id).unwrap();
+            [slots[0].id, slots[1].id].iter().for_each(|slot_id| {
+                let roster = db.create_roster(user.id, "Trained", None, None).unwrap();
+                db.bind_roster_to_slot(roster, *slot_id).unwrap();
+                let session = db.start_session(user.id, None).unwrap();
+                db.bind_roster_to_session(roster, session.id).unwrap();
+            });
+        }
+        let before = llm.recorded_requests().len();
+
+        let reply = handler.handle_text_message(&msg, "/programme").await.unwrap();
+        let text = shown(&reply);
+        assert!(text.contains("Week 3 of 6"), "the position must reach the user: {text}");
+        assert!(text.contains("accumulation"), "and the block covering it: {text}");
+        assert!(text.contains("Week 3, day 1: upper"), "and the next session due: {text}");
+        assert!(text.contains("2 trained · 2 missed · 0 skipped · 8 to go"), "and the tally: {text}");
+        assert!(text.contains("/nextworkout"), "and what to do about it: {text}");
+        assert!(!text.contains("Lock it in?"), "a live programme is not asking to be confirmed: {text}");
+        assert_eq!(llm.recorded_requests().len(), before, "the status report costs no LLM call");
+    }
+
+    /// Reading the status sweeps, so the report can never show a week as still owed that
+    /// the calendar closed — and the sweep it performs is the real one, not a display
+    /// nicety: `/nextworkout` afterwards lands on the same slot the report named.
+    #[tokio::test]
+    async fn reading_the_status_settles_the_weeks_it_reports_as_missed() {
+        let (handler, _llm) = setup_handler("").await;
+        let msg = make_message(12345, "hello");
+        let user = setup_ready_user(&handler, &msg).await;
+        let programme_id = {
+            let db = handler.db.lock().await;
+            activate_programme_started(&db, user.id, 3, 6)
+        };
+
+        let _ = handler.handle_text_message(&msg, "/programme status").await.unwrap();
+
+        let db = handler.db.lock().await;
+        let missed = db.list_programme_slots(programme_id).unwrap().iter().filter(|s| s.status == SlotStatus::Missed).count();
+        assert_eq!(missed, 6, "three elapsed weeks are settled by the read");
+        assert_eq!(db.next_design_slot(programme_id).unwrap().unwrap().week_idx, 4, "and the design path agrees with the report");
+    }
+
+    /// A read must never arm an interview: `/programme status` with nothing to report is
+    /// answered, not quietly turned into a design session the user did not ask for.
+    #[tokio::test]
+    async fn programme_status_without_a_programme_answers_without_arming_anything() {
+        let (handler, _llm) = setup_handler("").await;
+        let msg = make_message(12345, "hello");
+        let user = setup_ready_user(&handler, &msg).await;
+
+        let reply = handler.handle_text_message(&msg, "/programme status").await.unwrap();
+        assert!(shown(&reply).contains("don't have an active programme"), "got: {}", shown(&reply));
+        assert!(shown(&reply).contains("/programme"), "and must name the way to get one: {}", shown(&reply));
+        assert!(
+            handler.db.lock().await.get_interview_state(user.id, "telegram").unwrap().is_none(),
+            "a status read must not arm the interview"
+        );
+    }
+
+    /// Bare `/programme` still opens the interview for a user with no programme — the
+    /// pre-[R2.1] behaviour, and the path all the onboarding copy points at.
+    #[tokio::test]
+    async fn bare_programme_still_opens_the_interview_when_none_is_active() {
+        let (handler, _llm) = setup_handler("").await;
+        let msg = make_message(12345, "hello");
+        let user = setup_ready_user(&handler, &msg).await;
+
+        let reply = handler.handle_text_message(&msg, "/programme").await.unwrap();
+        assert!(shown(&reply).contains("Let's build your multi-week programme"), "got: {}", shown(&reply));
+        assert_eq!(handler.db.lock().await.get_interview_state(user.id, "telegram").unwrap().unwrap().mode, "programme");
+    }
+
+    /// A draft is a programme in the making, not a live one: it has no position to
+    /// report, so bare `/programme` keeps interviewing rather than reporting on it.
+    #[tokio::test]
+    async fn a_draft_programme_does_not_divert_the_command_into_a_status_report() {
+        let (handler, _llm) = setup_handler("").await;
+        let msg = make_message(12345, "hello");
+        let user = setup_ready_user(&handler, &msg).await;
+        {
+            let db = handler.db.lock().await;
+            db.create_programme(&crate::db::new_programme(user.id, "Unfinished", 3, "full body", "linear")).unwrap();
+        }
+
+        let reply = handler.handle_text_message(&msg, "/programme").await.unwrap();
+        assert!(shown(&reply).contains("Let's build your multi-week programme"), "got: {}", shown(&reply));
+    }
+
+    /// Unrecognised words after the command are not a typo'd subcommand — they are
+    /// someone talking to it, and must read as bare `/programme`.
+    #[test]
+    fn programme_subcommands_parse_by_name_and_default_to_bare() {
+        use super::{ProgrammeRequest, programme_request};
+        assert_eq!(programme_request("/programme status"), ProgrammeRequest::Status);
+        assert_eq!(programme_request("/programme STATUS"), ProgrammeRequest::Status);
+        assert_eq!(programme_request("/programme new"), ProgrammeRequest::New);
+        assert_eq!(programme_request("/programme"), ProgrammeRequest::Bare);
+        assert_eq!(programme_request("/programme for my bench goal"), ProgrammeRequest::Bare);
     }
 
     // ── The prompt ────────────────────────────────────────────────────────────

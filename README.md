@@ -97,6 +97,28 @@ the same test `next_design_slot` applies — a SessionRoster bound to the slot t
 a slot merely `filled` with a design nobody executed is not adherence, and slot selection can never disagree with the
 adherence the prompt reports.
 
+**ProgrammeStatus** — where a *live* Programme has got to, as `/programme status` reports it: the calendar week
+against the grid's span, the ProgrammeBlock covering it, the next ProgrammeSlot due, and SlotCounts over the whole
+grid. Type `ProgrammeStatus`, read by `Database::programme_status` and never persisted.
+*Not to be confused with ProgrammeContext.* ProgrammeContext answers "what should this one session be?" for the
+designer, spanning only the slots before one cell; ProgrammeStatus answers "where am I?" for the user, spanning the
+whole grid whether or not a design is in flight. Its `current_week` is read off `start_date` and today (where the user
+*is*); its `next_slot` is read off the grid (what is *due*). The two agree once the missed-slot sweep has run, and
+diverge legitimately when a user trains a week's slots early.
+
+**SlotCounts** — how a whole Programme grid has resolved: `trained`, `missed`, `skipped` and a derived `remaining()`.
+Type `SlotCounts`. The four buckets are **disjoint and sum to the grid**, so they can be rendered as a whole; `trained`
+applies SlotAdherence's test and is narrowed to slots that are neither `missed` nor `skipped`, which is what keeps them
+disjoint when a slot was designed and then dropped by hand.
+
+**missed-slot sweep** — `Database::mark_missed_slots(programme_id, today)`: every ProgrammeSlot still `pending` whose
+week has *fully* passed becomes `missed`. Week *n* covers the seven days from `start_date + (n-1)*7`, so it settles
+only once today reaches `start_date + n*7` — a week still in progress is trainable today and is left alone. Only
+`pending` moves: a `filled` slot has a design against it, and whether that design was executed is a drift question, not
+this sweep's. It runs **lazily from `training_mode_for_design`, before the slot is chosen** — no cron, no scheduler —
+because the only moment a stale slot can do harm is the moment one is picked; without it a design six weeks in would
+target week 1 for ever. Idempotent by construction, and it fails closed on a date it cannot read.
+
 **TrainingMode** — the mode a session design runs in. Type `TrainingMode`; resolved per design, never persisted.
 - `AdHoc` — a one-off. The first-class default: it never requires a Programme, and it stays available *while* one is
   active as a deliberate one-off that leaves every slot untouched.
