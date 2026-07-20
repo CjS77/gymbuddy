@@ -32,8 +32,8 @@ use serde::{Deserialize, Serialize};
 use super::AssistantHandler;
 use crate::assistant::parser::parse_assistant_response;
 use crate::db::{
-    Database, EffortSource, ExerciseDelta, GoalDirection, GoalProgress, GoalStatus, MeasurementType, PerformedRollup, RosterVsActual,
-    Session, SessionPersonalRecord, SessionRoster, UnrosteredExercise, User,
+    Database, EffortSource, ExerciseDelta, GoalDirection, GoalProgress, GoalStatus, MeasurementType, PerformedRollup, ProgrammeSlot,
+    RosterVsActual, Session, SessionPersonalRecord, SessionRoster, UnrosteredExercise, User, today_str,
 };
 use crate::science::ScienceQuery;
 use crate::text::strip_markdown;
@@ -286,12 +286,30 @@ impl AssistantHandler {
     /// the turn down with it — the session is already ended and logged, and losing the user's
     /// reply over a failed write-up would be a far worse outcome than a missing review.
     pub(super) async fn write_session_review(&self, user: &User, session_id: i64) -> Option<String> {
-        match self.generate_session_review(user, session_id).await {
-            Ok(view) => Some(format!("{} /review for the full write-up.", view.headline)),
+        let view = match self.generate_session_review(user, session_id).await {
+            Ok(view) => view,
             Err(e) => {
                 tracing::warn!("Failed to generate the review for session {session_id}: {e:#}");
-                None
+                return None;
             }
+        };
+        let next = self.next_step_suffix(user).await;
+        Some(format!("{} /review for the full write-up. {next}", view.headline))
+    }
+
+    /// The pointer back to the next session that a completed review's reply carries — step 6's
+    /// not-yet branch ([R4.2]), closing the loop toward the next workout. With an active
+    /// programme it names the slot the next design will target; ad-hoc, it simply points at
+    /// `/nextworkout`. This is the suffix-assembly seam the programme-complete branch ([R4.1])
+    /// composes its own ending onto.
+    async fn next_step_suffix(&self, user: &User) -> String {
+        let next_slot = {
+            let db = self.db.lock().await;
+            active_next_slot(&db, user.id)
+        };
+        match next_slot {
+            Some(slot) => format!("Next up — {}. /nextworkout when you're ready.", slot_pointer(&slot)),
+            None => "/nextworkout when you're ready.".to_string(),
         }
     }
 
@@ -432,6 +450,19 @@ fn mark_and_collect_achieved(db: &Database, goals: &[GoalProgress]) -> anyhow::R
             Ok(goal_label(g))
         })
         .collect()
+}
+
+/// The next unresolved slot of the user's active programme, or `None` when there is no active
+/// programme or its grid is fully settled. Reuses the [R2.1] status read — which sweeps the
+/// weeks the user has run out of time for before choosing — rather than recomputing position.
+fn active_next_slot(db: &Database, user_id: i64) -> Option<ProgrammeSlot> {
+    let programme = db.active_programme_for_user(user_id).ok().flatten()?;
+    db.programme_status(&programme, &today_str()).ok()?.next_slot
+}
+
+/// One programme slot as the next-step pointer names it, e.g. "week 3, day 2: pull".
+fn slot_pointer(slot: &ProgrammeSlot) -> String {
+    format!("week {}, day {}: {}", slot.week_idx, slot.day_idx, slot.focus)
 }
 
 /// The programme position a slot sits at, or `None` when its programme has gone missing.
@@ -591,10 +622,27 @@ fn goal_label(g: &GoalProgress) -> String {
     format!("{} to {}", g.exercise_name, trim_decimal(g.goal.target_value))
 }
 
+/// How far a goal still has to travel, direction-aware ([R4.2]): an increase goal counts the
+/// climb up to its target, a decrease goal (weightloss, a faster time) the fall down to it.
+/// `None` once the target is met — a reached goal has no gap left to close, and the review's
+/// achieved section speaks for it instead of an inverted "distance to go".
+fn goal_distance(g: &GoalProgress) -> Option<f64> {
+    let current = g.current_value?;
+    let remaining = match g.goal.direction {
+        GoalDirection::Increase => g.goal.target_value - current,
+        GoalDirection::Decrease => current - g.goal.target_value,
+    };
+    (remaining > f64::EPSILON).then_some(remaining)
+}
+
 fn goal_line(g: &GoalProgress) -> String {
-    match g.current_value {
-        Some(current) => format!("{}: {} ({}%)", goal_label(g), trim_decimal(current), g.percentage.round() as i64),
-        None => format!("{}: nothing logged yet", goal_label(g)),
+    let Some(current) = g.current_value else {
+        return format!("{}: nothing logged yet", goal_label(g));
+    };
+    let progress = format!("{}: {} ({}%)", goal_label(g), trim_decimal(current), g.percentage.round() as i64);
+    match goal_distance(g) {
+        Some(remaining) => format!("{progress} — {} to go", trim_decimal(remaining)),
+        None => progress,
     }
 }
 
@@ -682,7 +730,8 @@ mod tests {
     use super::super::test_support::*;
     use super::*;
     use crate::db::{
-        LifecycleStatus, Programme, ProgrammeSlot, RosterExercise, SlotStatus, new_exercise_entry_at, new_exercise_goal, new_exercise_set,
+        Goal, GoalKind, LifecycleStatus, Programme, ProgrammeSlot, RosterExercise, SlotStatus, new_exercise_entry_at, new_exercise_goal,
+        new_exercise_set,
     };
     use crate::db::SetEdit;
     use gymbuddy_proto::{ReviewKindView, View};
@@ -1075,5 +1124,110 @@ mod tests {
         assert_eq!(llm.recorded_requests().len(), after_generate, "replaying a review consults nobody");
         assert!(matches!(reply.view, View::SessionReview(_)), "the command returns the review view");
         assert!(shown(&reply).contains("Bench Press"), "{}", shown(&reply));
+    }
+
+    // ── The encouragement path ([R4.2]) ───────────────────────────────────────
+
+    /// A `GoalProgress` built by hand, for the direction-awareness unit below — cheaper than
+    /// standing up the sets a real one derives its value from.
+    fn goal_progress_fixture(direction: GoalDirection, target: f64, current: Option<f64>) -> GoalProgress {
+        let goal = Goal {
+            id: 1,
+            user_id: 1,
+            kind: GoalKind::Strength,
+            exercise_type_id: Some(1),
+            metric: None,
+            target_value: target,
+            direction,
+            priority: 0,
+            start_date: "2026-01-01".into(),
+            target_date: None,
+            achieved: false,
+            notes: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        GoalProgress { goal, exercise_name: "Bench Press".into(), status: GoalStatus::Active, current_value: current, percentage: 0.0 }
+    }
+
+    /// An active programme for `user` with a single pending slot at `(week, day)` — the next
+    /// design would target it, so the review's pointer must name it.
+    async fn active_programme_with_pending_slot(handler: &AssistantHandler, user: &User, week: i32, day: i32, focus: &str) {
+        let db = handler.db.lock().await;
+        let programme_id = db
+            .create_programme(&Programme {
+                id: 0,
+                user_id: user.id,
+                title: "12-week hypertrophy".into(),
+                // Today, so the target week is still in the future and the sweep leaves it pending.
+                start_date: today_str(),
+                target_end_date: None,
+                days_per_week: 3,
+                split: "upper/lower".into(),
+                progression_policy: "double progression".into(),
+                status: LifecycleStatus::Active,
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .unwrap();
+        db.activate_programme(programme_id).unwrap();
+        db.add_programme_slot(&ProgrammeSlot {
+            id: 0,
+            programme_id,
+            week_idx: week,
+            day_idx: day,
+            focus: focus.into(),
+            status: SlotStatus::Pending,
+            updated_at: String::new(),
+        })
+        .unwrap();
+    }
+
+    /// Direction-awareness is the correctness bar the ticket sets: a decrease goal's distance
+    /// counts *down* to the target, never up. Getting it backwards would invert the encouragement.
+    #[test]
+    fn distance_to_goal_is_direction_aware() {
+        let increase = goal_progress_fixture(GoalDirection::Increase, 200.0, Some(82.5));
+        assert_eq!(goal_distance(&increase), Some(117.5), "an increase goal climbs the remaining gap to target");
+        assert!(goal_line(&increase).contains("117.5 to go"), "{}", goal_line(&increase));
+
+        let decrease = goal_progress_fixture(GoalDirection::Decrease, 75.0, Some(87.0));
+        assert_eq!(goal_distance(&decrease), Some(12.0), "a decrease goal falls the remaining gap to target");
+        assert!(goal_line(&decrease).contains("12 to go"), "{}", goal_line(&decrease));
+
+        // A decrease goal already at or under target has closed the gap — no distance to report.
+        let met = goal_progress_fixture(GoalDirection::Decrease, 75.0, Some(75.0));
+        assert_eq!(goal_distance(&met), None, "a met goal has no distance left");
+        assert!(!goal_line(&met).contains("to go"), "and its line says nothing about a gap: {}", goal_line(&met));
+    }
+
+    /// End of session, open goal, no programme: the review carries the direction-aware distance
+    /// line, and the reply points plainly at `/nextworkout` with no slot to name.
+    #[tokio::test]
+    async fn an_open_goal_gets_a_distance_line_and_a_plain_nextworkout_pointer() {
+        let (handler, _) = setup_handler(COMMENTARY).await;
+        let user = ready_user(&handler).await;
+        let session_id = logged_session(&handler, &user, 82.5, 3).await;
+
+        let view = handler.generate_session_review(&user, session_id).await.unwrap();
+        let bench = view.goals.iter().find(|g| g.contains("Bench Press")).expect("the bench goal line");
+        assert!(bench.contains("117.5 to go"), "the distance to the 200 target is shown: {bench}");
+
+        let suffix = handler.write_session_review(&user, session_id).await.expect("a review note");
+        assert!(suffix.contains("/nextworkout when you're ready."), "the reply points at the next session: {suffix}");
+        assert!(!suffix.contains("Next up —"), "ad-hoc has no programme slot to name: {suffix}");
+    }
+
+    /// With an active programme the pointer names the slot the next design will target — the
+    /// spec's worked example, verbatim.
+    #[tokio::test]
+    async fn a_programme_pointer_names_the_next_slot() {
+        let (handler, _) = setup_handler(COMMENTARY).await;
+        let user = ready_user(&handler).await;
+        let session_id = logged_session(&handler, &user, 82.5, 3).await;
+        active_programme_with_pending_slot(&handler, &user, 3, 2, "pull").await;
+
+        let suffix = handler.write_session_review(&user, session_id).await.expect("a review note");
+        assert!(suffix.contains("Next up — week 3, day 2: pull. /nextworkout when you're ready."), "{suffix}");
     }
 }
