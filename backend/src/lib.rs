@@ -4,6 +4,7 @@ pub mod db;
 pub mod dump;
 pub mod github;
 pub mod render;
+pub mod science;
 pub mod telegram;
 pub(crate) mod text;
 pub mod transport;
