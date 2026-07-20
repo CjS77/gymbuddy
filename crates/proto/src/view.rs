@@ -58,6 +58,9 @@ pub enum View {
     /// reply. `Box` is transparent to serde, so the wire bytes are exactly those of an
     /// unboxed `ProgrammeView` — the indirection is invisible to any peer.
     Programme(Box<ProgrammeView>),
+    /// How the user is tracking against their goals ( `/progress` ), as chartable
+    /// [`SeriesView`]s the client plots however it can ([C6.2]/[C6.3]).
+    Progress(ProgressView),
 }
 
 impl View {
@@ -91,6 +94,7 @@ impl View {
             View::SessionRoster(r) => format!("Here's a workout: {}.", r.title),
             View::ProgrammeSessionRoster { roster, mode } => format!("Here's a workout: {} ({}).", roster.title, mode.summary()),
             View::Programme(p) => format!("Here's a programme: {} ({}).", p.title, p.shape_line()),
+            View::Progress(p) => p.summary_line(),
         }
     }
 }
@@ -377,6 +381,239 @@ pub struct ProgrammeDayView {
     pub focus: String,
 }
 
+// ── chartable series ─────────────────────────────────────────────────────────────
+
+/// The eight block glyphs a [`SeriesView::spark`] is drawn from, shortest first.
+const SPARK_TICKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+/// Which way progress runs for a [`SeriesView`].
+///
+/// Carried as data because it is not derivable from the numbers: 90 → 85 kg is
+/// progress for a cut and a regression for a bulk, and only the server knows which
+/// goal the series was drawn for. A client that assumes "up is good" renders half
+/// the app's series backwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Direction {
+    /// Up is progress — load lifted, weekly volume, reps at a fixed load.
+    Higher,
+    /// Down is progress — bodyweight on a cut, time over a fixed distance.
+    Lower,
+    /// The series is worth showing but has no better end: a reading tracked without
+    /// a goal attached. Clients report the movement without a verdict on it.
+    Neutral,
+}
+
+/// What kind of chart a [`SeriesView`] wants — the *shape* of the data, never a
+/// widget name.
+///
+/// The point of this enum is that a client writes one renderer per variant here and
+/// is then done: exercise progression, body metrics and goal trajectory are all
+/// [`Trend`](SeriesShape::Trend)s or [`Trajectory`](SeriesShape::Trajectory)s, and
+/// muscle-group volume is a [`Breakdown`](SeriesShape::Breakdown). Adding a metric
+/// server-side must never mean adding client code — that is how a chart layer ends
+/// up rebuilt once per client.
+///
+/// Rides inside an appended `View` variant, so its own order is wire format too.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum SeriesShape {
+    /// Readings in time order — a line or sparkline. Point labels are dates.
+    Trend,
+    /// Readings in time order against a fixed target — a line plus a reference line
+    /// at `target`. The goal-trajectory shape.
+    Trajectory { target: f64 },
+    /// Independent buckets compared side by side — bars. Point labels are category
+    /// names (a muscle group, a weekday), and their order carries no time meaning,
+    /// so movement between them is not a trend.
+    Breakdown,
+}
+
+/// One reading in a [`SeriesView`]: a display label and a number.
+///
+/// `label` is deliberately a string rather than a timestamp — it is a date for a
+/// trend and a category name for a breakdown, and collapsing both to "the x-axis
+/// label" is what lets one client renderer serve every metric.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeriesPointView {
+    pub label: String,
+    pub value: f64,
+}
+
+/// One chartable series — the single contract for every chart GymBuddy emits
+/// ([C6.2]).
+///
+/// Core ships the data; each client plots it (Telegram as text plus a unicode
+/// sparkline, the TUI with ratatui widgets, a future app with real pixels). The
+/// server's own `TimeSeries` aggregate stays behind the DAO: this is the wire model,
+/// decoupled on purpose so a query change does not reshape the protocol.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeriesView {
+    /// What the series measures, e.g. "Bench Press — top set".
+    pub title: String,
+    /// The unit `value`s are in ("kg", "reps", "sets"); empty for a bare count.
+    pub unit: String,
+    /// Which way "better" runs — see [`Direction`].
+    pub better: Direction,
+    pub shape: SeriesShape,
+    pub points: Vec<SeriesPointView>,
+}
+
+impl SeriesView {
+    /// The most recent (or last) reading.
+    pub fn latest(&self) -> Option<&SeriesPointView> {
+        self.points.last()
+    }
+
+    /// Movement from the first reading to the last, in `unit`s.
+    ///
+    /// `None` for a [`SeriesShape::Breakdown`] — its buckets are not ordered in time,
+    /// so "first to last" would be an arithmetic result with no meaning — and for a
+    /// series of fewer than two points.
+    pub fn change(&self) -> Option<f64> {
+        if matches!(self.shape, SeriesShape::Breakdown) || self.points.len() < 2 {
+            return None;
+        }
+        Some(self.points.last()?.value - self.points.first()?.value)
+    }
+
+    /// Whether the [`change`](Self::change) is progress, per [`better`](Self::better).
+    ///
+    /// `None` means there is no verdict to give — not enough points, a
+    /// [`Direction::Neutral`] series, or no movement at all — and clients should say
+    /// nothing rather than guess.
+    pub fn improving(&self) -> Option<bool> {
+        let change = self.change()?;
+        match self.better {
+            _ if change == 0.0 => None,
+            Direction::Neutral => None,
+            Direction::Higher => Some(change > 0.0),
+            Direction::Lower => Some(change < 0.0),
+        }
+    }
+
+    /// `(min, max)` for a value axis, widened to include a
+    /// [`SeriesShape::Trajectory`]'s target so the reference line cannot fall off the
+    /// chart. `None` for an empty series.
+    ///
+    /// Computed here so every client scales its axis identically instead of each one
+    /// rediscovering that the target belongs in the range.
+    pub fn bounds(&self) -> Option<(f64, f64)> {
+        let (min, max) = self.point_bounds()?;
+        match self.shape {
+            SeriesShape::Trajectory { target } => Some((min.min(target), max.max(target))),
+            _ => Some((min, max)),
+        }
+    }
+
+    /// `(min, max)` over the points alone — what a sparkline scales to, since a distant
+    /// target would otherwise flatten the readings into one glyph.
+    fn point_bounds(&self) -> Option<(f64, f64)> {
+        let first = self.points.first()?.value;
+        Some(self.points.iter().fold((first, first), |(lo, hi), p| (lo.min(p.value), hi.max(p.value))))
+    }
+
+    /// A unicode block sparkline of the readings, e.g. `▁▂▄▅█`.
+    ///
+    /// The plain-text fallback for clients that cannot draw a chart, shared here so
+    /// Telegram and the TUI produce the same glyphs. It plots the values **as they
+    /// are**: a cut's bodyweight series slopes down because that is what the numbers
+    /// do. Direction is a verdict on the movement, not a transform of it — flipping
+    /// the geometry would mean showing the user data they did not record. Clients say
+    /// which way is good with [`improving`](Self::improving), in words or colour.
+    ///
+    /// Empty for an empty series; a flat series renders as a mid-height band.
+    pub fn spark(&self) -> String {
+        let Some((min, max)) = self.point_bounds() else {
+            return String::new();
+        };
+        let span = max - min;
+        let top = SPARK_TICKS.len() - 1;
+        self.points
+            .iter()
+            .map(|p| {
+                let tick = if span == 0.0 { top / 2 } else { (((p.value - min) / span) * top as f64).round() as usize };
+                SPARK_TICKS[tick.min(top)]
+            })
+            .collect()
+    }
+
+    /// One-line summary of the movement, e.g. `80 → 92.5 kg (+12.5, better)`.
+    ///
+    /// Empty when [`change`](Self::change) has nothing to report. Plain text —
+    /// styling and escaping stay at the renderer.
+    pub fn change_line(&self) -> String {
+        let (Some(change), Some(first), Some(last)) = (self.change(), self.points.first(), self.points.last()) else {
+            return String::new();
+        };
+        let verdict = match self.improving() {
+            Some(true) => ", better",
+            Some(false) => ", worse",
+            None => "",
+        };
+        format!("{} → {} ({}{verdict})", trim_decimal(first.value), self.value_label(last.value), signed(change))
+    }
+
+    /// A value in this series' unit, e.g. `92.5 kg` — or just `92.5` when the series
+    /// carries no unit. The one place a series' numbers get formatted, so every client
+    /// prints them the same way.
+    pub fn value_label(&self, value: f64) -> String {
+        match self.unit.is_empty() {
+            true => trim_decimal(value),
+            false => format!("{} {}", trim_decimal(value), self.unit),
+        }
+    }
+
+    /// The value a [`SeriesShape::Trajectory`] aims at, e.g. `Target: 100 kg`. Empty
+    /// for every other shape.
+    pub fn target_line(&self) -> String {
+        match self.shape {
+            SeriesShape::Trajectory { target } => format!("Target: {}", self.value_label(target)),
+            _ => String::new(),
+        }
+    }
+
+    /// The latest reading with its label, e.g. `92.5 kg (2026-07-01)`. Empty for an
+    /// empty series. What a client shows when the series is too short for a
+    /// [`change_line`](Self::change_line).
+    pub fn latest_line(&self) -> String {
+        self.latest().map(|p| format!("{} ({})", self.value_label(p.value), p.label)).unwrap_or_default()
+    }
+}
+
+/// Progress against the user's goals ( `/progress` ): a headline plus the chartable
+/// series behind it.
+///
+/// Holds nothing but [`SeriesView`]s and text, so every chart in the app — here, and
+/// in the post-session review — travels through the same contract rather than
+/// growing a second one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProgressView {
+    /// The server's one-line answer to "how am I doing", e.g. "2 of 3 goals on track".
+    pub headline: String,
+    pub series: Vec<SeriesView>,
+    /// Free-text caveats — a goal with too little data to chart, a metric not logged
+    /// recently enough to trend.
+    pub notes: Vec<String>,
+}
+
+impl ProgressView {
+    /// The line every renderer leads with: the server's headline, or a count of what
+    /// is enclosed when it did not set one (a view still has to announce itself).
+    pub fn summary_line(&self) -> String {
+        if self.headline.trim().is_empty() {
+            let n = self.series.len();
+            format!("Here's your progress ({n} {}).", if n == 1 { "chart" } else { "charts" })
+        } else {
+            self.headline.clone()
+        }
+    }
+}
+
+/// Render a change with an explicit sign, so "+2.5" and "-2.5" read as movement
+/// rather than as values.
+fn signed(v: f64) -> String {
+    if v > 0.0 { format!("+{}", trim_decimal(v)) } else { trim_decimal(v) }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -400,10 +637,175 @@ pub(crate) mod tests {
                 mode: TrainingModeView::Programme { programme_title: "12-week".into(), week: 1, day: 1, focus: "upper".into() },
             },
             View::Programme(Box::new(programme_view())),
+            View::Progress(progress_view()),
+            // A headline the server left empty is the case that would otherwise
+            // fall through to an empty message.
+            View::Progress(ProgressView { headline: String::new(), series: vec![], notes: vec![] }),
         ];
         for view in &views {
             assert!(!view.fallback_text().is_empty(), "empty fallback for {view:?}");
         }
+    }
+
+    /// A representative progress payload, shared by the tests below and by `lib.rs`.
+    pub(crate) fn progress_view() -> ProgressView {
+        ProgressView {
+            headline: "2 of 3 goals on track".into(),
+            series: vec![trend(), bodyweight(), breakdown()],
+            notes: vec!["Squat has too few sessions to trend yet.".into()],
+        }
+    }
+
+    fn points(raw: &[(&str, f64)]) -> Vec<SeriesPointView> {
+        raw.iter().map(|(label, value)| SeriesPointView { label: (*label).into(), value: *value }).collect()
+    }
+
+    /// Exercise progression: up is better.
+    fn trend() -> SeriesView {
+        SeriesView {
+            title: "Bench Press — top set".into(),
+            unit: "kg".into(),
+            better: Direction::Higher,
+            shape: SeriesShape::Trajectory { target: 100.0 },
+            points: points(&[("2026-05-01", 80.0), ("2026-06-01", 85.0), ("2026-07-01", 92.5)]),
+        }
+    }
+
+    /// A body metric on a cut: down is better. The series everyone renders backwards.
+    fn bodyweight() -> SeriesView {
+        SeriesView {
+            title: "Bodyweight".into(),
+            unit: "kg".into(),
+            better: Direction::Lower,
+            shape: SeriesShape::Trend,
+            points: points(&[("2026-05-01", 90.0), ("2026-06-01", 87.5)]),
+        }
+    }
+
+    /// Muscle-group volume: buckets, not a timeline.
+    fn breakdown() -> SeriesView {
+        SeriesView {
+            title: "Weekly volume by muscle group".into(),
+            unit: "sets".into(),
+            better: Direction::Neutral,
+            shape: SeriesShape::Breakdown,
+            points: points(&[("Chest", 12.0), ("Back", 16.0), ("Legs", 9.0)]),
+        }
+    }
+
+    /// The whole point of carrying `better` on the wire: the same downward movement is
+    /// progress for a cut and a regression for a lift.
+    #[test]
+    fn improving_is_direction_aware() {
+        assert_eq!(trend().improving(), Some(true), "load going up is progress");
+        assert_eq!(bodyweight().improving(), Some(true), "weight coming down is progress on a cut");
+
+        let mut regressed = trend();
+        regressed.points = points(&[("2026-05-01", 92.5), ("2026-06-01", 85.0)]);
+        assert_eq!(regressed.improving(), Some(false));
+
+        let mut gaining = bodyweight();
+        gaining.points = points(&[("2026-05-01", 87.5), ("2026-06-01", 90.0)]);
+        assert_eq!(gaining.improving(), Some(false));
+    }
+
+    /// `None` is "no verdict", and the three ways to get there must not be confused
+    /// with "not improving" — a client that renders them as a regression is lying.
+    #[test]
+    fn improving_withholds_a_verdict_when_it_has_none() {
+        let mut flat = bodyweight();
+        flat.points = points(&[("2026-05-01", 90.0), ("2026-06-01", 90.0)]);
+        assert_eq!(flat.improving(), None, "no movement");
+
+        let mut single = bodyweight();
+        single.points = points(&[("2026-05-01", 90.0)]);
+        assert_eq!(single.improving(), None, "one point is not a trend");
+
+        assert_eq!(breakdown().improving(), None, "a neutral breakdown has no better end");
+    }
+
+    /// Breakdown buckets are not ordered in time, so last-minus-first is arithmetic
+    /// with no meaning — better withheld than reported as a trend.
+    #[test]
+    fn a_breakdown_reports_no_change() {
+        assert_eq!(breakdown().change(), None);
+        assert_eq!(breakdown().change_line(), "");
+        assert_eq!(trend().change(), Some(12.5));
+    }
+
+    /// A trajectory's target has to sit inside the axis range or the reference line
+    /// is drawn off the chart.
+    #[test]
+    fn bounds_make_room_for_a_trajectory_target() {
+        assert_eq!(trend().bounds(), Some((80.0, 100.0)), "target 100 widens the 80..92.5 readings");
+        assert_eq!(bodyweight().bounds(), Some((87.5, 90.0)), "a plain trend spans its readings only");
+
+        let empty = SeriesView { points: vec![], ..trend() };
+        assert_eq!(empty.bounds(), None);
+    }
+
+    /// The sparkline plots the readings as recorded; the verdict on them is
+    /// `improving()`'s job, not a transform of the geometry.
+    #[test]
+    fn spark_draws_the_readings_as_they_are() {
+        let mut rising = trend();
+        rising.points = points(&[("a", 0.0), ("b", 4.0), ("c", 8.0)]);
+        assert_eq!(rising.spark(), "▁▅█");
+
+        // Falling bodyweight is progress, and still slopes down.
+        let mut falling = bodyweight();
+        falling.points = points(&[("a", 8.0), ("b", 4.0), ("c", 0.0)]);
+        assert_eq!(falling.improving(), Some(true));
+        assert_eq!(falling.spark(), "█▅▁");
+    }
+
+    #[test]
+    fn spark_handles_flat_and_empty_series() {
+        let mut flat = bodyweight();
+        flat.points = points(&[("a", 70.0), ("b", 70.0), ("c", 70.0)]);
+        assert_eq!(flat.spark(), "▄▄▄", "a flat series is a mid-height band, not a divide by zero");
+
+        let empty = SeriesView { points: vec![], ..bodyweight() };
+        assert_eq!(empty.spark(), "");
+    }
+
+    #[test]
+    fn change_line_reads_for_humans() {
+        assert_eq!(trend().change_line(), "80 → 92.5 kg (+12.5, better)");
+        assert_eq!(bodyweight().change_line(), "90 → 87.5 kg (-2.5, better)");
+
+        let mut unitless = trend();
+        unitless.unit = String::new();
+        unitless.better = Direction::Neutral;
+        unitless.points = points(&[("a", 3.0), ("b", 5.0)]);
+        assert_eq!(unitless.change_line(), "3 → 5 (+2)", "no unit, and no verdict on a neutral series");
+    }
+
+    #[test]
+    fn value_target_and_latest_labels() {
+        let s = trend();
+        assert_eq!(s.value_label(92.5), "92.5 kg");
+        assert_eq!(s.target_line(), "Target: 100 kg");
+        assert_eq!(s.latest_line(), "92.5 kg (2026-07-01)");
+
+        // A plain trend aims at nothing, and a unitless series prints a bare number.
+        assert_eq!(bodyweight().target_line(), "");
+        let bare = SeriesView { unit: String::new(), ..breakdown() };
+        assert_eq!(bare.value_label(9.0), "9");
+
+        let empty = SeriesView { points: vec![], ..trend() };
+        assert_eq!(empty.latest_line(), "");
+    }
+
+    #[test]
+    fn progress_summary_falls_back_to_a_count() {
+        assert_eq!(progress_view().summary_line(), "2 of 3 goals on track");
+
+        let one = ProgressView { headline: "  ".into(), series: vec![trend()], notes: vec![] };
+        assert_eq!(one.summary_line(), "Here's your progress (1 chart).");
+
+        let none = ProgressView { headline: String::new(), series: vec![], notes: vec![] };
+        assert_eq!(none.summary_line(), "Here's your progress (0 charts).");
     }
 
     /// A representative designed programme, shared by the tests below.

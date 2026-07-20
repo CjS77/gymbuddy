@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 
 pub mod view;
 pub use view::{
-    CatalogEntry, CatalogGroup, CatalogView, ExerciseLog, HealthNote, HistoryView, Measurement, ProgrammeBlockView, ProgrammeDayView,
-    ProgrammeView, Render, RosterExerciseView, SessionRosterView, SessionSummaryView, SessionView, SetLine, StatusView, TrainingModeView,
-    View,
+    CatalogEntry, CatalogGroup, CatalogView, Direction, ExerciseLog, HealthNote, HistoryView, Measurement, ProgrammeBlockView,
+    ProgrammeDayView, ProgrammeView, ProgressView, Render, RosterExerciseView, SeriesPointView, SeriesShape, SeriesView, SessionRosterView,
+    SessionSummaryView, SessionView, SetLine, StatusView, TrainingModeView, View,
 };
 
 /// Discriminator placed in confide's `Message::Custom { kind, .. }` so the peer
@@ -147,7 +147,7 @@ pub fn decode_response(data: &[u8]) -> postcard::Result<ServerResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use view::tests::programme_view;
+    use view::tests::{programme_view, progress_view};
 
     fn roundtrip_request(req: ClientRequest) {
         let bytes = encode_request(&req).expect("encode");
@@ -250,6 +250,8 @@ mod tests {
                 mode: view::TrainingModeView::Programme { programme_title: "12-week".into(), week: 1, day: 2, focus: "upper".into() },
             },
             View::Programme(Box::new(programme_view())),
+            View::Progress(progress_view()),
+            View::Progress(view::ProgressView { headline: "No goals set yet.".into(), series: vec![], notes: vec![] }),
         ] {
             roundtrip_response(ServerResponse::Reply { view, timer: None });
         }
@@ -286,6 +288,41 @@ mod tests {
             "ProgrammeSessionRoster keeps the pre-[R1.5] `ProgramWorkout` discriminant",
         );
         assert_eq!(tag(&View::Programme(Box::new(programme_view()))), 8, "Programme appended for [C4.2]");
+        assert_eq!(tag(&View::Progress(progress_view())), 9, "Progress appended for [C6.2]");
+    }
+
+    /// `SeriesShape` and `Direction` ride inside tag 9, so their own variant order is
+    /// wire format too — same reasoning as [`training_mode_discriminants_are_pinned_to_their_wire_tags`].
+    ///
+    /// `Direction` in particular must never shift: its variants are opposites, so a
+    /// reorder does not corrupt a message into a decode error, it silently turns
+    /// "losing weight is progress" into "losing weight is a regression" on an older
+    /// client. Nothing downstream would notice.
+    #[test]
+    fn series_discriminants_are_pinned_to_their_wire_tags() {
+        let tag = |bytes: Vec<u8>| bytes[0];
+        assert_eq!(tag(postcard::to_allocvec(&view::SeriesShape::Trend).unwrap()), 0, "Trend");
+        assert_eq!(tag(postcard::to_allocvec(&view::SeriesShape::Trajectory { target: 100.0 }).unwrap()), 1, "Trajectory");
+        assert_eq!(tag(postcard::to_allocvec(&view::SeriesShape::Breakdown).unwrap()), 2, "Breakdown");
+
+        assert_eq!(tag(postcard::to_allocvec(&view::Direction::Higher).unwrap()), 0, "Higher");
+        assert_eq!(tag(postcard::to_allocvec(&view::Direction::Lower).unwrap()), 1, "Lower");
+        assert_eq!(tag(postcard::to_allocvec(&view::Direction::Neutral).unwrap()), 2, "Neutral");
+    }
+
+    /// A series survives the wire with its numbers and its sense of "better" intact —
+    /// the two halves that a chart is drawn from.
+    #[test]
+    fn a_series_survives_the_wire_with_its_direction() {
+        let sent = progress_view();
+        let bytes = encode_response(&ServerResponse::Reply { view: View::Progress(sent.clone()), timer: None }).unwrap();
+        let ServerResponse::Reply { view: View::Progress(got), .. } = decode_response(&bytes).unwrap() else {
+            panic!("expected a Progress reply");
+        };
+        assert_eq!(got, sent);
+        assert_eq!(got.series[1].better, view::Direction::Lower);
+        assert_eq!(got.series[1].improving(), Some(true), "a cut's falling bodyweight is still progress after a roundtrip");
+        assert_eq!(got.series[0].bounds(), Some((80.0, 100.0)), "the trajectory target crossed too");
     }
 
     /// `View::Programme` boxes its payload purely to keep `View` small. That is an
