@@ -9,6 +9,7 @@ mod exercise_types;
 mod goals;
 mod groups;
 mod health;
+mod import;
 mod metrics;
 // `pub(crate)` so `crate::dump` can reach `V2_USER_VERSION` when it decides whether a database is
 // legacy, without publishing the migration set itself.

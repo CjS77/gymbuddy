@@ -101,17 +101,22 @@
 //! Timestamps are copied as the strings SQLite holds them in. No parsing, no normalisation: a
 //! backup that rewrites its own timestamps is not a backup.
 
+pub mod compare;
 pub mod counts;
+pub mod migrate;
 pub mod model;
 mod probe;
 mod v1;
+mod v2;
 
 use std::path::Path;
 
 use anyhow::Context as _;
 use rusqlite::{Connection, OpenFlags};
 
+pub use compare::Difference;
 pub use counts::RowCounts;
+pub use migrate::{MigrateReport, import, migrate};
 pub use model::{DUMP_FORMAT, DUMP_VERSION, Dump};
 pub use probe::{Generation, is_legacy_database};
 
@@ -144,10 +149,7 @@ pub fn export(conn: &Connection) -> anyhow::Result<Dump> {
     let exported_at = chrono::Utc::now().to_rfc3339();
     match generation {
         Generation::V1 => v1::read(conn, source, exported_at),
-        Generation::V2 => anyhow::bail!(
-            "this database is already schema v2 (user_version {}), and the v2 reader lands with schema v2 itself in EP-10",
-            source.user_version
-        ),
+        Generation::V2 => v2::read(conn, source, exported_at),
     }
 }
 
