@@ -9,11 +9,16 @@ This log starts at 0.22.0; earlier releases are not covered.
 
 ## [0.22.0] - 2026-07-18
 
+> Terminology note: this release shipped before the 2026-07-20 vocabulary realignment. Entries below are written in
+> current terms — `SessionRoster` for the built session artefact, `programme` throughout — so the log reads against
+> today's codebase. Behaviour is described as it shipped; only the names have moved. See the Nomenclature section of
+> `README.md`.
+
 ### Added
 
 #### Long-term programmes
 
-- Programme skeleton in the schema and a `programs.rs` DAO (migration `12-programmes`): programmes carry a title,
+- Programme skeleton in the schema and a `programmes.rs` DAO (migration `12-programmes`): programmes carry a title,
   start and target-end dates, days per week, free-text split and progression policy, and a
   draft/active/completed/abandoned status. Mesocycles are inclusive week ranges with a focus, and the week/day grid
   is a table of slots with pending/filled/missed/skipped status. Each user holds at most one live draft and one
@@ -23,10 +28,10 @@ This log starts at 0.22.0; earlier releases are not covered.
   the current slot — the earliest unresolved cell — and the reply names the programme, week, day and focus. A
   redesign re-targets the same slot rather than burning the next one.
 - A leading `adhoc` (also `ad-hoc`, `oneoff`, `one-off`) in the command guidance forces a deliberate one-off under
-  an active programme: the plan stays slotless and no slot status moves through design, execution or session end.
-- The training mode is carried on the wire as a new `View::ProgramWorkout` variant and rendered as a single line
-  under the workout title in both the Telegram and TUI clients. Ad-hoc designs with no programme in play still
-  travel as plain `View::Workout`, byte-identical to the pre-programme protocol.
+  an active programme: the roster stays slotless and no slot status moves through design, execution or session end.
+- The training mode is carried on the wire as a new `View::ProgrammeSessionRoster` variant and rendered as a single
+  line under the roster title in both the Telegram and TUI clients. Ad-hoc designs with no programme in play still
+  travel as plain `View::SessionRoster`, byte-identical to the pre-programme protocol.
 
 #### Goals and body metrics
 
@@ -48,7 +53,7 @@ This log starts at 0.22.0; earlier releases are not covered.
 - Measurements are never raised unprompted — only when the user asks or an active goal reports on them. They are
   kept indefinitely and erased completely on request.
 
-#### Workout designer
+#### Session designer
 
 - A per-muscle recovery signal: for each top-level muscle group, when it was last trained (rolled up over its
   subtree) and how many sets that day took. Every group is reported, including those never trained, and the
@@ -61,7 +66,7 @@ This log starts at 0.22.0; earlier releases are not covered.
   full while older ones collapse to per-exercise trend lines, filled in priority order — goal-relevant lifts and
   their taxonomy descendants before incidental accessories — until the token budget is reached. Goal lifts keep
   more history than accessories. Configurable under a new `[gym.designer_history]` block.
-- Prescribed-vs-actual deltas for a planned session.
+- Prescribed-vs-actual deltas for a rostered session.
 
 #### Session feedback
 
@@ -78,7 +83,7 @@ This log starts at 0.22.0; earlier releases are not covered.
 
 - A `set_session_override` action gives one-off requests voiced mid-workout ("I don't feel like bench today, let's
   do flys") their own home, separate from durable preferences (migration `09-session_overrides`). The override is
-  honoured for the rest of the session, expires when the plan completes or is superseded, and never reaches the
+  honoured for the rest of the session, expires when the roster completes or is superseded, and never reaches the
   philosophy — so it cannot silently ban a movement from future designs.
 - The prompt now draws the one-off vs durable distinction explicitly and, when the scope is genuinely ambiguous
   ("I hate bench press"), instructs the assistant to ask "just today or from now on?" rather than guess.
@@ -106,8 +111,8 @@ This log starts at 0.22.0; earlier releases are not covered.
 - JSON mode now reaches the provider as `response_format: {"type": "json_object"}`. The flag had always been set on
   the request but the provider dropped it, leaving every prompt's JSON contract resting on prompt text alone. The
   parser's fence tolerance stays as the guard for a model or provider that ignores the setting.
-- `/nextworkout` fails loudly with a retry notice when the designer returns no valid workout, instead of rendering
-  fallback prose as if a workout had been created. No phantom plan is persisted.
+- `/nextworkout` fails loudly with a retry notice when the designer returns no valid roster, instead of rendering
+  fallback prose as if a session had been designed. No phantom roster is persisted.
 - Conversation history is pruned per user *and* platform, matching how it is read. A chatty session on one client no
   longer silently evicts another client's context.
 

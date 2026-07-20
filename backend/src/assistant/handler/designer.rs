@@ -74,7 +74,7 @@ impl AssistantHandler {
         let llm_response = self
             .call_llm_with(&prompt, &[], &user_text, 2048, 0.2)
             .await
-            .context("workout designer LLM call failed")?;
+            .context("session designer LLM call failed")?;
         let parsed = parse_assistant_response(&llm_response);
 
         let proposal = parsed.actions.into_iter().find_map(|action| match action {
@@ -417,7 +417,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nextworkout_designs_and_persists_plan_without_logging() {
+    async fn nextworkout_designs_and_persists_roster_without_logging() {
         let design = r#"{"message": "Here's today's session.", "actions": [
             {"type": "propose_session_roster", "title": "Upper push", "rationale": "Bench was easy; push it.", "exercises": [
                 {"exercise": "Bench Press", "target_sets": 3, "target_reps": 6, "target_weight_kg": 65.0, "notes": "drive through heels"},
@@ -610,7 +610,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn starting_a_session_binds_the_designed_plan_and_prescribes() {
+    async fn starting_a_session_binds_the_designed_roster_and_prescribes() {
         let (handler, llm) = setup_handler("").await;
         let msg = make_message(12345, "hello");
         let user = start_guided_workout(&handler, &llm, &msg).await;
@@ -633,7 +633,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mid_workout_note_appends_to_philosophy_and_end_completes_plan() {
+    async fn mid_workout_note_appends_to_philosophy_and_end_completes_roster() {
         let (handler, llm) = setup_handler("").await;
         let msg = make_message(12345, "hello");
         let user = start_guided_workout(&handler, &llm, &msg).await;
@@ -658,7 +658,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_off_override_scopes_to_plan_and_spares_philosophy() {
+    async fn one_off_override_scopes_to_roster_and_spares_philosophy() {
         let (handler, llm) = setup_handler("").await;
         let msg = make_message(12345, "hello");
         let user = start_guided_workout(&handler, &llm, &msg).await;
@@ -884,7 +884,7 @@ mod tests {
     }
 
     #[test]
-    fn proposed_plan_window_excludes_stale_designs() {
+    fn proposed_roster_window_excludes_stale_designs() {
         let now = parse_sqlite_datetime("2026-06-19 12:00:00").unwrap();
         // Designed an hour ago → still bindable.
         assert!(draft_roster_within_window("2026-06-19 11:00:00", now));

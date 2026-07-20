@@ -393,7 +393,7 @@ AVAILABLE EXERCISES:\n\
 /// prompt it advertises ONLY the `save_philosophy` action — the interview never
 /// logs sets or touches a session. The assistant interviews the user about their
 /// training, then distils everything into a compact, information-dense philosophy
-/// (the prompt later fed to the workout designer).
+/// (the prompt later fed to the session designer).
 pub fn build_philosophy_prompt(draft: &str, health_entries: &[HealthEntry], turns: i32) -> String {
     let health_section = format_health_entries(health_entries);
     let draft_section = if draft.trim().is_empty() {
