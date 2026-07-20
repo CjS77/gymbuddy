@@ -1,17 +1,15 @@
 //! Prompt-context assembly: gathers the active session with its entries and
-//! sets, scheduled and designed plans, leaked entries, health, history and
+//! sets, the session roster in flight, leaked entries, health, history and
 //! goals into the [`PromptContext`] behind each turn's system prompt.
 
 use chrono::Utc;
 
-use crate::assistant::prompts::{
-    ActivePlanView, EntryView, PrescribedExercise, PromptContext, WorkoutPlanProgress, build_system_prompt,
-};
+use crate::assistant::prompts::{EntryView, PromptContext, RosterExerciseView, RosterProgress, build_system_prompt};
 use crate::db::{Database, ExerciseSet, ExerciseTypeWithAncestry, Session, User};
 
 use super::continuity::compute_last_activity_age_hours;
 use super::designer::proposed_plan_within_window;
-use super::{AssistantHandler, format_set_short, parse_plan_from_notes};
+use super::{AssistantHandler, format_set_short};
 
 impl AssistantHandler {
     pub(super) async fn build_context(&self, user: &User) -> anyhow::Result<String> {
@@ -19,7 +17,6 @@ impl AssistantHandler {
         let active_session = db.get_active_session(user.id)?;
         let mut session_sets: Vec<(ExerciseSet, String)> = Vec::new();
         let mut session_entries: Vec<EntryView> = Vec::new();
-        let mut closed_exercise_ids_in_session: Vec<i64> = Vec::new();
 
         if let Some(session) = &active_session {
             let entries = db.list_entries_for_session(session.id)?;
@@ -35,33 +32,15 @@ impl AssistantHandler {
                     sets_summary: summary_parts.join(", "),
                     is_open: entry.end_timestamp.is_none(),
                 });
-                if entry.end_timestamp.is_some() {
-                    if let Some(id) = exercise_type_id {
-                        closed_exercise_ids_in_session.push(id);
-                    }
-                }
                 for set in sets {
                     session_sets.push((set, exercise_name.clone()));
                 }
             }
         }
 
-        // Active plan, recovered from sentinel-prefixed session.notes
-        let active_plan = match active_session.as_ref().and_then(|s| s.notes.as_deref()) {
-            Some(notes) => {
-                let (plan_name, _rest) = parse_plan_from_notes(Some(notes));
-                match plan_name {
-                    Some(name) => self.build_active_plan(&db, user.id, &name, &closed_exercise_ids_in_session)?,
-                    None => None,
-                }
-            }
-            None => None,
-        };
-
         // A `/nextworkout` design: bound to the current session (guided execution) or
-        // freshly designed and ready to start. Sourced from `session_rosters`, distinct
-        // from the schedule-based `active_plan` above.
-        let active_workout_plan = self.build_active_workout_plan(&db, user.id, active_session.as_ref(), &session_sets)?;
+        // freshly designed and ready to start. Sourced from `session_rosters`.
+        let active_roster = self.build_active_roster(&db, user.id, active_session.as_ref(), &session_sets)?;
 
         // Leaked open entries: open EEs not belonging to the active session, OR open
         // entries in the active session (so the LLM can decide to close/delete before
@@ -93,8 +72,7 @@ impl AssistantHandler {
             session_sets,
             session_entries,
             leaked_open_entries,
-            active_plan,
-            active_workout_plan,
+            active_roster,
             health_entries,
             recent_summaries,
             recent_sets,
@@ -106,61 +84,46 @@ impl AssistantHandler {
         Ok(build_system_prompt(&ctx))
     }
 
-    fn build_active_plan(
-        &self,
-        db: &Database,
-        user_id: i64,
-        plan_name: &str,
-        completed_exercise_ids: &[i64],
-    ) -> anyhow::Result<Option<ActivePlanView>> {
-        // Always empty since schema v2 dropped `schedules`: this section resolved a session's
-        // `plan:` sentinel against a saved schedule, and nothing has created a schedule for a long
-        // time. The sentinel, `ActivePlanView` and this function all go together, which is a change
-        // to the assistant layer rather than to the schema — so it stays here, inert, until then.
-        let _ = (db, user_id, plan_name, completed_exercise_ids);
-        Ok(None)
-    }
-
-    /// Build the guided-execution view of a `/nextworkout` design. Prefers a plan
+    /// Build the guided-execution view of a `/nextworkout` design. Prefers a roster
     /// bound to the active session (guided, in progress); otherwise surfaces the most
-    /// recent designed-but-unstarted plan so the assistant can offer to run it.
-    fn build_active_workout_plan(
+    /// recent designed-but-unstarted roster so the assistant can offer to run it.
+    fn build_active_roster(
         &self,
         db: &Database,
         user_id: i64,
         active_session: Option<&Session>,
         session_sets: &[(ExerciseSet, String)],
-    ) -> anyhow::Result<Option<WorkoutPlanProgress>> {
-        // Guided execution: a plan bound to the CURRENT session.
+    ) -> anyhow::Result<Option<RosterProgress>> {
+        // Guided execution: a roster bound to the CURRENT session.
         if let Some(session) = active_session
-            && let Some(plan) = db.active_roster_for_user(user_id)?
-            && plan.session_id == Some(session.id)
+            && let Some(roster) = db.active_roster_for_user(user_id)?
+            && roster.session_id == Some(session.id)
         {
             let logged: std::collections::HashSet<i64> = session_sets.iter().map(|(s, _)| s.exercise_type_id).collect();
-            return Ok(Some(self.workout_plan_progress(db, &plan, &logged, true)?));
+            return Ok(Some(self.roster_progress(db, &roster, &logged, true)?));
         }
 
-        // Otherwise a freshly designed plan ready to start — but only while it is
+        // Otherwise a freshly designed roster ready to start — but only while it is
         // recent, so a stale design does not resurface as "ready" days later.
-        if let Some(plan) = db.latest_draft_roster(user_id)?
-            && proposed_plan_within_window(&plan.created_at, Utc::now().naive_utc())
+        if let Some(roster) = db.latest_draft_roster(user_id)?
+            && proposed_plan_within_window(&roster.created_at, Utc::now().naive_utc())
         {
-            return Ok(Some(self.workout_plan_progress(db, &plan, &std::collections::HashSet::new(), false)?));
+            return Ok(Some(self.roster_progress(db, &roster, &std::collections::HashSet::new(), false)?));
         }
 
         Ok(None)
     }
 
-    /// Compute done/next/remaining for `plan`, treating any prescribed exercise whose
+    /// Compute done/next/remaining for `roster`, treating any prescribed exercise whose
     /// type appears in `logged` as done.
-    fn workout_plan_progress(
+    fn roster_progress(
         &self,
         db: &Database,
-        plan: &crate::db::SessionRoster,
+        roster: &crate::db::SessionRoster,
         logged: &std::collections::HashSet<i64>,
         started: bool,
-    ) -> anyhow::Result<WorkoutPlanProgress> {
-        let exercises = db.list_roster_exercises(plan.id)?;
+    ) -> anyhow::Result<RosterProgress> {
+        let exercises = db.list_roster_exercises(roster.id)?;
         let mut done = Vec::new();
         let mut next = None;
         for ex in &exercises {
@@ -168,7 +131,7 @@ impl AssistantHandler {
             if logged.contains(&ex.exercise_type_id) {
                 done.push(name);
             } else if next.is_none() {
-                next = Some(PrescribedExercise {
+                next = Some(RosterExerciseView {
                     exercise_name: name,
                     target_sets: ex.target_sets,
                     target_reps: ex.target_reps,
@@ -179,7 +142,7 @@ impl AssistantHandler {
             }
         }
         let remaining = exercises.len().saturating_sub(done.len());
-        Ok(WorkoutPlanProgress { title: plan.title.clone(), started, done, next, remaining, override_note: plan.override_note.clone() })
+        Ok(RosterProgress { title: roster.title.clone(), started, done, next, remaining, override_note: roster.override_note.clone() })
     }
 }
 

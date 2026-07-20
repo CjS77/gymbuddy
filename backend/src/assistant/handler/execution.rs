@@ -14,7 +14,7 @@ use crate::db::{
 };
 
 use super::designer::proposed_plan_within_window;
-use super::{AssistantHandler, combine_plan_with_notes, format_set_short};
+use super::{AssistantHandler, format_set_short};
 use gymbuddy_proto::TimerSignal;
 
 /// Result of executing a single [`AssistantAction`]: an optional reply suffix
@@ -143,7 +143,7 @@ impl AssistantHandler {
                 self.db.lock().await.insert_set(&s)?;
                 self.finish_logged_set(user, &target.session, target.entry_id, &target.exercise_name, pd).await
             }
-            AssistantAction::StartSession { notes, plan } => {
+            AssistantAction::StartSession { notes } => {
                 let db = self.db.lock().await;
                 if let Some(active) = db.get_active_session(user.id)? {
                     let open = db.list_open_entries_for_session(active.id)?;
@@ -166,11 +166,10 @@ impl AssistantHandler {
                 drop(db);
                 self.silent_close_leaked_entries(user.id).await?;
                 let db = self.db.lock().await;
-                let combined_notes = combine_plan_with_notes(plan.as_deref(), notes.as_deref());
-                let session = db.start_session(user.id, combined_notes.as_deref())?;
-                tracing::debug!(id = session.id, plan = ?plan, "Started session");
-                // Begin guided execution if the user just designed a workout.
-                self.bind_proposed_plan(&db, user.id, session.id)?;
+                let session = db.start_session(user.id, notes.as_deref())?;
+                tracing::debug!(id = session.id, "Started session");
+                // Begin guided execution if the user just designed a session.
+                self.bind_draft_roster(&db, user.id, session.id)?;
                 Ok(ActionOutcome::none())
             }
             AssistantAction::EndSession => {
@@ -356,25 +355,25 @@ impl AssistantHandler {
         self.silent_close_leaked_entries(user.id).await?;
         let db = self.db.lock().await;
         let session = db.start_session(user.id, None)?;
-        // Logging the first prescribed exercise auto-starts the guided workout.
-        self.bind_proposed_plan(&db, user.id, session.id)?;
+        // Logging the first prescribed exercise auto-starts the guided session.
+        self.bind_draft_roster(&db, user.id, session.id)?;
         Ok(session)
     }
 
-    /// After a session starts, bind the most recent designed (proposed) workout to it
-    /// so guided execution begins. No-op when there is no proposed plan.
-    fn bind_proposed_plan(&self, db: &Database, user_id: i64, session_id: i64) -> anyhow::Result<()> {
-        let Some(plan) = db.latest_draft_roster(user_id)? else {
+    /// After a session starts, bind the most recent draft roster to it so guided
+    /// execution begins. No-op when there is no draft roster.
+    fn bind_draft_roster(&self, db: &Database, user_id: i64, session_id: i64) -> anyhow::Result<()> {
+        let Some(roster) = db.latest_draft_roster(user_id)? else {
             return Ok(());
         };
-        if proposed_plan_within_window(&plan.created_at, Utc::now().naive_utc()) {
-            db.bind_roster_to_session(plan.id, session_id)?;
-            tracing::debug!(plan_id = plan.id, session_id, "Bound designed workout to session for guided execution");
+        if proposed_plan_within_window(&roster.created_at, Utc::now().naive_utc()) {
+            db.bind_roster_to_session(roster.id, session_id)?;
+            tracing::debug!(roster_id = roster.id, session_id, "Bound draft roster to session for guided execution");
         } else {
             // Designed too long ago to silently attach to this session — retire it so
             // it stops being a binding candidate.
-            db.set_roster_status(plan.id, crate::db::LifecycleStatus::Abandoned)?;
-            tracing::debug!(plan_id = plan.id, "Abandoned a stale proposed workout instead of binding");
+            db.set_roster_status(roster.id, crate::db::LifecycleStatus::Abandoned)?;
+            tracing::debug!(roster_id = roster.id, "Abandoned a stale draft roster instead of binding");
         }
         Ok(())
     }

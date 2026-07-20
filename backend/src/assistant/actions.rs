@@ -49,12 +49,10 @@ pub enum AssistantAction {
         #[serde(default)]
         superset: bool,
     },
+    /// Unknown fields are ignored, so history carrying the dropped `plan` field
+    /// (a saved-schedule name; schedules are gone) still parses.
     StartSession {
         notes: Option<String>,
-        /// Optional name of a saved schedule the session should follow. Used by the
-        /// host to suggest the next exercise after each entry closes.
-        #[serde(default)]
-        plan: Option<String>,
     },
     EndSession,
     /// Close one open exercise_entry. The handler resolves the entry by `entry_id`
@@ -274,23 +272,19 @@ mod tests {
         let json = r#"{"type": "start_session", "notes": "Leg day"}"#;
         let action: AssistantAction = serde_json::from_str(json).unwrap();
         match action {
-            AssistantAction::StartSession { notes, plan } => {
-                assert_eq!(notes.as_deref(), Some("Leg day"));
-                assert_eq!(plan, None);
-            }
+            AssistantAction::StartSession { notes } => assert_eq!(notes.as_deref(), Some("Leg day")),
             _ => panic!("expected StartSession"),
         }
     }
 
+    /// `plan` named a saved schedule; schedules are gone. Stored history still carries
+    /// the field, so it must be ignored rather than reject the whole envelope.
     #[test]
-    fn parse_start_session_with_plan() {
-        let json = r#"{"type": "start_session", "plan": "Push Day"}"#;
+    fn parse_start_session_ignores_dropped_plan_field() {
+        let json = r#"{"type": "start_session", "notes": "Leg day", "plan": "Push Day"}"#;
         let action: AssistantAction = serde_json::from_str(json).unwrap();
         match action {
-            AssistantAction::StartSession { notes, plan } => {
-                assert_eq!(notes, None);
-                assert_eq!(plan.as_deref(), Some("Push Day"));
-            }
+            AssistantAction::StartSession { notes } => assert_eq!(notes.as_deref(), Some("Leg day")),
             _ => panic!("expected StartSession"),
         }
     }

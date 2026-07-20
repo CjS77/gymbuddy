@@ -256,33 +256,6 @@ fn set_line(set: &ExerciseSet) -> SetLine {
     SetLine { measurement, count: set.count.map(|c| c.max(0) as u32), value: set.value }
 }
 
-/// Encode an optional plan name into the session's `notes` field using the
-/// `plan:<name>` sentinel prefix so the active plan can be recovered later
-/// without a schema change.
-pub(crate) fn combine_plan_with_notes(plan: Option<&str>, notes: Option<&str>) -> Option<String> {
-    match (plan, notes) {
-        (Some(p), Some(n)) => Some(format!("plan:{p}\n{n}")),
-        (Some(p), None) => Some(format!("plan:{p}")),
-        (None, Some(n)) => Some(n.to_string()),
-        (None, None) => None,
-    }
-}
-
-/// Inverse of `combine_plan_with_notes`. Returns `(plan_name, remaining_notes)`.
-pub(crate) fn parse_plan_from_notes(notes: Option<&str>) -> (Option<String>, Option<String>) {
-    let Some(text) = notes else {
-        return (None, None);
-    };
-    if let Some(rest) = text.strip_prefix("plan:") {
-        match rest.split_once('\n') {
-            Some((plan, body)) => (Some(plan.trim().to_string()), Some(body.to_string())),
-            None => (Some(rest.trim().to_string()), None),
-        }
-    } else {
-        (None, Some(text.to_string()))
-    }
-}
-
 /// Compact rendering of a single set used inside an entry summary, e.g. "8×80kg",
 /// "30s", "5000m". Delegates to the wire [`SetLine::compact`] so the backend's
 /// compact form has a single source of truth shared with every client.

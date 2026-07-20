@@ -628,7 +628,7 @@ mod tests {
         let _ = handler.handle_text_message(&msg, "ready").await.unwrap();
         let last = llm.recorded_requests().pop().unwrap();
         let system = &last.messages[0].content;
-        assert!(system.contains("PRESCRIBED WORKOUT"), "guided section should be in the prompt");
+        assert!(system.contains("SESSION ROSTER (guided, in progress)"), "guided section should be in the prompt");
         assert!(system.contains("Bench Press"));
     }
 

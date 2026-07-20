@@ -13,8 +13,7 @@ pub struct PromptContext {
     pub session_sets: Vec<(ExerciseSet, String)>, // (set, exercise_type name) — flat view, kept for backward compat
     pub session_entries: Vec<EntryView>,          // closed + open entries in the active session, in insertion order
     pub leaked_open_entries: Vec<EntryView>,      // open entries belonging to ENDED prior sessions or the active session
-    pub active_plan: Option<ActivePlanView>,      // populated when the active session was started with a `plan:` sentinel
-    pub active_workout_plan: Option<WorkoutPlanProgress>, // a `/nextworkout` design that is ready or under guided execution
+    pub active_roster: Option<RosterProgress>,    // a `/nextworkout` design that is ready or under guided execution
     pub health_entries: Vec<HealthEntry>,
     pub recent_summaries: Vec<SessionSummary>,
     pub recent_sets: Vec<ExerciseSet>,
@@ -39,41 +38,27 @@ pub struct EntryView {
     pub is_open: bool,
 }
 
-#[derive(Debug, Clone)]
-pub struct ActivePlanView {
-    pub name: String,
-    pub completed_exercise_ids: Vec<i64>,
-    pub next: Option<PlanExerciseView>,
-}
-
-#[derive(Debug, Clone)]
-pub struct PlanExerciseView {
-    pub exercise_name: String,
-    pub target_sets: Option<i32>,
-    pub target_reps: Option<i32>,
-    pub target_weight_kg: Option<f64>,
-}
-
 /// Progress of a `/nextworkout` design: either freshly designed and ready to start
 /// (`started == false`) or bound to the active session and under guided execution
 /// (`started == true`). Drives the proactive set-by-set coaching.
 #[derive(Debug, Clone)]
-pub struct WorkoutPlanProgress {
+pub struct RosterProgress {
     pub title: String,
     pub started: bool,
     /// Names of prescribed exercises the user has already logged sets for this session.
     pub done: Vec<String>,
     /// The next prescribed exercise still to do.
-    pub next: Option<PrescribedExercise>,
+    pub next: Option<RosterExerciseView>,
     /// How many prescribed exercises remain.
     pub remaining: usize,
-    /// Today-only overrides the user voiced for THIS plan ("no bench today, do flys
-    /// instead"). Applies to the plan in flight only; never folded into the philosophy.
+    /// Today-only overrides the user voiced for THIS roster ("no bench today, do flys
+    /// instead"). Applies to the roster in flight only; never folded into the philosophy.
     pub override_note: Option<String>,
 }
 
+/// One exercise of a [`RosterProgress`] as the prompt sees it.
 #[derive(Debug, Clone)]
-pub struct PrescribedExercise {
+pub struct RosterExerciseView {
     pub exercise_name: String,
     pub target_sets: Option<i32>,
     pub target_reps: Option<i32>,
@@ -90,8 +75,7 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
 
     let entries_section = format_session_entries(&ctx.session_entries);
     let leaked_section = format_leaked_entries(&ctx.leaked_open_entries);
-    let plan_section = format_active_plan(&ctx.active_plan);
-    let workout_plan_section = format_active_workout_plan(&ctx.active_workout_plan);
+    let roster_section = format_active_roster(&ctx.active_roster);
     let continuity_section = format_session_continuity(ctx.last_activity_age_hours);
     let continuity_banner = format_session_continuity_banner(ctx.last_activity_age_hours);
     let health_section = format_health_entries(&ctx.health_entries);
@@ -291,8 +275,8 @@ entry and appends the summary to your reply.\n\
 - If the user mentions pain, injury, or illness, log it with log_health\n\
 - If the user reports a body measurement (weight, body fat, waist, resting heart \
 rate), log it with log_body_metric\n\
-- GUIDED WORKOUT: When a PRESCRIBED WORKOUT or DESIGNED WORKOUT section is present, \
-you are coaching the user through a pre-designed session like a personal trainer. \
+- GUIDED SESSION: When a SESSION ROSTER section is present, you are coaching the user \
+through a pre-designed session like a personal trainer. \
 After you log or confirm the set the user just reported, PROACTIVELY tell them the \
 NEXT prescribed set — name, target weight and reps — with a short motivating reason \
 drawn from their history (e.g. \"last time 55kg felt easy, so let's go 60kg\"). State \
@@ -387,8 +371,7 @@ Active session: {session_status}\n\
 \n\
 {entries_section}\
 {leaked_section}\
-{plan_section}\
-{workout_plan_section}\
+{roster_section}\
 {continuity_section}\
 {health_section}\n\
 {history_section}\n\
@@ -775,59 +758,34 @@ fn format_leaked_entries(entries: &[EntryView]) -> String {
     s
 }
 
-fn format_active_plan(plan: &Option<ActivePlanView>) -> String {
-    let Some(plan) = plan else {
-        return String::new();
-    };
-    let mut s = format!("ACTIVE PLAN: {}\n", plan.name);
-    s.push_str(&format!("- completed exercises in this session: {}\n", plan.completed_exercise_ids.len()));
-    if let Some(next) = &plan.next {
-        let mut parts = vec![next.exercise_name.clone()];
-        if let Some(sets) = next.target_sets {
-            parts.push(format!("{sets} sets"));
-        }
-        if let Some(reps) = next.target_reps {
-            parts.push(format!("{reps} reps"));
-        }
-        if let Some(w) = next.target_weight_kg {
-            parts.push(format!("{w}kg"));
-        }
-        s.push_str(&format!("- next: {}\n", parts.join(", ")));
-    } else {
-        s.push_str("- next: (plan complete)\n");
-    }
-    s.push('\n');
-    s
-}
-
 /// Render the `/nextworkout` design for the system prompt: a "ready to start" hint
-/// before the workout begins, or live progress with the NEXT prescribed set once it
-/// is under way. Distinct from the schedule-based ACTIVE PLAN section above.
-fn format_active_workout_plan(plan: &Option<WorkoutPlanProgress>) -> String {
-    let Some(plan) = plan else {
+/// before the session begins, or live progress with the NEXT prescribed set once it
+/// is under way.
+fn format_active_roster(roster: &Option<RosterProgress>) -> String {
+    let Some(roster) = roster else {
         return String::new();
     };
 
     let mut s = String::new();
-    if plan.started {
-        s.push_str(&format!("PRESCRIBED WORKOUT (guided, in progress): {}\n", plan.title));
-        if !plan.done.is_empty() {
-            s.push_str(&format!("- done so far: {}\n", plan.done.join(", ")));
+    if roster.started {
+        s.push_str(&format!("SESSION ROSTER (guided, in progress): {}\n", roster.title));
+        if !roster.done.is_empty() {
+            s.push_str(&format!("- done so far: {}\n", roster.done.join(", ")));
         }
-        match &plan.next {
-            Some(next) => s.push_str(&format!("- NEXT SET: {} ({} to go)\n", format_prescription(next), plan.remaining)),
+        match &roster.next {
+            Some(next) => s.push_str(&format!("- NEXT SET: {} ({} to go)\n", format_prescription(next), roster.remaining)),
             None => s.push_str("- all prescribed exercises done — congratulate the user and offer to end the session\n"),
         }
     } else {
-        s.push_str(&format!("DESIGNED WORKOUT READY: {}\n", plan.title));
-        if let Some(next) = &plan.next {
+        s.push_str(&format!("SESSION ROSTER READY: {}\n", roster.title));
+        if let Some(next) = &roster.next {
             s.push_str(&format!("- first up when they start: {}\n", format_prescription(next)));
         }
-        s.push_str("- when the user starts their workout, walk them through it set by set\n");
+        s.push_str("- when the user starts their session, walk them through it set by set\n");
     }
-    if let Some(note) = plan.override_note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+    if let Some(note) = roster.override_note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
         s.push_str(&format!(
-            "- TODAY-ONLY OVERRIDES for this workout (honour them now; do NOT save to philosophy):\n{note}\n"
+            "- TODAY-ONLY OVERRIDES for this session (honour them now; do NOT save to philosophy):\n{note}\n"
         ));
     }
     s.push('\n');
@@ -835,7 +793,7 @@ fn format_active_workout_plan(plan: &Option<WorkoutPlanProgress>) -> String {
 }
 
 /// A prescribed exercise as one compact line, e.g. "Bench Press — 3 sets 6 reps @ 65kg (push it)".
-fn format_prescription(p: &PrescribedExercise) -> String {
+fn format_prescription(p: &RosterExerciseView) -> String {
     let mut parts = Vec::new();
     if let Some(sets) = p.target_sets {
         parts.push(format!("{sets} sets"));
@@ -1025,8 +983,7 @@ mod tests {
             session_sets: vec![],
             session_entries: vec![],
             leaked_open_entries: vec![],
-            active_plan: None,
-            active_workout_plan: None,
+            active_roster: None,
             health_entries: vec![],
             recent_summaries: vec![],
             recent_sets: vec![],
@@ -1085,22 +1042,40 @@ mod tests {
         assert!(prompt.contains("[id=3] Squat"));
     }
 
-    #[test]
-    fn prompt_surfaces_active_plan() {
-        let mut ctx = base_context();
-        ctx.active_plan = Some(ActivePlanView {
-            name: "Push Day".to_string(),
-            completed_exercise_ids: vec![1],
-            next: Some(PlanExerciseView {
+    fn overhead_press_roster(started: bool) -> RosterProgress {
+        RosterProgress {
+            title: "Push Day".to_string(),
+            started,
+            done: Vec::new(),
+            next: Some(RosterExerciseView {
                 exercise_name: "Overhead Press".to_string(),
                 target_sets: Some(4),
                 target_reps: Some(6),
                 target_weight_kg: Some(50.0),
+                target_secs: None,
+                notes: None,
             }),
-        });
+            remaining: 1,
+            override_note: None,
+        }
+    }
+
+    #[test]
+    fn prompt_surfaces_ready_session_roster() {
+        let mut ctx = base_context();
+        ctx.active_roster = Some(overhead_press_roster(false));
         let prompt = build_system_prompt(&ctx);
-        assert!(prompt.contains("ACTIVE PLAN: Push Day"));
-        assert!(prompt.contains("next: Overhead Press"));
+        assert!(prompt.contains("SESSION ROSTER READY: Push Day"));
+        assert!(prompt.contains("first up when they start: Overhead Press"));
+    }
+
+    #[test]
+    fn prompt_surfaces_guided_session_roster() {
+        let mut ctx = base_context();
+        ctx.active_roster = Some(overhead_press_roster(true));
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("SESSION ROSTER (guided, in progress): Push Day"));
+        assert!(prompt.contains("NEXT SET: Overhead Press"));
     }
 
     #[test]

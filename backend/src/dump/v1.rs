@@ -475,9 +475,9 @@ fn roster_status(v1_status: &str) -> String {
 /// Split v1's `plan:<name>` sentinel off the front of `sessions.notes`, returning
 /// `(schedule_name, remaining_notes)`.
 ///
-/// Deliberately a copy of `assistant::handler::parse_plan_from_notes` rather than a call to it:
-/// schema v2 deletes the sentinel and that function with it, but a v1 database read years from now
-/// still needs decoding.
+/// Deliberately a copy of the assistant layer's old `parse_plan_from_notes` rather than a call to
+/// it: schema v2 stopped writing the sentinel and [R1.4] deleted that function, but a v1 database
+/// read years from now still needs decoding.
 fn split_plan_sentinel(notes: Option<&str>) -> (Option<String>, Option<String>) {
     let Some(text) = notes else {
         return (None, None);
