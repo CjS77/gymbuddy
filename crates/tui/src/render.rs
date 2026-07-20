@@ -11,8 +11,8 @@
 //! this side of the wall, where `app.rs` never has to know about them ([T1.1]).
 
 use gymbuddy_proto::{
-    CatalogView, ExerciseLog, HistoryView, PROGRAMME_LOCK_IN_ASK, ProgrammeView, ProgressView, SeriesShape, SeriesView, SessionReviewView,
-    SessionRosterView, SetLine, StatusView, TrainingModeView, View,
+    CatalogView, ExerciseLog, HistoryView, PROGRAMME_LOCK_IN_ASK, ProgrammeView, ProgressView, ReviewEffortView, ReviewExerciseView,
+    ReviewRecordView, SeriesShape, SeriesView, SessionReviewView, SessionRosterView, SetLine, StatusView, TrainingModeView, View,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -30,10 +30,10 @@ const MUTED: Color = Color::DarkGray;
 /// Render a view into transcript lines (without the speaker prefix, which the
 /// transcript adds).
 ///
-/// `width` is the room the transcript has for a line. Only the charts of
-/// [`View::Progress`] use it, and they need it: a `Chart` is drawn into a fixed area,
-/// and one drawn wider than the transcript would be folded by the `Paragraph`'s wrap
-/// into something worse than no chart at all.
+/// `width` is the room the transcript has for a line. The charts of [`View::Progress`]
+/// and [`View::SessionReview`] use it, and they need it: a `Chart` is drawn into a fixed
+/// area, and one drawn wider than the transcript would be folded by the `Paragraph`'s
+/// wrap into something worse than no chart at all.
 pub fn render_view(view: &View, width: u16) -> Vec<Line<'static>> {
     match view {
         View::Message { text, notes, failures } => render_message(text, notes, failures),
@@ -45,7 +45,7 @@ pub fn render_view(view: &View, width: u16) -> Vec<Line<'static>> {
         View::ProgrammeSessionRoster { roster, mode } => render_session_roster(roster, Some(mode)),
         View::Programme(programme) => render_programme(programme),
         View::Progress(progress) => render_progress(progress, width),
-        View::SessionReview(review) => render_session_review(review),
+        View::SessionReview(review) => render_session_review(review, width),
         View::Timers { enabled } => vec![Line::from(Span::styled(
             format!("Rest timers {}", if *enabled { "on" } else { "off" }),
             Style::default().fg(if *enabled { SUCCESS } else { MUTED }).add_modifier(Modifier::BOLD),
@@ -55,23 +55,144 @@ pub fn render_view(view: &View, width: u16) -> Vec<Line<'static>> {
     }
 }
 
-/// The post-session review ([C6.5]).
+/// The post-session review ([C6.5]) — what the session was, how it measured up to the
+/// prescription, what it moved.
 ///
-/// Deliberately minimal: the headline, the goal and record lines, and the per-exercise
-/// deltas, as plain text. The rich terminal rendering — charts, colour, the layout — is
-/// [T2.3]'s, and this arm exists so the variant renders something honest until then rather
-/// than falling through to "[unsupported message]".
-fn render_session_review(r: &SessionReviewView) -> Vec<Line<'static>> {
-    let mut lines = vec![heading(r.summary_line())];
-    lines.extend(r.position.iter().map(|p| muted(p.summary())));
-    lines.extend(r.achieved_goals.iter().map(|g| bold(&format!("Goal reached: {g}"))));
-    lines.extend(r.commentary.iter().flat_map(|c| plain_lines(c)));
-    lines.extend(r.records.iter().map(|record| Line::from(Span::raw(format!("  {}", record.line())))));
-    lines.extend(r.exercises.iter().map(|e| Line::from(Span::raw(format!("  {}", e.line())))));
-    lines.extend(r.adherence.iter().map(|a| muted(a.clone())));
-    lines.extend(r.effort.iter().map(|e| muted(e.line())));
-    lines.extend(r.notes.iter().map(|n| muted(n.clone())));
+/// Arrives unprompted when a session ends (including one auto-closed by
+/// `close_stale_session`), not as a reply to a submitted line, so it stands entirely on
+/// the [`SessionReviewView`] it is handed and assumes no preceding user turn.
+///
+/// The verdict is Core's ([C6.5]) and is rendered as given — a "Partial session"
+/// headline is not softened here. Achieved goals lead, because finishing a goal is the
+/// one thing worth interrupting for. Charts route through the same [T2.2] helpers
+/// `/progress` uses, degrading to text where the width or the point count is too small.
+fn render_session_review(r: &SessionReviewView, width: u16) -> Vec<Line<'static>> {
+    let mut lines = review_header(r);
+    lines.extend(review_achievements(r));
+    lines.extend(review_exercises(r));
+    lines.extend(review_records(r));
+    lines.extend(review_commentary(r));
+    lines.extend(bullet_section("Goals", &r.goals));
+    lines.extend(review_series(r, width));
+    lines.extend(review_footer(r));
+    lines.extend(bullet_section("Notes", &r.notes));
     lines
+}
+
+/// The headline verdict, then the session's date and — when it had them — its programme
+/// slot and the intent the user set out with, as muted context beneath.
+fn review_header(r: &SessionReviewView) -> Vec<Line<'static>> {
+    let mut lines = vec![heading(r.summary_line()), muted(r.session_date.clone())];
+    lines.extend(r.position.iter().map(|p| muted(p.summary())));
+    lines.extend(r.intent.iter().map(|i| muted(format!("Aiming for {i}"))));
+    lines
+}
+
+/// Goals finished this session — led with, and coloured as the win they are. The word
+/// "reached" carries the verdict so a colourless terminal still shows it.
+fn review_achievements(r: &SessionReviewView) -> Vec<Line<'static>> {
+    if r.achieved_goals.is_empty() {
+        return Vec::new();
+    }
+    let win = Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD);
+    std::iter::once(Line::from(""))
+        .chain(r.achieved_goals.iter().map(|g| Line::from(Span::styled(format!("Goal reached: {g}"), win))))
+        .collect()
+}
+
+/// The exercises as performed against what was asked. The delta is Core's verbatim text
+/// — a bare string with no direction attached — so it is shown as given and never
+/// recoloured by a guess at whether, say, "-2.5kg" was progress.
+fn review_exercises(r: &SessionReviewView) -> Vec<Line<'static>> {
+    if r.exercises.is_empty() {
+        return Vec::new();
+    }
+    std::iter::once(Line::from(""))
+        .chain(std::iter::once(bold("Exercises")))
+        .chain(r.exercises.iter().map(review_exercise_line))
+        .collect()
+}
+
+/// One exercise line with its name in the accent used for exercises everywhere else,
+/// the rest of [`ReviewExerciseView::line`] following verbatim.
+fn review_exercise_line(e: &ReviewExerciseView) -> Line<'static> {
+    named_line("  ", &e.name, MUTED, e.line())
+}
+
+/// Personal records set this session. A record is by definition an improvement, so the
+/// "record" framing carries the good news and the success-coloured marker underlines it.
+fn review_records(r: &SessionReviewView) -> Vec<Line<'static>> {
+    if r.records.is_empty() {
+        return Vec::new();
+    }
+    std::iter::once(Line::from(""))
+        .chain(std::iter::once(bold("Personal records")))
+        .chain(r.records.iter().map(review_record_line))
+        .collect()
+}
+
+/// One record line, marked with a success-coloured bullet and the exercise name accented.
+fn review_record_line(record: &ReviewRecordView) -> Line<'static> {
+    named_line("  • ", &record.exercise, SUCCESS, record.line())
+}
+
+/// A `<marker><name>: <rest>` line where the name takes the exercise accent, reusing the
+/// proto helper's own text for everything after the name. `line` is expected to start
+/// `"<name>: "`; anything else is rendered whole, indented, rather than mis-split.
+fn named_line(marker: &str, name: &str, marker_colour: Color, line: String) -> Line<'static> {
+    match line.strip_prefix(&format!("{name}: ")) {
+        Some(rest) => Line::from(vec![
+            Span::styled(marker.to_string(), Style::default().fg(marker_colour)),
+            Span::styled(name.to_string(), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::raw(format!(": {rest}")),
+        ]),
+        None => Line::from(Span::raw(format!("{marker}{line}"))),
+    }
+}
+
+/// The grounded commentary ([C6.5], the programme tier only). Core's honest assessment,
+/// rendered verbatim — never softened, never reflowed.
+fn review_commentary(r: &SessionReviewView) -> Vec<Line<'static>> {
+    match &r.commentary {
+        Some(c) => std::iter::once(Line::from("")).chain(plain_lines(c)).collect(),
+        None => Vec::new(),
+    }
+}
+
+/// The charts behind the review, plotted with the same [T2.2] helpers `/progress` uses —
+/// the [C6.2] promise that every chart travels one path. Each degrades to a sparkline or
+/// a bare movement line exactly as [`render_series`] does when there is no room for axes.
+fn review_series(r: &SessionReviewView, width: u16) -> Vec<Line<'static>> {
+    r.series.iter().flat_map(|s| std::iter::once(Line::from("")).chain(render_series(s, width))).collect()
+}
+
+/// The session's summary stats as muted lines under the detail: how it tracked against
+/// the prescription, how hard it was, the streak it continued, and the week so far.
+fn review_footer(r: &SessionReviewView) -> Vec<Line<'static>> {
+    let stats: Vec<String> = r
+        .adherence
+        .clone()
+        .into_iter()
+        .chain(r.effort.iter().map(ReviewEffortView::line))
+        .chain(r.streak_days.map(|n| format!("{n}-day training streak")))
+        .chain(r.week_line.iter().map(|w| format!("This week: {w}")))
+        .collect();
+    if stats.is_empty() {
+        return Vec::new();
+    }
+    std::iter::once(Line::from("")).chain(stats.into_iter().map(muted)).collect()
+}
+
+/// A bulleted section — a bold title over `  • item` lines, led by a blank line — or
+/// nothing at all when there is nothing to list.
+fn bullet_section(title: &str, items: &[String]) -> Vec<Line<'static>> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    std::iter::once(Line::from(""))
+        .chain(std::iter::once(bold(title)))
+        .chain(items.iter().map(|item| Line::from(vec![Span::styled("  • ", Style::default().fg(MUTED)), Span::raw(item.clone())])))
+        .collect()
 }
 
 fn render_message(text: &str, notes: &[String], failures: &[String]) -> Vec<Line<'static>> {
@@ -560,8 +681,8 @@ mod tests {
     fn render(view: &View) -> Vec<Line<'static>> {
         render_view(view, WIDE)
     }
-    /// The minimal [C6.5] arm: enough that a review renders as itself rather than as
-    /// "[unsupported message]". The rich terminal rendering is [T2.3]'s.
+    /// The core of a [C6.5] review reads through end to end: the headline, an achieved
+    /// goal, the grounded commentary, the per-exercise delta and the derived-effort line.
     #[test]
     fn session_review_renders_its_headline_and_exercise_lines() {
         use gymbuddy_proto::{ReviewEffortView, ReviewExerciseView, ReviewKindView, SessionReviewView};
@@ -596,6 +717,153 @@ mod tests {
         assert!(text.contains("Effort: hard (my read, not yours)"), "{text}");
         assert!(!text.contains("[unsupported message]"), "the variant must not fall through: {text}");
         assert!(!text.contains('<'), "no HTML markup should appear: {text}");
+    }
+
+    /// A fuller programme-tier review — the shape a completed session with a bound
+    /// roster produces, carrying every optional field so the render exercises each.
+    fn full_review() -> SessionReviewView {
+        use gymbuddy_proto::{ReviewEffortView, ReviewExerciseView, ReviewKindView, ReviewRecordView};
+        SessionReviewView {
+            headline: "Strong session — every lift at or above target".into(),
+            kind: ReviewKindView::Report,
+            session_date: "2026-07-19".into(),
+            intent: Some("upper push".into()),
+            effort: Some(ReviewEffortView { label: "hard".into(), confirmed: true }),
+            exercises: vec![ReviewExerciseView {
+                name: "Bench Press".into(),
+                prescribed: Some("3 sets × 6 reps @ 65kg".into()),
+                actual: "3 sets × 6 reps @ 67.5kg".into(),
+                delta: Some("+2.5kg".into()),
+            }],
+            records: vec![ReviewRecordView {
+                exercise: "Bench Press".into(),
+                detail: "67.5 kg × 6".into(),
+                previous: Some("65 kg × 6".into()),
+            }],
+            commentary: Some("The extra 2.5kg held for all three sets, which is the signal to keep the load.".into()),
+            goals: vec!["Bench Press to 100kg: 67.5kg (68%)".into()],
+            achieved_goals: vec!["Overhead Press to 40kg".into()],
+            position: Some(TrainingModeView::Programme {
+                programme_title: "12-week hypertrophy".into(),
+                week: 2,
+                day: 1,
+                focus: "upper".into(),
+            }),
+            adherence: Some("1 of 1 prescribed exercises completed".into()),
+            streak_days: Some(4),
+            week_line: Some("3 sessions, 12400 kg total volume".into()),
+            series: vec![],
+            notes: vec!["Squat has too few sessions to trend yet.".into()],
+        }
+    }
+
+    /// Every section of a full programme-tier review lands: the header context, the
+    /// achievement, the exercise and record detail, the commentary, the goal line, the
+    /// footer stats and the caveat — and none of it as markup.
+    #[test]
+    fn session_review_renders_every_section() {
+        let text = flat(&render(&View::SessionReview(Box::new(full_review()))));
+        assert!(text.contains("Strong session — every lift at or above target"), "the headline: {text}");
+        assert!(text.contains("2026-07-19"), "the session date: {text}");
+        assert!(text.contains("Programme: 12-week hypertrophy — week 2, day 1: upper"), "the slot it filled: {text}");
+        assert!(text.contains("Aiming for upper push"), "the intent: {text}");
+        assert!(text.contains("Goal reached: Overhead Press to 40kg"), "the achievement: {text}");
+        assert!(text.contains("Exercises"), "the exercises heading: {text}");
+        assert!(text.contains("Bench Press: 3 sets × 6 reps @ 67.5kg (asked 3 sets × 6 reps @ 65kg) — +2.5kg"), "the delta: {text}");
+        assert!(text.contains("Personal records"), "the records heading: {text}");
+        assert!(text.contains("Bench Press: 67.5 kg × 6 (was 65 kg × 6)"), "the record: {text}");
+        assert!(text.contains("The extra 2.5kg held for all three sets"), "the commentary: {text}");
+        assert!(text.contains("Bench Press to 100kg: 67.5kg (68%)"), "the goal line: {text}");
+        assert!(text.contains("1 of 1 prescribed exercises completed"), "adherence: {text}");
+        assert!(text.contains("Effort: hard"), "effort: {text}");
+        assert!(text.contains("4-day training streak"), "the streak: {text}");
+        assert!(text.contains("This week: 3 sessions, 12400 kg total volume"), "the week line: {text}");
+        assert!(text.contains("Squat has too few sessions to trend yet."), "the caveat: {text}");
+        assert!(!text.contains('<'), "no HTML markup should appear: {text}");
+    }
+
+    /// Achievements lead: finishing a goal is the one thing worth interrupting for, so it
+    /// renders above the exercise detail. Colour marks it, but the word "reached" carries
+    /// the verdict for a terminal that renders the green away.
+    #[test]
+    fn session_review_leads_with_its_achievements() {
+        let lines = render(&View::SessionReview(Box::new(full_review())));
+        let goal = lines.iter().position(|l| flat(std::slice::from_ref(l)).contains("Goal reached")).expect("an achievement line");
+        let exercise = lines.iter().position(|l| flat(std::slice::from_ref(l)).contains("Bench Press")).expect("an exercise line");
+        assert!(goal < exercise, "the achievement leads the exercise detail: {goal} vs {exercise}");
+        assert_eq!(lines[goal].spans.last().unwrap().style.fg, Some(SUCCESS), "a reached goal is coloured as the win it is");
+    }
+
+    /// The verdict is Core's, and a blunt one is not softened in the render — a partial
+    /// session says so, verbatim.
+    #[test]
+    fn session_review_does_not_soften_a_blunt_verdict() {
+        let blunt = SessionReviewView {
+            headline: "Partial session — 1 of 3 prescribed exercises completed".into(),
+            achieved_goals: vec![],
+            ..full_review()
+        };
+        let text = flat(&render(&View::SessionReview(Box::new(blunt))));
+        assert!(text.contains("Partial session — 1 of 3 prescribed exercises completed"), "the honest headline stands: {text}");
+    }
+
+    /// Composes with [T2.2]: a review carrying a chartable series plots it through the
+    /// same helpers `/progress` uses — axes where there is room, a sparkline where there
+    /// is not — rather than growing a second chart path.
+    #[test]
+    fn session_review_composes_charts_and_degrades_to_text() {
+        use gymbuddy_proto::{Direction, SeriesShape, SeriesView};
+        let series = SeriesView {
+            title: "Bench Press".into(),
+            unit: "kg".into(),
+            better: Direction::Higher,
+            shape: SeriesShape::Trajectory { target: 100.0 },
+            points: series_points(&[("2026-05-01", 80.0), ("2026-06-01", 85.0), ("2026-07-01", 92.5)]),
+        };
+        let view = View::SessionReview(Box::new(SessionReviewView { series: vec![series], ..full_review() }));
+
+        let wide = flat(&render_view(&view, WIDE));
+        assert!(wide.contains("80 → 92.5 kg (+12.5, better)"), "the movement, direction-aware: {wide}");
+        assert!(wide.contains('│') && wide.contains('└'), "a wide review charts the series: {wide}");
+        assert!(wide.contains("Target: 100 kg"), "the trajectory target is named: {wide}");
+
+        let narrow = flat(&render_view(&view, 20));
+        assert!(narrow.contains("▁▄█"), "a narrow review degrades to a sparkline: {narrow}");
+        assert!(!narrow.contains('│'), "no room for axes at 20 columns: {narrow}");
+    }
+
+    /// The timeout path ([C6.5]/`close_stale_session`): a review arrives unprompted, not
+    /// as a reply to a submitted line. It stands on its view alone — no intent, no
+    /// commentary, a derived effort it admits to guessing — and still renders in full.
+    #[test]
+    fn session_review_from_a_timeout_renders_without_a_user_line() {
+        use gymbuddy_proto::{ReviewEffortView, ReviewExerciseView, ReviewKindView};
+        let auto_closed = SessionReviewView {
+            headline: "Session logged — 1 exercise".into(),
+            kind: ReviewKindView::Summary,
+            intent: None,
+            commentary: None,
+            position: None,
+            adherence: None,
+            achieved_goals: vec![],
+            records: vec![],
+            goals: vec![],
+            series: vec![],
+            notes: vec![],
+            effort: Some(ReviewEffortView { label: "hard".into(), confirmed: false }),
+            exercises: vec![ReviewExerciseView {
+                name: "Bench Press".into(),
+                prescribed: None,
+                actual: "3 sets × 6 reps @ 67.5kg".into(),
+                delta: None,
+            }],
+            ..full_review()
+        };
+        let text = flat(&render(&View::SessionReview(Box::new(auto_closed))));
+        assert!(text.contains("Session logged — 1 exercise"), "the headline: {text}");
+        assert!(text.contains("Bench Press: 3 sets × 6 reps @ 67.5kg"), "the unrostered exercise: {text}");
+        assert!(text.contains("Effort: hard (my read, not yours)"), "a derived effort admits it is a guess: {text}");
+        assert!(!text.contains("[unsupported message]"), "the variant must not fall through: {text}");
     }
 
     fn flat(lines: &[Line]) -> String {
