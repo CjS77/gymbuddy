@@ -61,6 +61,14 @@ pub enum View {
     /// How the user is tracking against their goals ( `/progress` ), as chartable
     /// [`SeriesView`]s the client plots however it can ([C6.2]/[C6.3]).
     Progress(ProgressView),
+    /// The post-session review ([C6.5]): what happened in a session that just ended,
+    /// how it compared to what was prescribed, and what it moved. Emitted when a
+    /// session ends, when a stale one is auto-closed, and by `/review`.
+    ///
+    /// Boxed for the same reason as [`View::Programme`] — it is the largest variant and
+    /// `View` travels inside `ServerResponse` on every reply. `Box` is transparent to
+    /// serde, so the wire bytes are exactly those of an unboxed `SessionReviewView`.
+    SessionReview(Box<SessionReviewView>),
 }
 
 impl View {
@@ -95,6 +103,7 @@ impl View {
             View::ProgrammeSessionRoster { roster, mode } => format!("Here's a workout: {} ({}).", roster.title, mode.summary()),
             View::Programme(p) => format!("Here's a programme: {} ({}).", p.title, p.shape_line()),
             View::Progress(p) => p.summary_line(),
+            View::SessionReview(r) => r.summary_line(),
         }
     }
 }
@@ -608,6 +617,160 @@ impl ProgressView {
     }
 }
 
+// ── /review ──────────────────────────────────────────────────────────────────────
+
+/// Which tier of review this is — the wire record of the two-tier split in [C6.5].
+///
+/// Rides inside an appended `View` variant, so its own variant order is wire format
+/// too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReviewKindView {
+    /// An ad-hoc session: assembled entirely from the logged sets, with no model
+    /// consulted. [`SessionReviewView::commentary`] is always `None` here, and clients
+    /// may say so — "no LLM was asked" is a property worth being able to show.
+    Summary,
+    /// A programme session: the same deterministic stats, plus one commentary call
+    /// grounded in the deltas the review already computed.
+    Report,
+}
+
+/// The post-session review ([C6.5]): a snapshot of what a session was, taken when it
+/// ended.
+///
+/// Everything except [`series`](Self::series) is a record of what was true at
+/// generation time and is replayed verbatim by `/review` — a later edit to a set does
+/// not rewrite it. The series are recomputed live on each render, because a chart of
+/// the user's history is a current view of that history, not part of the record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionReviewView {
+    /// The one-line verdict, e.g. "Solid session — 3 of 4 lifts at or above target".
+    /// Always deterministic, never the model's words, in both tiers.
+    pub headline: String,
+    pub kind: ReviewKindView,
+    /// When the session ended, as stored — clients display it as given.
+    pub session_date: String,
+    /// What the user said they were setting out to do, when they said anything.
+    pub intent: Option<String>,
+    /// How hard the session was, and whether the user confirmed that or the server
+    /// derived it from the set-by-set difficulties.
+    pub effort: Option<ReviewEffortView>,
+    /// One line per exercise, in the order performed.
+    pub exercises: Vec<ReviewExerciseView>,
+    /// Personal records set *in this session* — never the user's all-time record list.
+    pub records: Vec<ReviewRecordView>,
+    /// The grounded commentary, present only for [`ReviewKindView::Report`]. `None` for
+    /// an ad-hoc summary, which makes no model call at all.
+    pub commentary: Option<String>,
+    /// Where the session left each live goal, already rendered as display lines.
+    pub goals: Vec<String>,
+    /// Goals this session *completed* — persisted as achieved at generation time, so
+    /// this list is the record of when it happened, not a re-derivation. Clients lead
+    /// with these: finishing a goal is the one thing worth interrupting for.
+    pub achieved_goals: Vec<String>,
+    /// The programme slot this session filled, when it was run in programme mode.
+    pub position: Option<TrainingModeView>,
+    /// How the session tracked against its prescription, e.g. "4 of 5 prescribed
+    /// exercises completed". `None` when no roster was bound to compare against.
+    pub adherence: Option<String>,
+    /// Consecutive days trained, including this session.
+    pub streak_days: Option<u32>,
+    /// The week so far, e.g. "3 sessions, 12,400 kg total volume".
+    pub week_line: Option<String>,
+    /// The charts behind the review — recomputed on every render, so they are the only
+    /// part of this view that moves after the fact. The [C6.2] contract: this list must
+    /// never grow a second series path.
+    pub series: Vec<SeriesView>,
+    /// Free-text caveats — a goal with too little data, a metric that could not be
+    /// compared, a commentary call that failed.
+    pub notes: Vec<String>,
+}
+
+impl SessionReviewView {
+    /// The line every renderer leads with: the server's headline, or a self-announcing
+    /// fallback when it somehow set none.
+    pub fn summary_line(&self) -> String {
+        if self.headline.trim().is_empty() {
+            let n = self.exercises.len();
+            format!("Here's your session review ({n} {}).", if n == 1 { "exercise" } else { "exercises" })
+        } else {
+            self.headline.clone()
+        }
+    }
+}
+
+/// How hard a session was, plus where that verdict came from.
+///
+/// The provenance is carried rather than inferred because it changes what a client
+/// should say: a derived effort is a guess the user has not seen yet and is worth
+/// offering back for correction, a confirmed one is theirs and must not be
+/// second-guessed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewEffortView {
+    /// "easy", "medium", "hard", "failure".
+    pub label: String,
+    /// `true` when the user told us; `false` when the server derived it from the
+    /// perceived difficulty of the logged sets (the auto-close path).
+    pub confirmed: bool,
+}
+
+impl ReviewEffortView {
+    /// The effort line, e.g. `Effort: hard` or `Effort: hard (my read, not yours)`.
+    pub fn line(&self) -> String {
+        match self.confirmed {
+            true => format!("Effort: {}", self.label),
+            false => format!("Effort: {} (my read, not yours)", self.label),
+        }
+    }
+}
+
+/// One exercise as it was actually performed, against what was asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewExerciseView {
+    pub name: String,
+    /// The roster's prescription, e.g. "3 sets × 6 reps @ 65kg". `None` when the
+    /// session ran without a roster, or when this exercise was not on it.
+    pub prescribed: Option<String>,
+    /// What was logged, e.g. "3 sets × 6 reps @ 67.5kg".
+    pub actual: String,
+    /// How the two differ, e.g. "+2.5kg" or "1 set short". `None` when there was no
+    /// prescription to differ from, or when the session matched it exactly.
+    pub delta: Option<String>,
+}
+
+impl ReviewExerciseView {
+    /// The per-exercise line, e.g. `Bench Press: 3 sets × 6 reps @ 67.5kg (asked 65kg) — +2.5kg`.
+    /// Plain text; styling and escaping stay at the renderer.
+    pub fn line(&self) -> String {
+        let base = format!("{}: {}", self.name, self.actual);
+        match (&self.prescribed, &self.delta) {
+            (Some(p), Some(d)) => format!("{base} (asked {p}) — {d}"),
+            (Some(p), None) => format!("{base} (as prescribed: {p})"),
+            (None, _) => base,
+        }
+    }
+}
+
+/// A personal record set during the session under review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewRecordView {
+    pub exercise: String,
+    /// The new best, already formatted with its unit, e.g. "100 kg × 5".
+    pub detail: String,
+    /// The best that stood before it, when there was one. Absent for a first-ever
+    /// logged effort, which is a record only in the trivial sense.
+    pub previous: Option<String>,
+}
+
+impl ReviewRecordView {
+    /// The record line, e.g. `Bench Press: 100 kg × 5 (was 97.5 kg × 5)`.
+    pub fn line(&self) -> String {
+        match &self.previous {
+            Some(prev) => format!("{}: {} (was {prev})", self.exercise, self.detail),
+            None => format!("{}: {} (first logged)", self.exercise, self.detail),
+        }
+    }
+}
+
 /// Render a change with an explicit sign, so "+2.5" and "-2.5" read as movement
 /// rather than as values.
 fn signed(v: f64) -> String {
@@ -641,6 +804,8 @@ pub(crate) mod tests {
             // A headline the server left empty is the case that would otherwise
             // fall through to an empty message.
             View::Progress(ProgressView { headline: String::new(), series: vec![], notes: vec![] }),
+            View::SessionReview(Box::new(session_review_view())),
+            View::SessionReview(Box::new(SessionReviewView { headline: String::new(), ..session_review_view() })),
         ];
         for view in &views {
             assert!(!view.fallback_text().is_empty(), "empty fallback for {view:?}");
@@ -654,6 +819,124 @@ pub(crate) mod tests {
             series: vec![trend(), bodyweight(), breakdown()],
             notes: vec!["Squat has too few sessions to trend yet.".into()],
         }
+    }
+
+    /// A representative programme-mode review, shared by the tests below and by
+    /// `lib.rs`. Deliberately the *fuller* tier: it carries commentary, a programme
+    /// position and an achieved goal, so a roundtrip exercises every optional field.
+    pub(crate) fn session_review_view() -> SessionReviewView {
+        SessionReviewView {
+            headline: "Strong session — every lift at or above target".into(),
+            kind: ReviewKindView::Report,
+            session_date: "2026-07-19".into(),
+            intent: Some("upper push".into()),
+            effort: Some(ReviewEffortView { label: "hard".into(), confirmed: true }),
+            exercises: vec![
+                ReviewExerciseView {
+                    name: "Bench Press".into(),
+                    prescribed: Some("3 sets × 6 reps @ 65kg".into()),
+                    actual: "3 sets × 6 reps @ 67.5kg".into(),
+                    delta: Some("+2.5kg".into()),
+                },
+                ReviewExerciseView {
+                    name: "Overhead Press".into(),
+                    prescribed: Some("3 sets × 8 reps @ 40kg".into()),
+                    actual: "3 sets × 8 reps @ 40kg".into(),
+                    delta: None,
+                },
+            ],
+            records: vec![ReviewRecordView {
+                exercise: "Bench Press".into(),
+                detail: "67.5 kg × 6".into(),
+                previous: Some("65 kg × 6".into()),
+            }],
+            commentary: Some("The extra 2.5kg held for all three sets, which is the signal to keep the load.".into()),
+            goals: vec!["Bench Press to 100kg: 67.5kg (68%)".into()],
+            achieved_goals: vec!["Overhead Press to 40kg".into()],
+            position: Some(TrainingModeView::Programme {
+                programme_title: "12-week hypertrophy".into(),
+                week: 2,
+                day: 1,
+                focus: "upper".into(),
+            }),
+            adherence: Some("2 of 2 prescribed exercises completed".into()),
+            streak_days: Some(4),
+            week_line: Some("3 sessions, 12400 kg total volume".into()),
+            series: vec![trend()],
+            notes: vec!["Squat has too few sessions to trend yet.".into()],
+        }
+    }
+
+    /// The ad-hoc tier: no commentary, no programme position, no prescription to
+    /// measure against. The shape the no-LLM path produces.
+    pub(crate) fn adhoc_review_view() -> SessionReviewView {
+        SessionReviewView {
+            headline: "Session logged — 1 exercise".into(),
+            kind: ReviewKindView::Summary,
+            commentary: None,
+            position: None,
+            adherence: None,
+            achieved_goals: vec![],
+            exercises: vec![ReviewExerciseView {
+                name: "Bench Press".into(),
+                prescribed: None,
+                actual: "3 sets × 6 reps @ 67.5kg".into(),
+                delta: None,
+            }],
+            ..session_review_view()
+        }
+    }
+
+    /// The two tiers differ in exactly one visible way: whether a model was asked.
+    /// A `Summary` carrying commentary would mean the ad-hoc path had made an LLM
+    /// call, which is the safety property [C6.5] is built around.
+    #[test]
+    fn an_adhoc_summary_carries_no_commentary() {
+        let adhoc = adhoc_review_view();
+        assert_eq!(adhoc.kind, ReviewKindView::Summary);
+        assert!(adhoc.commentary.is_none(), "the ad-hoc tier must never carry model prose");
+        assert!(session_review_view().commentary.is_some(), "the programme tier grounds one commentary call");
+    }
+
+    /// The per-exercise line is the review's core sentence, and it reads differently
+    /// in each of its three states.
+    #[test]
+    fn exercise_lines_report_the_delta_against_the_prescription() {
+        let beat = &session_review_view().exercises[0];
+        assert_eq!(beat.line(), "Bench Press: 3 sets × 6 reps @ 67.5kg (asked 3 sets × 6 reps @ 65kg) — +2.5kg");
+
+        let matched = &session_review_view().exercises[1];
+        assert_eq!(matched.line(), "Overhead Press: 3 sets × 8 reps @ 40kg (as prescribed: 3 sets × 8 reps @ 40kg)");
+
+        let unrostered = &adhoc_review_view().exercises[0];
+        assert_eq!(unrostered.line(), "Bench Press: 3 sets × 6 reps @ 67.5kg", "nothing prescribed, nothing to compare");
+    }
+
+    /// A record is only impressive against the one it beat, and a first-ever effort
+    /// must not be dressed up as one.
+    #[test]
+    fn record_lines_name_what_they_beat() {
+        assert_eq!(session_review_view().records[0].line(), "Bench Press: 67.5 kg × 6 (was 65 kg × 6)");
+
+        let first = ReviewRecordView { exercise: "Dips".into(), detail: "12 reps".into(), previous: None };
+        assert_eq!(first.line(), "Dips: 12 reps (first logged)");
+    }
+
+    /// A derived effort is a guess the user has not confirmed — the auto-close path's
+    /// whole reason for offering it back.
+    #[test]
+    fn effort_line_admits_when_it_is_a_guess() {
+        assert_eq!(ReviewEffortView { label: "hard".into(), confirmed: true }.line(), "Effort: hard");
+        assert_eq!(ReviewEffortView { label: "hard".into(), confirmed: false }.line(), "Effort: hard (my read, not yours)");
+    }
+
+    #[test]
+    fn review_summary_falls_back_to_a_count() {
+        let blank = SessionReviewView { headline: "  ".into(), ..session_review_view() };
+        assert_eq!(blank.summary_line(), "Here's your session review (2 exercises).");
+
+        let one = SessionReviewView { headline: String::new(), ..adhoc_review_view() };
+        assert_eq!(one.summary_line(), "Here's your session review (1 exercise).");
     }
 
     fn points(raw: &[(&str, f64)]) -> Vec<SeriesPointView> {

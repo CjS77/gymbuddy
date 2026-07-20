@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 pub mod view;
 pub use view::{
     CatalogEntry, CatalogGroup, CatalogView, Direction, ExerciseLog, HealthNote, HistoryView, Measurement, ProgrammeBlockView,
-    ProgrammeDayView, ProgrammeView, ProgressView, Render, RosterExerciseView, SeriesPointView, SeriesShape, SeriesView, SessionRosterView,
-    SessionSummaryView, SessionView, SetLine, StatusView, TrainingModeView, View,
+    ProgrammeDayView, ProgrammeView, ProgressView, Render, ReviewEffortView, ReviewExerciseView, ReviewKindView, ReviewRecordView,
+    RosterExerciseView, SeriesPointView, SeriesShape, SeriesView, SessionReviewView, SessionRosterView, SessionSummaryView, SessionView,
+    SetLine, StatusView, TrainingModeView, View,
 };
 
 /// Discriminator placed in confide's `Message::Custom { kind, .. }` so the peer
@@ -147,7 +148,7 @@ pub fn decode_response(data: &[u8]) -> postcard::Result<ServerResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use view::tests::{programme_view, progress_view};
+    use view::tests::{adhoc_review_view, programme_view, progress_view, session_review_view};
 
     fn roundtrip_request(req: ClientRequest) {
         let bytes = encode_request(&req).expect("encode");
@@ -252,6 +253,8 @@ mod tests {
             View::Programme(Box::new(programme_view())),
             View::Progress(progress_view()),
             View::Progress(view::ProgressView { headline: "No goals set yet.".into(), series: vec![], notes: vec![] }),
+            View::SessionReview(Box::new(session_review_view())),
+            View::SessionReview(Box::new(adhoc_review_view())),
         ] {
             roundtrip_response(ServerResponse::Reply { view, timer: None });
         }
@@ -289,6 +292,47 @@ mod tests {
         );
         assert_eq!(tag(&View::Programme(Box::new(programme_view()))), 8, "Programme appended for [C4.2]");
         assert_eq!(tag(&View::Progress(progress_view())), 9, "Progress appended for [C6.2]");
+        assert_eq!(tag(&View::SessionReview(Box::new(session_review_view()))), 10, "SessionReview appended for [C6.5]");
+    }
+
+    /// `ReviewKindView` rides inside tag 10, so its own variant order is wire format
+    /// too — and the two variants are the wire record of whether a model was consulted.
+    /// A reorder would tell an older client that a deterministic ad-hoc summary was
+    /// LLM commentary, and vice versa.
+    #[test]
+    fn review_kind_discriminants_are_pinned_to_their_wire_tags() {
+        let tag = |kind: &view::ReviewKindView| postcard::to_allocvec(kind).unwrap()[0];
+        assert_eq!(tag(&view::ReviewKindView::Summary), 0, "Summary");
+        assert_eq!(tag(&view::ReviewKindView::Report), 1, "Report");
+    }
+
+    /// A review is a snapshot, so every part of it has to survive the wire intact —
+    /// including the optional halves (commentary, programme position, achieved goals)
+    /// that only the programme tier fills in.
+    #[test]
+    fn a_session_review_survives_the_wire_whole() {
+        let sent = session_review_view();
+        let bytes = encode_response(&ServerResponse::Reply { view: View::SessionReview(Box::new(sent.clone())), timer: None }).unwrap();
+        let ServerResponse::Reply { view: View::SessionReview(got), .. } = decode_response(&bytes).unwrap() else {
+            panic!("expected a SessionReview reply");
+        };
+        assert_eq!(*got, sent);
+        assert_eq!(got.kind, view::ReviewKindView::Report);
+        assert!(got.commentary.is_some(), "the grounded commentary crossed");
+        assert_eq!(got.achieved_goals, vec!["Overhead Press to 40kg".to_string()], "achieved goals are the record, not a re-derivation");
+        assert_eq!(got.series[0].improving(), Some(true), "the embedded [C6.2] series kept its verdict");
+    }
+
+    /// `View::SessionReview` boxes its payload to keep `View` small, exactly as
+    /// `View::Programme` does. That must stay an in-memory decision, invisible on the
+    /// wire.
+    #[test]
+    fn boxing_the_review_payload_does_not_change_its_wire_bytes() {
+        let review = session_review_view();
+        let boxed = postcard::to_allocvec(&View::SessionReview(Box::new(review.clone()))).unwrap();
+        let bare = postcard::to_allocvec(&review).unwrap();
+        assert_eq!(boxed[0], 10);
+        assert_eq!(&boxed[1..], &bare[..], "the box must add nothing to the encoding");
     }
 
     /// `SeriesShape` and `Direction` ride inside tag 9, so their own variant order is
