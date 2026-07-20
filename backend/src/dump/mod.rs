@@ -39,6 +39,13 @@
 //! importer remaps them through translation maps built in dependency order and must never insert
 //! them verbatim.
 //!
+//! # Row counts
+//!
+//! [`Dump::row_counts`] reports how many rows landed in each collection, counted from the dump
+//! rather than from the source. `gymbuddy export` logs them, and the fidelity tests compare them
+//! against `SELECT COUNT(*)` on the seeded fixture — which is what turns "the export succeeded"
+//! into "the export succeeded and brought everything with it".
+//!
 //! # v1 → v2 mapping
 //!
 //! The v1 reader ([`v1`]) applies every rename on the way out, so the dump never contains legacy
@@ -94,6 +101,7 @@
 //! Timestamps are copied as the strings SQLite holds them in. No parsing, no normalisation: a
 //! backup that rewrites its own timestamps is not a backup.
 
+pub mod counts;
 pub mod model;
 mod probe;
 mod v1;
@@ -103,8 +111,20 @@ use std::path::Path;
 use anyhow::Context as _;
 use rusqlite::{Connection, OpenFlags};
 
+pub use counts::RowCounts;
 pub use model::{DUMP_FORMAT, DUMP_VERSION, Dump};
 pub use probe::Generation;
+
+impl Dump {
+    /// How many rows this dump carries, per collection.
+    ///
+    /// The counts come from the dump itself, so comparing them against `SELECT COUNT(*)` on the
+    /// source is a real reconciliation rather than a tautology — that comparison is what catches a
+    /// table the reader forgot to walk.
+    pub fn row_counts(&self) -> RowCounts {
+        RowCounts::of(self)
+    }
+}
 
 /// Export the database at `path`.
 ///
@@ -150,6 +170,14 @@ pub fn from_json(json: &str) -> anyhow::Result<Dump> {
     );
     Ok(dump)
 }
+
+/// The frozen schema v1 fixture, shared with the integration tests in `tests/` (which reach it as a
+/// plain `mod fixtures;`). It lives under `tests/` because that is the only place both test
+/// binaries can see it from; duplicating a 200-line seed to avoid one `#[path]` would only
+/// guarantee the two copies drift apart.
+#[cfg(test)]
+#[path = "../../tests/fixtures/mod.rs"]
+pub(crate) mod fixtures;
 
 #[cfg(test)]
 mod tests;

@@ -121,15 +121,18 @@ fn run_export(db: &Path, out: &Path) -> anyhow::Result<()> {
     let json = dump::to_json(&dump)?;
     std::fs::write(out, &json).with_context(|| format!("writing dump to {}", out.display()))?;
 
-    let sessions: usize = dump.users.iter().map(|user| user.sessions.len()).sum();
+    // Per-collection counts, not just a total: they are what an operator reconciles against the
+    // source database to convince themselves nothing was left behind, and the only way a dropped
+    // table shows up in a run that otherwise reports success.
+    let counts = dump.row_counts();
     tracing::info!(
         out = %out.display(),
         source_schema = dump.source_schema.generation,
-        users = dump.users.len(),
-        sessions,
+        rows = counts.total(),
         bytes = json.len(),
         "Export complete"
     );
+    tracing::info!(%counts, "Rows exported per collection");
     Ok(())
 }
 

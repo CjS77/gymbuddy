@@ -119,6 +119,18 @@ pub struct User {
     pub legacy: Legacy,
 }
 
+impl User {
+    /// Every exercise entry in the tree, wherever it hangs.
+    ///
+    /// Entries live in two places — under their session, and under the user when `session_id` was
+    /// NULL — and code that walks only [`User::sessions`] silently loses the second kind. Anything
+    /// meaning "all of this user's entries" should come through here rather than rebuild the chain
+    /// and risk forgetting the tail.
+    pub fn entries(&self) -> impl Iterator<Item = &ExerciseEntry> {
+        self.sessions.iter().flat_map(|session| &session.entries).chain(&self.unsessioned_entries)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Philosophy {
     /// Source id — [`SessionRoster::philosophy_id`] points here.
