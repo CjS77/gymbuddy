@@ -170,6 +170,19 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().context("Failed to list programme blocks")
     }
 
+    /// The block whose inclusive week range covers `week_idx`, if the programme has one there.
+    /// Blocks are not required to tile the whole programme, so a week between them has no block —
+    /// which reads as ordinary progression, never as a deload ([C5.3]).
+    ///
+    /// Overlapping blocks are not prevented by the schema; the earliest-starting one wins, matching
+    /// [`list_programme_blocks`](Self::list_programme_blocks)'s order.
+    pub fn block_for_week(&self, programme_id: i64, week_idx: i32) -> anyhow::Result<Option<ProgrammeBlock>> {
+        let sql = format!("{SELECT_BLOCK} WHERE programme_id = ?1 AND start_week <= ?2 AND end_week >= ?2 ORDER BY start_week LIMIT 1");
+        let mut stmt = self.conn().prepare(&sql)?;
+        let mut rows = stmt.query_map(params![programme_id, week_idx], row_to_block)?;
+        rows.next().transpose().context("Failed to read the block for a week")
+    }
+
     // ── The week/day slot grid ────────────────────────────────────────────────────
 
     pub fn add_programme_slot(&self, s: &ProgrammeSlot) -> anyhow::Result<i64> {

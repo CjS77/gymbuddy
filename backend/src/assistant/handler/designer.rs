@@ -11,12 +11,15 @@ use chrono::NaiveDateTime;
 use crate::assistant::actions::{AssistantAction, ProposedRosterExercise};
 use crate::assistant::matching::find_exercise_type;
 use crate::assistant::parser::parse_assistant_response;
-use crate::assistant::prompts::{build_designer_prompt, estimate_tokens, format_muscle_recovery, format_session_outcome, goals_by_priority};
+use crate::assistant::prompts::{
+    DesignerInputs, build_designer_prompt, estimate_tokens, format_muscle_recovery, format_session_outcome, goals_by_priority,
+};
 use crate::config::DesignerHistoryConfig;
 use crate::db::{
     Database, EntryWithSets, ExerciseSet, GoalKind, GoalProgress, HealthEntry, MeasurementType, Philosophy, RosterExercise, Session,
     SessionWithSets, TrainingMode, User,
 };
+use crate::progression::{BlockIntent, ExerciseClass, ExerciseRecord, Outing, ProgressionPolicy, build_policy};
 use crate::science::{ScienceQuery, normalise_body_part, prescription_doc};
 
 use super::AssistantHandler;
@@ -37,20 +40,24 @@ impl AssistantHandler {
         let raw_guidance = text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
         let (force_ad_hoc, guidance) = split_ad_hoc_marker(&raw_guidance);
 
-        let (mode, philosophy, sessions, recovery, goals, injuries, goal_ids) = {
+        let (mode, philosophy, sessions, recovery, goals, injuries, goal_ids, progression) = {
             let db = self.db.lock().await;
             let goals = db.goal_progress_report(user.id, None, None)?;
             let goal_ids = goal_relevant_exercise_ids(&db, &goals)?;
+            let mode = db.training_mode_for_design(user.id, force_ad_hoc)?;
             // Pull a generous window (bounded by config); the summariser decides how
             // much of it survives into the prompt under the token budget.
+            let sessions = db.recent_sessions_with_sets(user.id, self.config.designer_history.max_sessions)?;
+            let progression = self.progression_policy(&db, &sessions, &mode)?;
             (
-                db.training_mode_for_design(user.id, force_ad_hoc)?,
+                mode,
                 db.latest_philosophy(user.id)?,
-                db.recent_sessions_with_sets(user.id, self.config.designer_history.max_sessions)?,
+                sessions,
                 db.muscle_recovery(user.id)?,
                 goals,
                 db.list_active_health_entries(user.id)?,
                 goal_ids,
+                progression,
             )
         };
 
@@ -64,9 +71,18 @@ impl AssistantHandler {
 
         let history_block = self.format_designer_history(&sessions, &goal_ids);
         let recovery_block = format_muscle_recovery(&recovery, chrono::Utc::now().date_naive());
-        let science = self.science.search(&science_query(&goals, &injuries, &guidance), SCIENCE_CHUNK_K);
-        let prompt =
-            build_designer_prompt(&philosophy.content, &history_block, &recovery_block, &goals, &injuries, &science, &self.catalogue);
+        let query = science_query(&goals, &injuries, &guidance, focus_terms(&mode, &progression.block));
+        let science = self.science.search(&query, SCIENCE_CHUNK_K);
+        let prompt = build_designer_prompt(&DesignerInputs {
+            philosophy: &philosophy.content,
+            history: &history_block,
+            recovery: &recovery_block,
+            goals: &goals,
+            health_entries: &injuries,
+            science: &science,
+            progression: &progression,
+            catalogue: &self.catalogue,
+        });
         let user_text = if guidance.trim().is_empty() { "Design my next workout.".to_string() } else { guidance };
 
         // The design overruns the default token cap; logging is impossible here
@@ -158,6 +174,59 @@ impl AssistantHandler {
         })
     }
 
+    /// The progressive-overload policy for this design ([C5.3]): one binding load directive per
+    /// exercise the user has trained recently, plus the week's block intent.
+    ///
+    /// Reads the session window the designer already loaded rather than querying again; the only
+    /// extra reads are the roster bound to each of those sessions (the prescription half of
+    /// prescribed-vs-actual, [C1.5]) and the programme block covering the current week.
+    fn progression_policy(&self, db: &Database, sessions: &[SessionWithSets], mode: &TrainingMode) -> anyhow::Result<ProgressionPolicy> {
+        let records = self.progression_records(db, sessions)?;
+        Ok(build_policy(&records, block_intent(db, mode)?))
+    }
+
+    /// Roll the recent sessions up into one [`ExerciseRecord`] per exercise trained, most
+    /// recently-trained first.
+    fn progression_records(&self, db: &Database, sessions: &[SessionWithSets]) -> anyhow::Result<Vec<ExerciseRecord>> {
+        let mut order: Vec<i64> = Vec::new();
+        let mut collected: BTreeMap<i64, (MeasurementType, Vec<Outing>)> = BTreeMap::new();
+
+        for (session, entries) in sessions.iter().take(PROGRESSION_SESSION_WINDOW) {
+            let prescribed = self.prescriptions_for_session(db, session.id)?;
+            let date = session.started_at.get(..10).unwrap_or(&session.started_at);
+            for (type_id, sets) in sets_by_exercise(entries) {
+                let Some(outing) = build_outing(date, &sets, prescribed.get(&type_id)) else { continue };
+                if !order.contains(&type_id) {
+                    order.push(type_id);
+                }
+                collected.entry(type_id).or_insert_with(|| (sets[0].measurement_type, Vec::new())).1.push(outing);
+            }
+        }
+
+        Ok(order.into_iter().take(MAX_PROGRESSION_DIRECTIVES).filter_map(|id| self.exercise_record(id, &mut collected)).collect())
+    }
+
+    /// One exercise's record, classified against the catalogue. An exercise the catalogue no longer
+    /// knows is skipped rather than guessed at — the class decides how much load to add, and a
+    /// wrong guess there is exactly the failure this ticket exists to prevent.
+    fn exercise_record(&self, type_id: i64, collected: &mut BTreeMap<i64, (MeasurementType, Vec<Outing>)>) -> Option<ExerciseRecord> {
+        let entry = self.catalogue.iter().find(|e| e.exercise_type.id == type_id)?;
+        let (measurement_type, outings) = collected.remove(&type_id)?;
+        Some(ExerciseRecord {
+            exercise_name: entry.exercise_type.name.clone(),
+            class: ExerciseClass::of(entry, &self.catalogue),
+            measurement_type,
+            outings,
+        })
+    }
+
+    /// What the roster bound to `session_id` prescribed, keyed by exercise. Empty for an ad-hoc
+    /// session that ran against no design, which is ordinary rather than exceptional.
+    fn prescriptions_for_session(&self, db: &Database, session_id: i64) -> anyhow::Result<BTreeMap<i64, RosterExercise>> {
+        let Some(roster) = db.roster_for_session(session_id)? else { return Ok(BTreeMap::new()) };
+        Ok(db.list_roster_exercises(roster.id)?.into_iter().map(|re| (re.exercise_type_id, re)).collect())
+    }
+
     /// Build the designer's history block: the most recent sessions in full, older
     /// sessions collapsed to per-exercise trend lines, the whole thing bounded by the
     /// configured token budget with goal-relevant lifts favoured over incidental ones.
@@ -190,6 +259,86 @@ const SCIENCE_CHUNK_K: usize = 4;
 /// The document holding the curated rule for goals that pull against each other.
 const COMPETING_GOALS_DOC: &str = "competing-goals";
 
+/// How many recent sessions the progression policy reads ([C5.3]). The rules themselves only ever
+/// compare the two most recent outings *of an exercise*, but an exercise trained twice a week takes
+/// several sessions to appear twice, so the window is over sessions, not over outings.
+const PROGRESSION_SESSION_WINDOW: usize = 8;
+
+/// Cap on how many exercises get a directive. The section is a policy the model must follow, not a
+/// dump of the log — and past a point, extra directives crowd out the science that justifies them.
+/// Exercises are taken most-recently-trained first, so what survives the cap is what is in rotation.
+const MAX_PROGRESSION_DIRECTIVES: usize = 10;
+
+/// The week's block intent for the design ([C4.3] → [C5.3]): a deload block overrides progression.
+///
+/// Only programme mode resolves a block, because only a filled slot says which week the user is in.
+/// An ad-hoc session — including a deliberate one-off under an active programme — progresses
+/// ordinarily, which is consistent with it leaving every slot untouched.
+fn block_intent(db: &Database, mode: &TrainingMode) -> anyhow::Result<BlockIntent> {
+    let TrainingMode::Programme { programme, slot } = mode else { return Ok(BlockIntent::Ordinary) };
+    Ok(BlockIntent::of_block(db.block_for_week(programme.id, slot.week_idx)?.as_ref()))
+}
+
+/// Focus terms for science retrieval, from the programme slot and the block covering it. Split into
+/// words because the corpus matches whole tags: "weeks 5-6: deload" contributes `deload`, which is
+/// corpus vocabulary, and the rest scores nothing. This is what puts the deload science in front of
+/// the model on the week it matters.
+fn focus_terms(mode: &TrainingMode, block: &BlockIntent) -> Vec<String> {
+    let slot_focus = match mode {
+        TrainingMode::Programme { slot, .. } => slot.focus.as_str(),
+        TrainingMode::AdHoc { .. } => "",
+    };
+    let block_focus = match block {
+        BlockIntent::Deload { focus } => focus.as_str(),
+        BlockIntent::Ordinary => "",
+    };
+    [slot_focus, block_focus]
+        .iter()
+        .flat_map(|text| text.split(|c: char| !c.is_alphanumeric() && c != '_'))
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .fold(Vec::new(), |mut terms, word| {
+            if !terms.contains(&word) {
+                terms.push(word);
+            }
+            terms
+        })
+}
+
+/// One session's sets for one exercise, grouped by exercise_type across all of the session's
+/// entries — an exercise revisited later in the session is one outing, not two.
+fn sets_by_exercise(entries: &[EntryWithSets]) -> Vec<(i64, Vec<ExerciseSet>)> {
+    let mut order: Vec<i64> = Vec::new();
+    let mut grouped: BTreeMap<i64, Vec<ExerciseSet>> = BTreeMap::new();
+    for (_entry, sets) in entries {
+        for set in sets {
+            if !order.contains(&set.exercise_type_id) {
+                order.push(set.exercise_type_id);
+            }
+            grouped.entry(set.exercise_type_id).or_default().push(set.clone());
+        }
+    }
+    order.into_iter().filter_map(|id| grouped.remove(&id).map(|sets| (id, sets))).collect()
+}
+
+/// Roll one exercise's sets in one session up into the [`Outing`] the policy reads: the top set's
+/// load and reps, and the **hardest** effort across the working sets.
+///
+/// The hardest rather than the mean, deliberately: one set taken to failure is the fact that decides
+/// whether more load is safe next time, and averaging it against two easy sets hides it.
+fn build_outing(date: &str, sets: &[ExerciseSet], prescribed: Option<&RosterExercise>) -> Option<Outing> {
+    let top = top_set(sets)?;
+    let effort = sets.iter().map(|s| s.perceived_difficulty).max_by_key(|d| d.rank())?;
+    Some(Outing {
+        date: date.to_string(),
+        load: top.value,
+        reps: top.count,
+        effort,
+        target_reps: prescribed.and_then(|re| re.target_reps),
+        target_load: prescribed.and_then(|re| re.target_weight_kg),
+    })
+}
+
 /// Compose the [`ScienceQuery`] for this design ([C5.2]).
 ///
 /// Goal kinds go in **priority order** ([C3.1]) — the ordering *is* the resolution mechanism, so a
@@ -204,7 +353,9 @@ const COMPETING_GOALS_DOC: &str = "competing-goals";
 ///
 /// Nothing here decides *how* goals combine; that judgement lives in the corpus, which is where it
 /// can be reviewed as science.
-fn science_query(goals: &[GoalProgress], injuries: &[HealthEntry], guidance: &str) -> ScienceQuery {
+/// `focus` carries the programme slot's and block's focus words ([C4.3]), so a week the programme
+/// calls a deload pulls the deload science in on its own weight rather than needing a pin.
+fn science_query(goals: &[GoalProgress], injuries: &[HealthEntry], guidance: &str, focus: Vec<String>) -> ScienceQuery {
     let goal_kinds = distinct_kinds_by_priority(goals);
     let prescriptions = goal_kinds.iter().map(|kind| prescription_doc(*kind).to_string());
     let resolution = (goal_kinds.len() > 1).then(|| COMPETING_GOALS_DOC.to_string());
@@ -212,7 +363,7 @@ fn science_query(goals: &[GoalProgress], injuries: &[HealthEntry], guidance: &st
         injuries: injuries.iter().filter_map(|e| e.body_part.as_deref()).filter_map(normalise_body_part).collect(),
         pinned_docs: prescriptions.chain(resolution).collect(),
         guidance: guidance.to_string(),
-        focus: Vec::new(),
+        focus,
         goal_kinds,
     }
 }
@@ -818,7 +969,7 @@ mod tests {
         seed_goal_of_kind(&db, user_id, crate::db::GoalKind::BodyComposition, 8, "body_fat_pct");
 
         let goals = db.goal_progress_report(user_id, None, None).unwrap();
-        let query = science_query(&goals, &[], "");
+        let query = science_query(&goals, &[], "", Vec::new());
 
         assert_eq!(query.goal_kinds, [crate::db::GoalKind::BodyComposition, crate::db::GoalKind::Strength]);
         // Each kind's prescription in priority order, then the resolution — none of them left to
@@ -836,7 +987,7 @@ mod tests {
         seed_goal_of_kind(&db, user_id, crate::db::GoalKind::BodyComposition, 3, "body_fat_pct");
 
         let goals = db.goal_progress_report(user_id, None, None).unwrap();
-        let query = science_query(&goals, &[], "");
+        let query = science_query(&goals, &[], "", Vec::new());
         assert_eq!(query.pinned_docs, ["goal-body-composition", "goal-body-composition", COMPETING_GOALS_DOC]);
 
         let hits = crate::science::ScienceIndex::build().unwrap().search(&query, 4);
@@ -855,7 +1006,7 @@ mod tests {
 
         let goals = db.goal_progress_report(user_id, None, None).unwrap();
         assert_eq!(goals.len(), 2, "both goals should be active");
-        let query = science_query(&goals, &[], "");
+        let query = science_query(&goals, &[], "", Vec::new());
         assert_eq!(query.goal_kinds, [crate::db::GoalKind::Strength]);
         assert_eq!(query.pinned_docs, ["goal-strength"], "the prescription is pinned; the resolution is not, since nothing competes");
     }
@@ -868,7 +1019,7 @@ mod tests {
             e
         };
         let injuries = [entry(Some("lower back")), entry(Some("elbow")), entry(Some("aura")), entry(None)];
-        assert_eq!(science_query(&[], &injuries, "").injuries, ["lower_back", "elbow"]);
+        assert_eq!(science_query(&[], &injuries, "", Vec::new()).injuries, ["lower_back", "elbow"]);
     }
 
     #[test]

@@ -1,8 +1,10 @@
 use chrono::NaiveDate;
 
 use crate::db::{
-    ExerciseSet, ExerciseTypeWithAncestry, GoalProgress, HealthEntry, MeasurementType, MuscleRecovery, Session, SessionSummary,
+    Difficulty, ExerciseSet, ExerciseTypeWithAncestry, GoalProgress, HealthEntry, MeasurementType, MuscleRecovery, Session,
+    SessionSummary,
 };
+use crate::progression::{BlockIntent, ProgressionAction, ProgressionDirective, ProgressionPolicy, reps_in_reserve};
 use crate::science::ScienceChunk;
 
 pub struct PromptContext {
@@ -457,33 +459,49 @@ to save, keep `actions` empty and ask the next question.",
     )
 }
 
+/// Everything [`build_designer_prompt`] reads. A struct rather than a parameter list because the
+/// designer draws on eight distinct inputs, several of them string blocks, and a positional call of
+/// that length is one transposition away from a prompt that is wrong in a way no type catches.
+pub struct DesignerInputs<'a> {
+    /// The user's distilled training philosophy, or an empty string when they have none yet.
+    pub philosophy: &'a str,
+    /// The pre-formatted RECENT HISTORY block (the caller holds the catalogue to resolve names).
+    pub history: &'a str,
+    /// The pre-formatted MUSCLE RECOVERY block.
+    pub recovery: &'a str,
+    pub goals: &'a [GoalProgress],
+    pub health_entries: &'a [HealthEntry],
+    /// What retrieval returned for this design ([C5.2]).
+    pub science: &'a [ScienceChunk],
+    /// The computed progressive-overload policy ([C5.3]).
+    pub progression: &'a ProgressionPolicy,
+    pub catalogue: &'a [ExerciseTypeWithAncestry],
+}
+
 /// System prompt for `/nextworkout`: design ONE tailored training session from the
-/// user's philosophy, recent history, goals, injuries, and the curated training
-/// science retrieved for them. It advertises ONLY the `propose_session_roster` action —
-/// the design is a proposal and logs nothing. Exercise selection follows the spec's
-/// decreasing priority order (goal contribution, done before, longest-rested muscles,
-/// philosophy fit, health issues, temporary requests); lower rungs break ties rather
-/// than veto, except active health issues, which stay a hard constraint.
+/// user's philosophy, recent history, goals, injuries, the curated training science
+/// retrieved for them, and the computed progression policy. It advertises ONLY the
+/// `propose_session_roster` action — the design is a proposal and logs nothing.
+/// Exercise selection follows the spec's decreasing priority order (goal contribution,
+/// done before, longest-rested muscles, philosophy fit, health issues, temporary
+/// requests); lower rungs break ties rather than veto, except active health issues,
+/// which stay a hard constraint.
 ///
-/// `history` is a pre-formatted block (the caller has the catalogue to resolve
-/// names); `philosophy` is the distilled philosophy text or a short placeholder.
-/// `science` is what [`crate::science::ScienceIndex::search`] returned for this user
-/// ([C5.2]) — it narrows the *prescription* (rep ranges, intensity, rest, volume)
+/// `science` ([C5.2]) narrows the *prescription* — rep ranges, intensity, rest, volume —
 /// while the model still chooses the exercises, which is where the adaptivity lives.
-/// An empty slice degrades to the pre-[C5.2] prompt rather than asserting bands the
-/// prompt does not carry.
-pub fn build_designer_prompt(
-    philosophy: &str,
-    history: &str,
-    recovery: &str,
-    goals: &[GoalProgress],
-    health_entries: &[HealthEntry],
-    science: &[ScienceChunk],
-    catalogue: &[ExerciseTypeWithAncestry],
-) -> String {
+/// `progression` ([C5.3]) fixes the *loads*, per exercise, from what the user actually
+/// logged; the prompt carries it as a binding instruction rather than leaving the model
+/// to infer progression from the history block.
+///
+/// Both degrade gracefully: an empty `science` drops back to the pre-[C5.2] prompt and
+/// an empty `progression` to a conservative starting rule, rather than asserting bands
+/// or loads the prompt does not actually carry.
+pub fn build_designer_prompt(input: &DesignerInputs<'_>) -> String {
+    let DesignerInputs { philosophy, history, recovery, goals, health_entries, science, progression, catalogue } = *input;
     let goals_section = format_active_goals(goals);
     let competing_section = format_competing_goals(goals);
     let science_section = format_training_science(science);
+    let progression_section = format_progression_policy(progression);
     let health_section = format_health_entries(health_entries);
     let exercise_list = format_exercise_list(catalogue);
 
@@ -512,13 +530,13 @@ the lower back is flaring).\n\
 HOW TO DESIGN (reason like a real trainer):\n\
 - Honour the EQUIPMENT in the philosophy and its weight limits — never prescribe a weight the \
 user cannot load, or equipment they do not have.\n\
-- Use RECENT HISTORY to set weights: if the last sets of an exercise were easy, progress the \
-load; if they were hard or to failure, hold or back off. Avoid repeating yesterday's heavy work.\n\
+{progression_rule}\
 - Pick 3-6 exercises. For each, prescribe target sets and target reps (or seconds for timed work) \
 and a target weight within the user's equipment limits. Add a short per-exercise cue when useful.\n\
 \n\
 {philosophy_section}\n\
 {history}\n\
+{progression_section}\
 {recovery}\n\
 {goals_section}\n\
 {competing_section}\
@@ -547,7 +565,85 @@ AVAILABLE EXERCISES:\n\
 {exercise_list}",
         philosophy_section = format_philosophy_section(philosophy),
         science_rule = science_rule(science),
+        progression_rule = progression_rule(progression),
     )
+}
+
+/// The HOW TO DESIGN bullet governing load selection ([C5.3]).
+///
+/// With a computed policy this points at it and says it is binding; with none — a user with no
+/// logged history at all — it falls back to the conservative starting rule. It deliberately does
+/// *not* fall back to the old "if the last sets were easy, progress the load" heuristic: that
+/// sentence was the entire progression model this ticket exists to replace, and leaving it in place
+/// for the empty case would leave a second, weaker policy in the prompt to contradict the first.
+fn progression_rule(progression: &ProgressionPolicy) -> String {
+    if progression.is_empty() {
+        return "- The user has no logged history to progress from. Prescribe conservative loads they can \
+finish with 2-3 reps in reserve, and treat this session as calibration rather than a test.\n"
+            .to_string();
+    }
+    "- Set every load from the PROGRESSION POLICY section below. It is COMPUTED from what the user \
+actually logged — performance against prescription, and effort per set — and it is BINDING, not \
+advisory. Do not add load to an exercise it marks HOLD, BACK OFF or DELOAD, and do not exceed the \
+load it states for one marked PROGRESS. Use your own judgement only for exercises it does not list. \
+Avoid repeating yesterday's heavy work.\n"
+        .to_string()
+}
+
+/// The PROGRESSION POLICY section: the per-exercise directives [`crate::progression`] computed,
+/// plus the reading of the effort scale they were derived under.
+///
+/// Rendered as instructions rather than as data, because the model's job here is to apply a
+/// decision that has already been made, not to re-derive it. The reasons travel with the directives
+/// so the rationale the user reads can explain *why* the load moved, which is the difference
+/// between a coach and a number generator.
+fn format_progression_policy(progression: &ProgressionPolicy) -> String {
+    if progression.is_empty() {
+        return String::new();
+    }
+
+    let header = match &progression.block {
+        BlockIntent::Deload { focus } => format!(
+            "PROGRESSION POLICY — DELOAD WEEK (programme block: \"{focus}\"):\n\
+This week's block calls a deload, which OVERRIDES ordinary progression. Hold the loads below and \
+cut the working sets by about a third. Adding load during a deload week misreads the week's \
+purpose. Say in the rationale that this is a deload and what it is for.\n"
+        ),
+        BlockIntent::Ordinary => "PROGRESSION POLICY (computed from logged performance and per-set effort; \
+implements [S:progressive-overload]):\n"
+            .to_string(),
+    };
+
+    let effort_scale = format!(
+        "Effort is logged on a four-point scale; read it as repetitions in reserve — easy = {}, medium = {}, \
+hard = {}, failure = {}.\n",
+        reps_in_reserve(Difficulty::Easy),
+        reps_in_reserve(Difficulty::Medium),
+        reps_in_reserve(Difficulty::Hard),
+        reps_in_reserve(Difficulty::Failure),
+    );
+
+    let lines: String = progression.directives.iter().map(|d| format!("{}\n", format_directive(d))).collect();
+    let advice = match &progression.deload_advice {
+        Some(text) => format!("\nACCUMULATED FATIGUE: {text}\n"),
+        None => String::new(),
+    };
+    let unlisted = "\nAn exercise not listed above has no logged history to progress from: prescribe a load the \
+user can finish with 2-3 reps in reserve and treat it as calibration.\n";
+
+    format!("{header}{effort_scale}\n{lines}{advice}{unlisted}\n")
+}
+
+/// One directive as the prompt states it: verb, exercise, the loads, and the reasoning.
+fn format_directive(d: &ProgressionDirective) -> String {
+    let show = |v: f64| d.measurement_type.describe_value(v);
+    let movement = match &d.action {
+        ProgressionAction::Progress { from, to } | ProgressionAction::BackOff { from, to } => {
+            format!("{} -> {}", show(*from), show(*to))
+        }
+        ProgressionAction::Hold { at } | ProgressionAction::Deload { at } => format!("at {}", show(*at)),
+    };
+    format!("- {}: {} {movement} ({}; {})", d.exercise_name, d.action.verb(), d.class.label(), d.reason)
 }
 
 /// The paragraph that tells the designer what to do with the TRAINING SCIENCE section. Absent when
@@ -996,6 +1092,7 @@ pub fn capitalize(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::db::{ExerciseLevel, ExerciseType, Goal, GoalDirection, GoalKind, GoalProgress, GoalStatus};
+    use crate::progression::ExerciseClass;
     use crate::db::{HealthEntry, HealthEntryType, MeasurementType, Session};
 
     fn make_exercise_type(id: i64, name: &str, aliases: &str, muscle_group: &str, mt: MeasurementType) -> ExerciseTypeWithAncestry {
@@ -1311,15 +1408,40 @@ mod tests {
     }
 
     fn designer_prompt_for(goals: &[GoalProgress], health_entries: &[HealthEntry], science: &[ScienceChunk]) -> String {
-        build_designer_prompt(
-            "goal=hypertrophy. Home gym: dumbbells up to 24kg.",
-            "RECENT HISTORY: No recent workouts\n",
-            "MUSCLE RECOVERY: no muscle groups on record.\n",
+        designer_prompt_with(goals, health_entries, science, &empty_policy())
+    }
+
+    fn designer_prompt_with(
+        goals: &[GoalProgress],
+        health_entries: &[HealthEntry],
+        science: &[ScienceChunk],
+        progression: &ProgressionPolicy,
+    ) -> String {
+        build_designer_prompt(&DesignerInputs {
+            philosophy: "goal=hypertrophy. Home gym: dumbbells up to 24kg.",
+            history: "RECENT HISTORY: No recent workouts\n",
+            recovery: "MUSCLE RECOVERY: no muscle groups on record.\n",
             goals,
             health_entries,
             science,
-            &base_context().exercise_types,
-        )
+            progression,
+            catalogue: &base_context().exercise_types,
+        })
+    }
+
+    /// A user with no logged history: the designer still runs, on the conservative fallback rule.
+    fn empty_policy() -> ProgressionPolicy {
+        ProgressionPolicy { block: BlockIntent::Ordinary, directives: Vec::new(), deload_advice: None }
+    }
+
+    fn directive(name: &str, action: ProgressionAction) -> ProgressionDirective {
+        ProgressionDirective {
+            exercise_name: name.to_string(),
+            class: ExerciseClass::UpperBodyCompound,
+            measurement_type: MeasurementType::WeightReps,
+            action,
+            reason: "test fixture".to_string(),
+        }
     }
 
     /// A goal of `kind` at `priority`, denominated in `subject` — enough of a [`GoalProgress`] for
@@ -1582,5 +1704,115 @@ mod tests {
         let summary = SessionSummary { session, exercise_count: 3, duration_mins: Some(60) };
         let text = format_recent_history(&[summary], &[], &[]);
         assert!(text.contains("- 2026-03-20 09:00:00 [completed]: 3 entries (60 min) — overall hard, felt good"), "{text}");
+    }
+
+    // ── Progressive overload policy [C5.3] ────────────────────────────────────
+
+    /// The sentence this ticket exists to delete. Its survival anywhere in the designer prompt
+    /// would leave a second, vaguer progression model contradicting the computed one.
+    #[test]
+    fn the_old_one_line_progression_heuristic_is_gone() {
+        let with_policy = designer_prompt_with(
+            &[],
+            &[],
+            &[],
+            &ProgressionPolicy {
+                block: BlockIntent::Ordinary,
+                directives: vec![directive("Bench Press", ProgressionAction::Progress { from: 60.0, to: 62.5 })],
+                deload_advice: None,
+            },
+        );
+        for prompt in [designer_prompt(&[]), with_policy] {
+            assert!(
+                !prompt.contains("if the last sets of an exercise were easy, progress the"),
+                "the pre-[C5.3] heuristic must not survive:\n{prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_computed_policy_reaches_the_prompt_as_a_binding_rule() {
+        let prompt = designer_prompt_with(
+            &[],
+            &[],
+            &[],
+            &ProgressionPolicy {
+                block: BlockIntent::Ordinary,
+                directives: vec![
+                    directive("Bench Press", ProgressionAction::Progress { from: 60.0, to: 62.5 }),
+                    directive("Squat", ProgressionAction::Hold { at: 90.0 }),
+                    directive("Lateral Raise", ProgressionAction::BackOff { from: 14.0, to: 12.0 }),
+                ],
+                deload_advice: None,
+            },
+        );
+
+        assert!(prompt.contains("PROGRESSION POLICY"), "the section must be present:\n{prompt}");
+        assert!(prompt.contains("it is BINDING, not advisory"), "the rule must bind the model, not suggest to it");
+        assert!(prompt.contains("- Bench Press: PROGRESS 60.0kg -> 62.5kg"), "an earned increment states both loads:\n{prompt}");
+        assert!(prompt.contains("- Squat: HOLD at 90.0kg"));
+        assert!(prompt.contains("- Lateral Raise: BACK OFF 14.0kg -> 12.0kg"), "backing off is as explicit as progressing");
+        // The RPE/RIR answer ([C3.3]): the four-point scale, read as reps in reserve.
+        assert!(prompt.contains("easy = 4+ RIR") && prompt.contains("failure = 0 RIR"), "the effort→RIR reading must reach the model");
+    }
+
+    /// A deload block overrides progression, and the prompt has to say so where the model will act
+    /// on it — next to the loads, not only in the retrieved science.
+    #[test]
+    fn a_deload_block_overrides_progression_in_the_prompt() {
+        let prompt = designer_prompt_with(
+            &[],
+            &[],
+            &[],
+            &ProgressionPolicy {
+                block: BlockIntent::Deload { focus: "deload".to_string() },
+                directives: vec![directive("Bench Press", ProgressionAction::Deload { at: 60.0 })],
+                deload_advice: None,
+            },
+        );
+        assert!(prompt.contains("PROGRESSION POLICY — DELOAD WEEK"), "the deload must head the section:\n{prompt}");
+        assert!(prompt.contains("OVERRIDES ordinary progression"));
+        assert!(prompt.contains("cut the working sets by about a third"));
+        assert!(prompt.contains("- Bench Press: DELOAD at 60.0kg"));
+    }
+
+    #[test]
+    fn accumulated_back_off_advice_is_surfaced_when_present() {
+        let prompt = designer_prompt_with(
+            &[],
+            &[],
+            &[],
+            &ProgressionPolicy {
+                block: BlockIntent::Ordinary,
+                directives: vec![directive("Bench Press", ProgressionAction::BackOff { from: 60.0, to: 55.0 })],
+                deload_advice: Some("2 of 3 exercises are backing off at once.".to_string()),
+            },
+        );
+        assert!(prompt.contains("ACCUMULATED FATIGUE: 2 of 3 exercises are backing off"), "{prompt}");
+    }
+
+    /// A user with nothing logged gets a conservative starting rule and no empty section claiming a
+    /// policy the prompt does not carry.
+    #[test]
+    fn no_history_yields_a_conservative_fallback_and_no_empty_section() {
+        let prompt = designer_prompt(&[]);
+        assert!(!prompt.contains("PROGRESSION POLICY"), "an empty policy must not render a section:\n{prompt}");
+        assert!(prompt.contains("no logged history to progress from"));
+        assert!(prompt.contains("2-3 reps in reserve"));
+    }
+
+    /// Timed work progresses in seconds, not kilograms: the directive renders through the
+    /// measurement type rather than assuming load.
+    #[test]
+    fn a_timed_exercise_directive_renders_in_its_own_unit() {
+        let mut plank = directive("Plank", ProgressionAction::Progress { from: 60.0, to: 63.0 });
+        plank.measurement_type = MeasurementType::TimeBased;
+        plank.class = ExerciseClass::Conditioning;
+        let prompt = designer_prompt_with(&[], &[], &[], &ProgressionPolicy {
+            block: BlockIntent::Ordinary,
+            directives: vec![plank],
+            deload_advice: None,
+        });
+        assert!(prompt.contains("- Plank: PROGRESS 60s -> 63s"), "timed work must not be described in kg:\n{prompt}");
     }
 }

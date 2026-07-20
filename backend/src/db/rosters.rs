@@ -164,6 +164,18 @@ impl Database {
         self.set_slot_status(slot_id, SlotStatus::Filled)
     }
 
+    /// The roster that was bound to `session_id`, if the session ran against one. The inverse of
+    /// [`bind_roster_to_session`](Self::bind_roster_to_session), and how the progression policy
+    /// ([C5.3]) recovers what a past session was *prescribed* in order to judge what it achieved.
+    /// A session logged without a design has none, which is ordinary — ad-hoc training is
+    /// first-class.
+    pub fn roster_for_session(&self, session_id: i64) -> anyhow::Result<Option<SessionRoster>> {
+        let sql = format!("{SELECT_ROSTER} WHERE session_id = ?1 ORDER BY updated_at DESC, id DESC LIMIT 1");
+        let mut stmt = self.conn().prepare(&sql)?;
+        let mut rows = stmt.query_map(params![session_id], row_to_roster)?;
+        rows.next().transpose().context("Failed to read roster for session")
+    }
+
     /// The roster that filled `slot_id`, if one has.
     pub fn roster_for_slot(&self, slot_id: i64) -> anyhow::Result<Option<SessionRoster>> {
         let sql = format!("{SELECT_ROSTER} WHERE programme_slot_id = ?1 ORDER BY created_at DESC, id DESC LIMIT 1");
