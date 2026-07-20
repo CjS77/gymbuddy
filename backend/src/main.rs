@@ -170,6 +170,30 @@ async fn serve(config_path: &Path) -> anyhow::Result<()> {
     }
 }
 
+/// Stop `serve` before it opens a schema v1 database.
+///
+/// `Database::open` migrates whatever it is given to the latest schema it knows, and the schema it
+/// knows is now v2 — which starts its migration numbering again from 1. Run against a legacy file
+/// that would not upgrade it; it would build the v2 tables alongside the v1 ones and leave a
+/// database belonging to neither generation, in place, over the only copy of the user's history.
+///
+/// So migrating is an explicit, separate act: `gymbuddy migrate` writes a new file and never
+/// touches the old one, which is therefore its own rollback. All this has to do is make sure the
+/// implicit path is never taken by accident.
+fn refuse_legacy_database(db_path: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !dump::is_legacy_database(db_path)?,
+        "{} is a legacy (schema v1) database and this build serves schema v2.\n\
+         Migrate it first — the original file is left untouched:\n\n    \
+         gymbuddy migrate --db {} --out {}\n\n\
+         Then point the config at the new file.",
+        db_path.display(),
+        db_path.display(),
+        db_path.with_extension("v2.db").display(),
+    );
+    Ok(())
+}
+
 async fn setup(
     config_path: &Path,
 ) -> anyhow::Result<(Option<TelegramClient>, AssistantHandler, Vec<i64>, Option<VoicePipeline>, GymConfig)> {
@@ -206,6 +230,7 @@ async fn setup(
 
     // 3. Open database
     let db_path = data_dir.join(&gym_config.db_path);
+    refuse_legacy_database(&db_path)?;
     tracing::info!("Loading database from {}", db_path.display());
     let db = Database::open(&db_path)?;
     let db = Arc::new(Mutex::new(db));

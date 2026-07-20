@@ -51,11 +51,21 @@ pub fn seeded_v1_db() -> Connection {
     conn
 }
 
+/// An empty, fully-migrated v1 database written to `path`.
+///
+/// The file-backed counterpart of [`empty_v1_db`], and the only way to get one now that
+/// `Database::open` builds schema v2: a test that wants a *legacy* file on disk has to reach for
+/// these frozen migrations explicitly.
+pub fn empty_v1_db_at(path: &Path) -> Connection {
+    let mut conn = Connection::open(path).expect("creating the fixture database file");
+    V1_MIGRATIONS.to_latest(&mut conn).expect("applying the v1 fixture migrations");
+    conn
+}
+
 /// The same fixture written to `path`, for tests that need a file — the CLI, and anything asserting
 /// that an export leaves its source untouched.
 pub fn seeded_v1_db_at(path: &Path) {
-    let mut conn = Connection::open(path).expect("creating the fixture database file");
-    V1_MIGRATIONS.to_latest(&mut conn).expect("applying the v1 fixture migrations");
+    let conn = empty_v1_db_at(path);
     conn.execute_batch(V1_SEED).expect("seeding the v1 fixture");
 }
 

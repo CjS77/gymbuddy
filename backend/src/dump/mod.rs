@@ -113,7 +113,7 @@ use rusqlite::{Connection, OpenFlags};
 
 pub use counts::RowCounts;
 pub use model::{DUMP_FORMAT, DUMP_VERSION, Dump};
-pub use probe::Generation;
+pub use probe::{Generation, is_legacy_database};
 
 impl Dump {
     /// How many rows this dump carries, per collection.

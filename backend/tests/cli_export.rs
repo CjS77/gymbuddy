@@ -9,17 +9,17 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
-use gymbuddy_backend::db::Database;
-
 mod fixtures;
 
 /// Path to the binary cargo built for this test run.
 const GYMBUDDY: &str = env!("CARGO_BIN_EXE_gymbuddy");
 
-/// A migrated-but-empty database. `Database::open` applies the v1 migration set, which is what the
-/// exporter should recognise.
+/// A migrated-but-empty legacy database, built from the frozen v1 fixture.
+///
+/// It cannot come from `Database::open` any more: that now builds schema v2, and this test needs
+/// the generation the exporter's v1 reader is for.
 fn v1_database(path: &Path) {
-    Database::open(path).expect("creating the fixture database");
+    fixtures::empty_v1_db_at(path);
 }
 
 /// Run `gymbuddy export` and return the parsed dump, failing loudly with the binary's own stderr.
@@ -97,6 +97,59 @@ fn import_and_migrate_are_wired_but_refuse_to_pretend() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("not implemented yet"), "`{name}` should say so plainly, got: {stderr}");
     }
+}
+
+/// The guard rail on the one irreversible mistake available here.
+///
+/// `serve` opens the database read-write and migrates it to the latest schema it knows. Pointed at
+/// a legacy file, a v2 build would create the v2 tables beside the v1 ones — in place, over the
+/// user's only copy. So it must stop, and it must say what to run instead.
+#[test]
+fn serve_refuses_to_start_on_a_legacy_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("gym.db");
+    fixtures::seeded_v1_db_at(&db);
+    let before = std::fs::metadata(&db).unwrap().len();
+
+    let config = dir.path().join("gymbuddy.toml");
+    std::fs::write(&config, config_pointing_at(dir.path(), "gym.db")).unwrap();
+
+    let output = Command::new(GYMBUDDY).args(["--config", config.to_str().unwrap(), "serve"]).output().expect("running gymbuddy serve");
+    assert!(!output.status.success(), "serving a legacy database must fail");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("legacy"), "the refusal should name the problem, got: {stderr}");
+    assert!(stderr.contains("gymbuddy migrate"), "the refusal should name the fix, got: {stderr}");
+    assert_eq!(std::fs::metadata(&db).unwrap().len(), before, "a refused start must not have touched the database");
+}
+
+/// A schema v2 database is served, not refused — the point of probing for a marker table rather
+/// than trusting `PRAGMA user_version`, which v1 and v2 both spell small.
+///
+/// Startup still fails here, but on the *next* step: this config configures no transport. That the
+/// error is about transports and not about the schema is the whole assertion.
+#[test]
+fn serve_gets_past_the_schema_check_on_a_v2_database() {
+    let dir = tempfile::tempdir().unwrap();
+    gymbuddy_backend::db::Database::open(&dir.path().join("gym.db")).expect("creating a v2 database");
+
+    let config = dir.path().join("gymbuddy.toml");
+    std::fs::write(&config, config_pointing_at(dir.path(), "gym.db")).unwrap();
+
+    let output = Command::new(GYMBUDDY).args(["--config", config.to_str().unwrap(), "serve"]).output().expect("running gymbuddy serve");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("legacy"), "a v2 database must not be mistaken for a legacy one, got: {stderr}");
+    assert!(stderr.contains("no transport configured"), "startup should have reached the transport check, got: {stderr}");
+}
+
+/// The smallest config that gets `serve` as far as opening the database.
+fn config_pointing_at(data_dir: &Path, db_name: &str) -> String {
+    format!(
+        "[general]\ndata_dir = \"{}\"\n\n\
+         [llm]\nprovider = \"openai-compatible\"\nbase_url = \"http://127.0.0.1:1\"\nmodel = \"test-model\"\napi_key = \"test-key\"\n\n\
+         [gym]\ndb_path = \"{db_name}\"\n",
+        data_dir.display()
+    )
 }
 
 #[test]

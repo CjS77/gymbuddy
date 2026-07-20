@@ -1,12 +1,21 @@
 -- =============================================================================
--- Initial taxonomy seed
+-- Catalogue seed: the baseline exercise taxonomy
 -- =============================================================================
--- The exercise taxonomy is seeded inline at the bottom of this file using stable ID ranges:
+-- The taxonomy a brand-new database starts with, at stable ids:
 --
 --     1 .. 99       muscle_group
 --     100 .. 999    specific_muscle
 --     1000 .. 9999  exercise
 --     10000 ..      variation
+--
+-- THIS FILE IS THE BASELINE, NOT THE PLACE TO ADD EXERCISES. Schema v1 grew a
+-- migration per new exercise (mig 04 and mig 06 carried one row each), which
+-- turned a data edit into a schema change. Additions now live in
+-- `backend/catalogue/` and are applied at startup with `INSERT OR IGNORE`,
+-- idempotent on `UNIQUE (parent_id, name)`. Add a row there; leave this frozen.
+--
+-- The id ranges above are what makes that work: catalogue files address their
+-- parents by number, so these numbers must not be reassigned.
 -- =============================================================================
 
 -- ============================================
