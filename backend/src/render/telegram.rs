@@ -4,7 +4,8 @@
 //! the Telegram bot is visually unchanged — locked down by golden tests below.
 
 use gymbuddy_proto::{
-    CatalogView, HistoryView, PROGRAMME_LOCK_IN_ASK, ProgrammeView, Render, SessionRosterView, SetLine, StatusView, TrainingModeView, View,
+    CatalogView, HistoryView, PROGRAMME_LOCK_IN_ASK, ProgrammeView, ProgressView, Render, SeriesShape, SeriesView, SessionRosterView,
+    SetLine, StatusView, TrainingModeView, View,
 };
 
 /// The Telegram renderer. `Output` is `(text, parse_mode)` — `parse_mode` is
@@ -24,6 +25,7 @@ impl Render for Telegram {
             View::SessionRoster(roster) => (render_session_roster(roster, None), Some("HTML")),
             View::ProgrammeSessionRoster { roster, mode } => (render_session_roster(roster, Some(mode)), Some("HTML")),
             View::Programme(programme) => (render_programme(programme), Some("HTML")),
+            View::Progress(progress) => (render_progress(progress), Some("HTML")),
             View::Timers { enabled } => (format!("Rest timers are now {}.", if *enabled { "on" } else { "off" }), None),
             // `View` is `#[non_exhaustive]`: a variant from a newer server lands here.
             // Degrade to plain text rather than sending Telegram an empty message
@@ -211,6 +213,79 @@ fn render_programme(p: &ProgrammeView) -> String {
     result
 }
 
+/// How wide a [`SeriesShape::Breakdown`] bar may grow. Telegram wraps on narrow
+/// phones, so the bar has to fit beside its label rather than fill a terminal.
+const BAR_WIDTH: usize = 12;
+
+/// Render progress ([C6.2]): the headline, then one block per series, then any
+/// caveats. Telegram cannot draw, so the series arrive as text — but the choice of
+/// text is made per *shape*, not per metric, which is what stops this growing a
+/// branch every time Core adds something to chart.
+fn render_progress(p: &ProgressView) -> String {
+    let mut result = format!("<b>{}</b>\n", escape_html(&p.summary_line()));
+    result.extend(p.series.iter().map(|series| format!("\n{}", render_series(series))));
+
+    if !p.notes.is_empty() {
+        result.push_str("\n<b>Notes:</b>\n");
+        result.extend(p.notes.iter().map(|note| format!("- {}\n", escape_html(note))));
+    }
+    result
+}
+
+/// One series: a title, then the shape's own rendering.
+fn render_series(s: &SeriesView) -> String {
+    let body = match s.shape {
+        SeriesShape::Breakdown => render_bars(s),
+        SeriesShape::Trend | SeriesShape::Trajectory { .. } => render_trend(s),
+    };
+    format!("<b>{}</b>\n{body}", escape_html(&s.title))
+}
+
+/// A time-ordered series as a unicode sparkline plus its movement.
+///
+/// The sparkline is `<code>`-wrapped so Telegram renders the blocks in a monospace
+/// run; the verdict on the movement is in words (from `change_line`), never in the
+/// shape of the line — a falling series can be progress ([C6.2]).
+fn render_trend(s: &SeriesView) -> String {
+    let Some(latest) = s.latest() else {
+        return "No readings yet.\n".to_string();
+    };
+
+    let mut out = format!("<code>{}</code>\n", s.spark());
+    match s.change_line() {
+        // Too short to have moved: report where it stands instead of nothing.
+        line if line.is_empty() => out.push_str(&format!("{}\n", escape_html(&s.latest_line()))),
+        line => out.push_str(&format!("{}\n", escape_html(&line))),
+    }
+    if !s.target_line().is_empty() {
+        out.push_str(&format!("{}\n", escape_html(&s.target_line())));
+    }
+    if let Some(first) = s.points.first()
+        && first.label != latest.label
+    {
+        out.push_str(&format!("<i>{} to {}</i>\n", escape_html(&first.label), escape_html(&latest.label)));
+    }
+    out
+}
+
+/// Independent buckets as proportional bars, scaled to the largest. A breakdown has
+/// no time order, so it gets no sparkline and no trend line.
+fn render_bars(s: &SeriesView) -> String {
+    let Some((_, max)) = s.bounds() else {
+        return "No readings yet.\n".to_string();
+    };
+    let width = s.points.iter().map(|p| p.label.chars().count()).max().unwrap_or(0);
+
+    s.points
+        .iter()
+        .map(|p| {
+            let filled = if max <= 0.0 { 0 } else { ((p.value / max) * BAR_WIDTH as f64).round() as usize };
+            let bar = "█".repeat(filled.min(BAR_WIDTH));
+            format!("<code>{:<width$} {bar:<BAR_WIDTH$}</code> {}\n", escape_html(&p.label), escape_html(&s.value_label(p.value)))
+        })
+        .collect()
+}
+
 /// Compact rendering of one set ("8×80kg", "30s", …) shared with every client via
 /// [`SetLine::compact`](gymbuddy_proto::SetLine::compact).
 fn joined_sets(sets: &[SetLine]) -> String {
@@ -229,7 +304,7 @@ pub(crate) fn escape_html(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gymbuddy_proto::{CatalogEntry, CatalogGroup, ExerciseLog, HealthNote, Measurement, SessionView};
+    use gymbuddy_proto::{CatalogEntry, CatalogGroup, Direction, ExerciseLog, HealthNote, Measurement, SeriesPointView, SessionView};
 
     fn set(count: Option<u32>, value: f64) -> SetLine {
         SetLine { measurement: Measurement::WeightReps, count, value }
@@ -388,6 +463,102 @@ mod tests {
                         1. <b>Bench Press</b> — 3 sets × 6 reps @ 65kg\n\
                         \nNothing is logged yet -- log your sets as you go and I'll adjust.";
         assert_eq!(html, expected);
+    }
+
+    fn points(raw: &[(&str, f64)]) -> Vec<SeriesPointView> {
+        raw.iter().map(|(label, value)| SeriesPointView { label: (*label).into(), value: *value }).collect()
+    }
+
+    /// [C6.2]: a trend arrives as a sparkline, its movement, its target and the span
+    /// the readings cover.
+    #[test]
+    fn progress_html_renders_a_trend_block() {
+        let view = View::Progress(ProgressView {
+            headline: "2 of 3 goals on track".into(),
+            series: vec![SeriesView {
+                title: "Bench Press".into(),
+                unit: "kg".into(),
+                better: Direction::Higher,
+                shape: SeriesShape::Trajectory { target: 100.0 },
+                points: points(&[("2026-05-01", 80.0), ("2026-06-01", 85.0), ("2026-07-01", 92.5)]),
+            }],
+            notes: vec!["Squat has too few sessions to trend.".into()],
+        });
+        let (html, mode) = Telegram.render(&view);
+        assert_eq!(mode, Some("HTML"));
+        let expected = "<b>2 of 3 goals on track</b>\n\
+                        \n<b>Bench Press</b>\n\
+                        <code>▁▄█</code>\n\
+                        80 → 92.5 kg (+12.5, better)\n\
+                        Target: 100 kg\n\
+                        <i>2026-05-01 to 2026-07-01</i>\n\
+                        \n<b>Notes:</b>\n\
+                        - Squat has too few sessions to trend.\n";
+        assert_eq!(html, expected);
+    }
+
+    /// The [C6.2] rule that makes the whole contract worth having: "better" is the
+    /// series' own, not the direction of the line. A cut's bodyweight falls, and that
+    /// is progress — the sparkline still slopes down, because that is what was logged.
+    #[test]
+    fn a_falling_series_can_still_read_as_progress() {
+        let view = View::Progress(ProgressView {
+            headline: "Cutting".into(),
+            series: vec![SeriesView {
+                title: "Bodyweight".into(),
+                unit: "kg".into(),
+                better: Direction::Lower,
+                shape: SeriesShape::Trend,
+                points: points(&[("2026-05-01", 90.0), ("2026-06-01", 87.5)]),
+            }],
+            notes: vec![],
+        });
+        let (html, _) = Telegram.render(&view);
+        assert!(html.contains("90 → 87.5 kg (-2.5, better)"), "got: {html}");
+        assert!(html.contains("<code>█▁</code>"), "the readings are plotted as logged: {html}");
+    }
+
+    /// A breakdown gets bars scaled to its largest bucket — and no trend line, since
+    /// its buckets are not ordered in time.
+    #[test]
+    fn progress_html_bars_scale_to_the_largest_bucket() {
+        let view = View::Progress(ProgressView {
+            headline: "This week".into(),
+            series: vec![SeriesView {
+                title: "Volume by group".into(),
+                unit: "sets".into(),
+                better: Direction::Neutral,
+                shape: SeriesShape::Breakdown,
+                points: points(&[("Chest", 12.0), ("Back", 16.0), ("Legs", 9.0)]),
+            }],
+            notes: vec![],
+        });
+        let (html, _) = Telegram.render(&view);
+        // Labels are padded to a common width, and the largest bucket fills the bar.
+        assert!(html.contains("<code>Back  ████████████</code> 16 sets\n"), "got: {html}");
+        assert!(html.contains("<code>Chest █████████   </code> 12 sets\n"), "got: {html}");
+        assert!(html.contains("<code>Legs  ███████     </code> 9 sets\n"), "got: {html}");
+        assert!(!html.contains('→'), "a breakdown has no trend to report: {html}");
+    }
+
+    #[test]
+    fn progress_html_escapes_titles_labels_and_notes() {
+        let view = View::Progress(ProgressView {
+            headline: "Progress & <goals>".into(),
+            series: vec![SeriesView {
+                title: "Row <wide> & narrow".into(),
+                unit: "kg".into(),
+                better: Direction::Neutral,
+                shape: SeriesShape::Breakdown,
+                points: points(&[("A & B", 5.0)]),
+            }],
+            notes: vec!["<not markup>".into()],
+        });
+        let (html, _) = Telegram.render(&view);
+        assert!(html.contains("Progress &amp; &lt;goals&gt;"), "got: {html}");
+        assert!(html.contains("Row &lt;wide&gt; &amp; narrow"), "got: {html}");
+        assert!(html.contains("A &amp; B"), "got: {html}");
+        assert!(html.contains("- &lt;not markup&gt;"), "got: {html}");
     }
 
     /// [C1.4]: an explicit one-off during an active programme says so, and says the

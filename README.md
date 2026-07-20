@@ -181,6 +181,22 @@ must not rewrite it.
 *Not to be confused with the Session verdict* (`overall_effort`, `felt`, `cut_short`), which is a handful of
 structured fields on the Session itself, captured at session end.
 
+**Series** — one chartable run of numbers, and the only chart contract GymBuddy has. Type `SeriesView` in
+`crates/proto/src/view.rs`, carried by `View::Progress` and reused wherever a chart is warranted. Exercise
+progression, muscle-group volume, goal trajectory and body metrics are all Series; **Core ships the data and each
+client plots it**, so there is no server-side chart. Not persisted — a Series is recomputed from the DAOs on demand,
+and the DB-side `TimeSeries` aggregate is a separate, internal thing.
+
+**Direction** — which way "better" runs for a Series: `Higher`, `Lower` or `Neutral`. Type `Direction`, carried on
+the wire because it *cannot be derived from the numbers*: 90 → 85 kg is progress on a cut and a regression on a bulk,
+and only the server knows which goal the Series was drawn for. `improving()` applies it, and answers `None` when
+there is genuinely no verdict. Distinct from **GoalDirection** (`increase`/`decrease`), the stored column on a Goal
+that a Series' Direction is usually derived from.
+
+**SeriesShape** — what kind of chart a Series wants: `Trend` (time-ordered), `Trajectory` (time-ordered against a
+target) or `Breakdown` (independent buckets). A client writes one renderer per shape and is then done — a new metric
+of a known shape needs no client change. It is the *shape of the data*, never a widget name.
+
 ### Reference data
 
 **ExerciseType** — one exercise in the taxonomy ("Barbell Bench Press"), with a parent, a level and a measurement

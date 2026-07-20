@@ -5,8 +5,8 @@
 //! which clashes with the flowing transcript).
 
 use gymbuddy_proto::{
-    CatalogView, ExerciseLog, HistoryView, PROGRAMME_LOCK_IN_ASK, ProgrammeView, SessionRosterView, SetLine, StatusView, TrainingModeView,
-    View,
+    CatalogView, ExerciseLog, HistoryView, PROGRAMME_LOCK_IN_ASK, ProgrammeView, ProgressView, SeriesShape, SeriesView, SessionRosterView,
+    SetLine, StatusView, TrainingModeView, View,
 };
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -29,6 +29,7 @@ pub fn render_view(view: &View) -> Vec<Line<'static>> {
         View::SessionRoster(roster) => render_session_roster(roster, None),
         View::ProgrammeSessionRoster { roster, mode } => render_session_roster(roster, Some(mode)),
         View::Programme(programme) => render_programme(programme),
+        View::Progress(progress) => render_progress(progress),
         View::Timers { enabled } => vec![Line::from(Span::styled(
             format!("Rest timers {}", if *enabled { "on" } else { "off" }),
             Style::default().fg(if *enabled { SUCCESS } else { MUTED }).add_modifier(Modifier::BOLD),
@@ -220,6 +221,104 @@ fn render_programme(p: &ProgrammeView) -> Vec<Line<'static>> {
     lines
 }
 
+/// How wide a [`SeriesShape::Breakdown`] bar may grow. The transcript has more room
+/// than a Telegram bubble, but still shares the line with a label and a value.
+const BAR_WIDTH: usize = 20;
+
+/// Render progress ([C6.2]) as sparklines and text.
+///
+/// Real ratatui `Chart`/`Sparkline` widgets are [T2.2]; this shows the same series
+/// those charts will be drawn from, with one rendering per *shape* rather than per
+/// metric — a new Core metric of a known shape needs nothing here.
+fn render_progress(p: &ProgressView) -> Vec<Line<'static>> {
+    let mut lines = vec![heading(p.summary_line())];
+    lines.extend(p.series.iter().flat_map(|s| std::iter::once(Line::from("")).chain(render_series(s))));
+
+    if !p.notes.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(bold("Notes"));
+        lines.extend(
+            p.notes.iter().map(|n| Line::from(vec![Span::styled("  • ", Style::default().fg(MUTED)), Span::raw(n.clone())])),
+        );
+    }
+    lines
+}
+
+/// One series: its title, then whatever its shape calls for.
+fn render_series(s: &SeriesView) -> Vec<Line<'static>> {
+    let mut lines = vec![bold(&s.title)];
+    match s.shape {
+        SeriesShape::Breakdown => lines.extend(render_bars(s)),
+        SeriesShape::Trend | SeriesShape::Trajectory { .. } => lines.extend(render_trend(s)),
+    }
+    lines
+}
+
+/// A time-ordered series as a sparkline plus its movement and target.
+///
+/// The sparkline plots the readings as recorded — a cut's bodyweight slopes down.
+/// Whether that is progress is said in the movement line's words *and* its colour;
+/// the words are what carry it, since a 16-colour terminal may render both verdicts
+/// alike.
+fn render_trend(s: &SeriesView) -> Vec<Line<'static>> {
+    let Some(latest) = s.latest() else {
+        return vec![muted("  No readings yet".into())];
+    };
+
+    let movement = match s.change_line() {
+        // Too short to have moved — say where it stands rather than nothing.
+        line if line.is_empty() => s.latest_line(),
+        line => line,
+    };
+    let mut lines = vec![
+        Line::from(vec![Span::raw("  "), Span::styled(s.spark(), Style::default().fg(ACCENT))]),
+        Line::from(vec![Span::raw("  "), Span::styled(movement, Style::default().fg(verdict_colour(s)))]),
+    ];
+
+    if !s.target_line().is_empty() {
+        lines.push(muted(format!("  {}", s.target_line())));
+    }
+    if let Some(first) = s.points.first()
+        && first.label != latest.label
+    {
+        lines.push(muted(format!("  {} to {}", first.label, latest.label)));
+    }
+    lines
+}
+
+/// Independent buckets as proportional bars, scaled to the largest. A breakdown has
+/// no time order, so no sparkline and no trend line.
+fn render_bars(s: &SeriesView) -> Vec<Line<'static>> {
+    let Some((_, max)) = s.bounds() else {
+        return vec![muted("  No readings yet".into())];
+    };
+    let width = s.points.iter().map(|p| p.label.chars().count()).max().unwrap_or(0);
+
+    s.points
+        .iter()
+        .map(|p| {
+            let filled = if max <= 0.0 { 0 } else { ((p.value / max) * BAR_WIDTH as f64).round() as usize };
+            Line::from(vec![
+                Span::raw(format!("  {:<width$} ", p.label)),
+                Span::styled("█".repeat(filled.min(BAR_WIDTH)), Style::default().fg(ACCENT)),
+                Span::raw(format!(" {}", s.value_label(p.value))),
+            ])
+        })
+        .collect()
+}
+
+/// The colour for a series' movement: its own [`SeriesView::improving`] verdict, never
+/// the direction the line happens to run. A series with no verdict stays muted rather
+/// than being guessed at.
+fn verdict_colour(s: &SeriesView) -> Color {
+    match s.improving() {
+        Some(true) => SUCCESS,
+        // A regression is information, not a failure — yellow, not red.
+        Some(false) => WARNING,
+        None => MUTED,
+    }
+}
+
 fn exercise_bullet(log: &ExerciseLog, index: Option<usize>) -> Line<'static> {
     let bullet = match index {
         Some(i) => format!("  {i}. "),
@@ -330,6 +429,92 @@ mod tests {
 
         let ad_hoc = View::ProgrammeSessionRoster { roster, mode: TrainingModeView::AdHoc { programme_title: "12-week".into() } };
         assert!(flat(&render_view(&ad_hoc)).contains("Ad-hoc session — 12-week is untouched"));
+    }
+
+    fn series_points(raw: &[(&str, f64)]) -> Vec<gymbuddy_proto::SeriesPointView> {
+        raw.iter().map(|(label, value)| gymbuddy_proto::SeriesPointView { label: (*label).into(), value: *value }).collect()
+    }
+
+    /// [C6.2]: a trend shows the sparkline, the movement, the target and the span.
+    #[test]
+    fn progress_renders_a_trend_with_its_target() {
+        use gymbuddy_proto::{Direction, ProgressView, SeriesShape, SeriesView};
+        let view = View::Progress(ProgressView {
+            headline: "2 of 3 goals on track".into(),
+            series: vec![SeriesView {
+                title: "Bench Press".into(),
+                unit: "kg".into(),
+                better: Direction::Higher,
+                shape: SeriesShape::Trajectory { target: 100.0 },
+                points: series_points(&[("2026-05-01", 80.0), ("2026-06-01", 85.0), ("2026-07-01", 92.5)]),
+            }],
+            notes: vec!["Squat has too few sessions to trend.".into()],
+        });
+        let text = flat(&render_view(&view));
+        assert!(text.contains("2 of 3 goals on track"));
+        assert!(text.contains("Bench Press"));
+        assert!(text.contains("▁▄█"));
+        assert!(text.contains("80 → 92.5 kg (+12.5, better)"));
+        assert!(text.contains("Target: 100 kg"));
+        assert!(text.contains("2026-05-01 to 2026-07-01"));
+        assert!(text.contains("Squat has too few sessions to trend."));
+        assert!(!text.contains('<'), "no HTML markup should appear: {text}");
+    }
+
+    /// The direction-aware rule [T2.2] turns on: falling bodyweight on a cut is
+    /// progress, so it is coloured as success — while the sparkline still slopes down,
+    /// because that is what the user logged.
+    #[test]
+    fn a_falling_series_that_is_progress_is_not_coloured_as_a_regression() {
+        use gymbuddy_proto::{Direction, ProgressView, SeriesShape, SeriesView};
+        let series = SeriesView {
+            title: "Bodyweight".into(),
+            unit: "kg".into(),
+            better: Direction::Lower,
+            shape: SeriesShape::Trend,
+            points: series_points(&[("2026-05-01", 90.0), ("2026-06-01", 87.5)]),
+        };
+        let lines = render_view(&View::Progress(ProgressView {
+            headline: "Cutting".into(),
+            series: vec![series.clone()],
+            notes: vec![],
+        }));
+        let text = flat(&lines);
+        assert!(text.contains("█▁"), "the readings are plotted as logged: {text}");
+        assert!(text.contains("90 → 87.5 kg (-2.5, better)"), "got: {text}");
+
+        let movement = lines.iter().find(|l| flat(std::slice::from_ref(l)).contains("→")).expect("a movement line");
+        assert_eq!(movement.spans.last().unwrap().style.fg, Some(SUCCESS), "losing weight on a cut is progress, not a regression");
+
+        // The same numbers with the opposite goal are a regression, and say so.
+        let bulking = SeriesView { better: Direction::Higher, ..series };
+        let text = flat(&render_view(&View::Progress(ProgressView {
+            headline: "Bulking".into(),
+            series: vec![bulking],
+            notes: vec![],
+        })));
+        assert!(text.contains("(-2.5, worse)"), "got: {text}");
+    }
+
+    /// A breakdown is bars, not a trend — its buckets carry no time order.
+    #[test]
+    fn progress_renders_a_breakdown_as_bars() {
+        use gymbuddy_proto::{Direction, ProgressView, SeriesShape, SeriesView};
+        let view = View::Progress(ProgressView {
+            headline: "This week".into(),
+            series: vec![SeriesView {
+                title: "Volume by group".into(),
+                unit: "sets".into(),
+                better: Direction::Neutral,
+                shape: SeriesShape::Breakdown,
+                points: series_points(&[("Chest", 12.0), ("Back", 16.0), ("Legs", 9.0)]),
+            }],
+            notes: vec![],
+        });
+        let text = flat(&render_view(&view));
+        assert!(text.contains(&format!("Back  {} 16 sets", "█".repeat(20))), "the largest bucket fills the bar: {text}");
+        assert!(text.contains(&format!("Chest {} 12 sets", "█".repeat(15))), "got: {text}");
+        assert!(!text.contains('→'), "a breakdown has no trend to report: {text}");
     }
 
     #[test]
