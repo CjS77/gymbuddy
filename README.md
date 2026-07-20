@@ -19,7 +19,7 @@ science corpus rather than the model's unaided recall, and in a long-term progra
 | `crates/timer/`   | Rest-timer core                                                                           |
 | `services/`       | Piper (TTS) and Whisper (ASR) sidecars                                                    |
 
-Clients reach the server over [confide](../confide), an encrypted p2p transport.
+Clients reach the server over [confide](https://github.com/CjS77/confide), an encrypted p2p transport.
 
 ## Nomenclature
 
