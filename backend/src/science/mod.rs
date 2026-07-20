@@ -50,6 +50,11 @@ pub mod retrieval;
 
 pub use retrieval::{ScienceIndex, ScienceQuery, normalise_body_part};
 
+/// The five [`GoalKind`] variants, for exhaustive iteration in tests and callers that must cover
+/// every kind. Routed through the same exhaustive matches as [`goal_kind_tag`].
+pub const GOAL_KINDS: [GoalKind; 5] =
+    [GoalKind::Strength, GoalKind::Endurance, GoalKind::Bodyweight, GoalKind::BodyComposition, GoalKind::Habit];
+
 static SCIENCE_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/science");
 
 /// Prefix marking a tag as an injury body part, as in `injury:lower_back`.
@@ -95,6 +100,26 @@ pub const GOAL_KIND_TAGS: [&str; 5] = [
     goal_kind_tag(GoalKind::BodyComposition),
     goal_kind_tag(GoalKind::Habit),
 ];
+
+/// The document that carries the canonical prescription for a goal kind — the rep ranges,
+/// intensities, rest intervals and frequencies a session for that goal must land inside ([C5.2]).
+///
+/// Named rather than retrieved. Tags say a document *mentions* strength; only the corpus's own
+/// structure says which document *prescribes* for it, and a prescription that reaches the designer
+/// only when it happens to out-rank a general document is not a prescription the designer can be
+/// held to. `bodyweight` and `body_composition` share a document because they share a prescription
+/// and differ only in how progress is read — which is that document's opening section.
+///
+/// Exhaustive by construction, like [`goal_kind_tag`]: a new `GoalKind` variant fails to compile
+/// here until the corpus has something to say about it.
+pub const fn prescription_doc(kind: GoalKind) -> &'static str {
+    match kind {
+        GoalKind::Strength => "goal-strength",
+        GoalKind::Endurance => "goal-endurance",
+        GoalKind::Bodyweight | GoalKind::BodyComposition => "goal-body-composition",
+        GoalKind::Habit => "goal-habit",
+    }
+}
 
 /// The tag spelling of a goal kind. Exhaustive by construction — adding a `GoalKind` variant fails to
 /// compile here until the corpus vocabulary accounts for it.

@@ -138,6 +138,28 @@ fn goal_kind_tags_are_exactly_the_goal_kind_variants() {
     assert_eq!(GOAL_KIND_TAGS.len(), kinds.len());
 }
 
+/// [C5.2] names a prescription document per goal kind rather than retrieving one. That naming is
+/// only safe while every id it returns exists, carries the goal kind's own tag, and actually
+/// prescribes — otherwise the designer is pinned to a document that says nothing useful.
+#[test]
+fn every_goal_kind_names_a_prescription_document_that_exists_and_prescribes() {
+    GOAL_KINDS.iter().for_each(|kind| {
+        let id = prescription_doc(*kind);
+        let found = doc(id).unwrap_or_else(|| panic!("{kind:?} names `{id}`, which is not in the corpus"));
+        assert!(found.has_tag(goal_kind_tag(*kind)), "`{id}` must be tagged for {kind:?}, or retrieval and naming disagree");
+        assert!(
+            found.chunks.iter().any(|c| c.heading.to_lowercase().contains("prescription")),
+            "`{id}` has no prescription section"
+        );
+    });
+}
+
+#[test]
+fn goal_kinds_lists_every_variant_once() {
+    assert_eq!(GOAL_KINDS.len(), GOAL_KIND_TAGS.len());
+    assert!(GOAL_KINDS.iter().all(|kind| GOAL_KIND_TAGS.contains(&goal_kind_tag(*kind))));
+}
+
 #[test]
 fn muscle_group_tags_are_the_catalogue_groups() {
     // The seven `muscle_group` rows seeded by migration 02-exercises, lowercased.

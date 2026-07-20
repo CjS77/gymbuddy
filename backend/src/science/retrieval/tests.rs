@@ -41,6 +41,17 @@ fn prescription_chunks_win_their_document() {
     assert_eq!(strength.heading, "Prescription summary", "the prescribing chunk is the one worth prompt budget");
 }
 
+/// `goal-body-composition` opens with "Two goal kinds, one prescription", which *introduces* the
+/// bands, and states them two chunks later under a bare "Prescription". Quoting the introduction
+/// would put a section header's worth of framing in the prompt where the numbers should be.
+#[test]
+fn a_heading_that_is_a_prescription_beats_one_that_mentions_prescriptions() {
+    let hits = index().search(&goal_query(GoalKind::BodyComposition), 4);
+    let doc = hits.iter().find(|c| c.doc_id == "goal-body-composition").expect("goal-body-composition retrieved");
+    assert_eq!(doc.heading, "Prescription");
+    assert!(doc.text.contains("6-12"), "the chosen chunk should carry the repetition band, not the framing");
+}
+
 #[test]
 fn evidence_caveats_never_stand_in_for_a_prescription() {
     let hits = index().search(&goal_query(GoalKind::Strength), 8);

@@ -3,6 +3,7 @@ use chrono::NaiveDate;
 use crate::db::{
     ExerciseSet, ExerciseTypeWithAncestry, GoalProgress, HealthEntry, MeasurementType, MuscleRecovery, Session, SessionSummary,
 };
+use crate::science::ScienceChunk;
 
 pub struct PromptContext {
     pub user_name: String,
@@ -460,31 +461,42 @@ to save, keep `actions` empty and ask the next question.",
 }
 
 /// System prompt for `/nextworkout`: design ONE tailored training session from the
-/// user's philosophy, recent history, goals, and injuries. It advertises ONLY the
-/// `propose_workout` action — the design is a proposal and logs nothing. Exercise
-/// selection follows the spec's decreasing priority order (goal contribution, done
-/// before, longest-rested muscles, philosophy fit, health issues, temporary
-/// requests); lower rungs break ties rather than veto, except active health issues,
-/// which stay a hard constraint. `history` is a pre-formatted block (the caller has
-/// the catalogue to resolve names); `philosophy` is the distilled philosophy text
-/// or a short placeholder.
+/// user's philosophy, recent history, goals, injuries, and the curated training
+/// science retrieved for them. It advertises ONLY the `propose_workout` action — the
+/// design is a proposal and logs nothing. Exercise selection follows the spec's
+/// decreasing priority order (goal contribution, done before, longest-rested muscles,
+/// philosophy fit, health issues, temporary requests); lower rungs break ties rather
+/// than veto, except active health issues, which stay a hard constraint.
+///
+/// `history` is a pre-formatted block (the caller has the catalogue to resolve
+/// names); `philosophy` is the distilled philosophy text or a short placeholder.
+/// `science` is what [`crate::science::ScienceIndex::search`] returned for this user
+/// ([C5.2]) — it narrows the *prescription* (rep ranges, intensity, rest, volume)
+/// while the model still chooses the exercises, which is where the adaptivity lives.
+/// An empty slice degrades to the pre-[C5.2] prompt rather than asserting bands the
+/// prompt does not carry.
 pub fn build_designer_prompt(
     philosophy: &str,
     history: &str,
     recovery: &str,
     goals: &[GoalProgress],
     health_entries: &[HealthEntry],
+    science: &[ScienceChunk],
     catalogue: &[ExerciseTypeWithAncestry],
 ) -> String {
     let goals_section = format_active_goals(goals);
+    let competing_section = format_competing_goals(goals);
+    let science_section = format_training_science(science);
     let health_section = format_health_entries(health_entries);
     let exercise_list = format_exercise_list(catalogue);
 
     format!(
         "You are a personal gym trainer DESIGNING one training session for the user right now. \
-Draw on your own expertise PLUS the user-specific information below to produce a highly tailored, \
-specific session that pushes the user toward their goals. You are only designing a plan — you do \
+Produce a highly tailored, specific session that pushes the user toward their goals, from the \
+TRAINING SCIENCE and the user-specific information below. You are only designing a plan — you do \
 NOT log any sets and do NOT start a session.\n\
+\n\
+{science_rule}\
 \n\
 SELECTION PRIORITY — rank candidate exercises by these criteria, in DECREASING priority:\n\
 1. Contribution to the user's ACTIVE GOALS.\n\
@@ -512,7 +524,9 @@ and a target weight within the user's equipment limits. Add a short per-exercise
 {history}\n\
 {recovery}\n\
 {goals_section}\n\
+{competing_section}\
 {health_section}\n\
+{science_section}\
 RESPONSE FORMAT: You MUST respond with ONLY a JSON object. No text before or after.\n\
 {{\n\
   \"message\": \"<one or two sentences introducing the session>\",\n\
@@ -522,7 +536,8 @@ RESPONSE FORMAT: You MUST respond with ONLY a JSON object. No text before or aft
 You MUST emit EXACTLY ONE action, of type propose_workout:\n\
 - {{\"type\": \"propose_workout\", \"title\": \"<short session title>\", \
 \"rationale\": \"<2-4 sentences that MUST name which SELECTION PRIORITY items drove today's \
-picks (e.g. goal contribution, longest-rested muscles), plus any injury substitutions and why>\", \
+picks (e.g. goal contribution, longest-rested muscles), plus any injury substitutions and why, \
+plus the [S:doc-id] marker of every TRAINING SCIENCE item that shaped the prescription>\", \
 \"exercises\": [{{\"exercise\": \"<EXACT NAME>\", \"target_sets\": N, \"target_reps\": N, \
 \"target_weight_kg\": N.N, \"target_secs\": N, \"notes\": \"<short cue, optional>\"}}, ...]}}\n\
   Use `target_secs` instead of reps/weight for timed exercises. Omit fields that do not apply.\n\
@@ -534,7 +549,108 @@ choose the closest available exercise and note the substitution in the rationale
 AVAILABLE EXERCISES:\n\
 {exercise_list}",
         philosophy_section = format_philosophy_section(philosophy),
+        science_rule = science_rule(science),
     )
+}
+
+/// The paragraph that tells the designer what to do with the TRAINING SCIENCE section. Absent when
+/// retrieval came back empty, because a rule pointing at a section that is not there is worse than
+/// no rule — the model invents the section.
+fn science_rule(science: &[ScienceChunk]) -> String {
+    if science.is_empty() {
+        return String::new();
+    }
+    "TRAINING SCIENCE IS THE AUTHORITY ON PRESCRIPTION. The TRAINING SCIENCE section below is \
+curated, human-reviewed exercise science. Its repetition ranges, intensities, rest intervals and \
+volumes are CONSTRAINTS your prescription MUST fall inside — prefer them over your own recall \
+wherever the two differ, and do not substitute a remembered protocol for a stated band. It does \
+NOT tell you WHICH exercises to choose: that is your job, from the user-specific information \
+below. Where it gives a range, land inside the range; where it says a beginner differs, use the \
+beginner figure if the philosophy or history says the user is one. Cite the [S:doc-id] marker of \
+whatever you applied.\n"
+        .to_string()
+}
+
+/// Rough token estimate for budgeting a prompt block: ~4 chars per token. Only needs to be
+/// monotonic and in the right ballpark, not exact.
+pub(crate) fn estimate_tokens(s: &str) -> usize {
+    s.len().div_ceil(4)
+}
+
+/// Upper bound (estimated tokens) on the whole TRAINING SCIENCE block, bounding it the way the
+/// history block is bounded. Sized for roughly four chunks of curated prose — a corpus section runs
+/// 150-300 words.
+const SCIENCE_TOKEN_BUDGET: usize = 1200;
+
+/// The TRAINING SCIENCE section: the retrieved chunks, each under its citation marker, bounded by
+/// [`SCIENCE_TOKEN_BUDGET`].
+///
+/// Chunks arrive best-first with any pinned rails at the head ([`crate::science::ScienceQuery`]),
+/// so truncation drops the least important science, never a rail. A dropped chunk is announced
+/// rather than silently omitted: a prompt that quietly shrinks under load is a prompt whose
+/// behaviour cannot be reasoned about from its inputs.
+fn format_training_science(science: &[ScienceChunk]) -> String {
+    if science.is_empty() {
+        return String::new();
+    }
+
+    let header = "TRAINING SCIENCE (curated, human-reviewed; cite as [S:doc-id]):\n";
+    let rendered = science.iter().map(|c| format!("{} {}\n{}\n", c.citation, c.heading, c.text));
+
+    // The first block always survives: a TRAINING SCIENCE section holding nothing but a truncation
+    // note is strictly worse than the pre-[C5.2] prompt, which at least did not claim to be grounded.
+    let mut used = estimate_tokens(header);
+    let kept: Vec<String> = rendered
+        .enumerate()
+        .take_while(|(idx, block)| {
+            used += estimate_tokens(block);
+            *idx == 0 || used <= SCIENCE_TOKEN_BUDGET
+        })
+        .map(|(_, block)| block)
+        .collect();
+
+    let dropped = science.len() - kept.len();
+    let note = match dropped {
+        0 => String::new(),
+        n => format!("({n} further science excerpt(s) omitted to fit the prompt budget.)\n"),
+    };
+    format!("{header}\n{}{note}\n", kept.join("\n"))
+}
+
+/// The COMPETING GOALS block, rendered only when the user holds goals of more than one kind — one
+/// kind cannot compete with itself, and a resolution rule for a non-conflict is noise.
+///
+/// The block states the priority ordering and the one rule the ticket turns on (resolve by
+/// priority, never by averaging); *how* particular pairs combine stays in the corpus, where it can
+/// be reviewed as science rather than edited as prompt text. The caller pins `competing-goals` into
+/// retrieval whenever this block renders, so the detail is always present to be applied.
+fn format_competing_goals(goals: &[GoalProgress]) -> String {
+    let ranked = goals_by_priority(goals);
+    let Some(first) = ranked.first() else { return String::new() };
+    if ranked.iter().all(|gp| gp.goal.kind == first.goal.kind) {
+        return String::new();
+    }
+
+    let lines = ranked.iter().enumerate().map(|(idx, gp)| {
+        format!("{}. {} — {} (priority {})\n", idx + 1, gp.goal.kind.as_str(), gp.exercise_name, gp.goal.priority)
+    });
+    format!(
+        "COMPETING GOALS (highest priority first):\n{}\
+These goals pull in different directions. Resolve them by the PRIORITY ORDER ABOVE, applying the \
+curated resolution in TRAINING SCIENCE ([S:competing-goals]) — do NOT average them into a middle \
+that serves neither. The highest-priority goal governs this session's prescription; the rest are \
+served by what is left. Say in the rationale which goal this session prioritises and what that \
+costs the other.\n\n",
+        lines.collect::<String>()
+    )
+}
+
+/// Active goals highest-priority first ([C3.1]). Ties keep the caller's order, which
+/// `goal_progress_report` returns deterministically, so the prompt is stable run to run.
+pub fn goals_by_priority(goals: &[GoalProgress]) -> Vec<&GoalProgress> {
+    let mut ranked: Vec<&GoalProgress> = goals.iter().collect();
+    ranked.sort_by_key(|gp| std::cmp::Reverse(gp.goal.priority));
+    ranked
 }
 
 /// The MUSCLE RECOVERY section for the designer prompt: every muscle group, ordered
@@ -1101,14 +1217,179 @@ mod tests {
     }
 
     fn designer_prompt(health_entries: &[HealthEntry]) -> String {
+        designer_prompt_for(&[], health_entries, &[])
+    }
+
+    fn designer_prompt_for(goals: &[GoalProgress], health_entries: &[HealthEntry], science: &[ScienceChunk]) -> String {
         build_designer_prompt(
             "goal=hypertrophy. Home gym: dumbbells up to 24kg.",
             "RECENT HISTORY: No recent workouts\n",
             "MUSCLE RECOVERY: no muscle groups on record.\n",
-            &[],
+            goals,
             health_entries,
+            science,
             &base_context().exercise_types,
         )
+    }
+
+    /// A goal of `kind` at `priority`, denominated in `subject` — enough of a [`GoalProgress`] for
+    /// the prompt layer, which reads only kind, priority and the display name.
+    fn goal(kind: GoalKind, priority: i64, subject: &str) -> GoalProgress {
+        GoalProgress {
+            goal: Goal {
+                id: 1,
+                user_id: 1,
+                kind,
+                exercise_type_id: Some(1),
+                metric: None,
+                target_value: 100.0,
+                direction: GoalDirection::Increase,
+                priority,
+                start_date: "2026-01-01".to_string(),
+                target_date: None,
+                achieved: false,
+                notes: None,
+                created_at: "2026-01-01".to_string(),
+                updated_at: "2026-01-01".to_string(),
+            },
+            exercise_name: subject.to_string(),
+            status: GoalStatus::Active,
+            current_value: Some(80.0),
+            percentage: 80.0,
+        }
+    }
+
+    /// Retrieve for `goals` the way `/nextworkout` does, so a band test exercises the real path
+    /// from a goal kind to the prompt rather than a hand-assembled science block.
+    fn science_for(goals: &[GoalProgress]) -> Vec<ScienceChunk> {
+        let index = crate::science::ScienceIndex::build().unwrap();
+        let goal_kinds = goals_by_priority(goals).iter().map(|gp| gp.goal.kind).fold(Vec::new(), |mut kinds, kind| {
+            if !kinds.contains(&kind) {
+                kinds.push(kind);
+            }
+            kinds
+        });
+        let prescriptions = goal_kinds.iter().map(|k| crate::science::prescription_doc(*k).to_string());
+        let resolution = (goal_kinds.len() > 1).then(|| "competing-goals".to_string());
+        let pinned_docs = prescriptions.chain(resolution).collect();
+        index.search(&crate::science::ScienceQuery { goal_kinds, pinned_docs, ..Default::default() }, 4)
+    }
+
+    // ── Prescription bands ────────────────────────────────────────────────────
+    //
+    // The claim [C5.2] makes is that "is the science right" becomes a question with an answer.
+    // These tests are the narrow, honest version of that: they assert the *corpus's own* numbers
+    // for a goal kind survive retrieval, budgeting and formatting into the prompt the model reads.
+    // They do NOT assert the model obeys them, and they do not adjudicate the science — editing a
+    // band in `backend/science/` and updating the assertion here is a legitimate change, and the
+    // diff is where a human judges it. What they do buy: a band can no longer disappear from the
+    // prompt silently, which is the failure mode that leaves the designer running on model recall.
+
+    /// One goal kind, and the numbers the corpus prescribes for it that must reach the prompt.
+    const PRESCRIPTION_BANDS: [(GoalKind, &str, &[&str]); 5] = [
+        (GoalKind::Strength, "[S:goal-strength]", &["1-6 per working set", "80-90% of a one-rep maximum", "3-5 minutes"]),
+        (GoalKind::Endurance, "[S:goal-endurance]", &["15 or more per set", "below roughly 60%", "30-90 seconds"]),
+        (GoalKind::Bodyweight, "[S:goal-body-composition]", &["6-12", "0.5-1% of bodyweight per week", "1.6 g per kg"]),
+        (GoalKind::BodyComposition, "[S:goal-body-composition]", &["6-12", "0.5-1% of bodyweight per week", "1.6 g per kg"]),
+        (GoalKind::Habit, "[S:goal-habit]", &["Set the frequency at what will actually happen", "Anchor the behaviour to a cue"]),
+    ];
+
+    #[test]
+    fn every_goal_kind_lands_its_prescription_band_in_the_prompt() {
+        PRESCRIPTION_BANDS.iter().for_each(|(kind, citation, bands)| {
+            let goals = vec![goal(*kind, 0, "Bench Press")];
+            let prompt = designer_prompt_for(&goals, &[], &science_for(&goals));
+            assert!(prompt.contains("TRAINING SCIENCE"), "{kind:?}: no science section reached the prompt");
+            assert!(prompt.contains(citation), "{kind:?}: expected the {citation} document to be cited");
+            bands.iter().for_each(|band| {
+                assert!(prompt.contains(band), "{kind:?}: the prescribed band {band:?} never reached the prompt");
+            });
+        });
+    }
+
+    #[test]
+    fn the_science_section_is_framed_as_a_constraint_not_a_suggestion() {
+        let goals = vec![goal(GoalKind::Strength, 0, "Bench Press")];
+        let prompt = designer_prompt_for(&goals, &[], &science_for(&goals));
+        assert!(prompt.contains("CONSTRAINTS your prescription MUST fall inside"));
+        // The KB narrows the prescription; the LLM still picks the exercises — the adaptivity is
+        // the product, so the prompt must not read as a lookup table of workouts.
+        assert!(prompt.contains("It does NOT tell you WHICH exercises to choose"));
+        assert!(prompt.contains("[S:doc-id]"), "the model must be told how to cite");
+    }
+
+    #[test]
+    fn the_designer_no_longer_falls_back_on_its_own_expertise() {
+        let goals = vec![goal(GoalKind::Strength, 0, "Bench Press")];
+        let prompt = designer_prompt_for(&goals, &[], &science_for(&goals));
+        assert!(!prompt.contains("Draw on your own expertise"), "the pre-[C5.2] instruction must be gone");
+        assert!(prompt.contains("prefer them over your own recall"));
+    }
+
+    /// With no science retrieved the prompt degrades to its pre-[C5.2] shape rather than pointing
+    /// at a section that is not there — an instruction to obey absent bands invites invention.
+    #[test]
+    fn an_empty_science_result_leaves_no_dangling_reference() {
+        let prompt = designer_prompt_for(&[], &[], &[]);
+        assert!(!prompt.contains("TRAINING SCIENCE IS THE AUTHORITY"));
+        assert!(!prompt.contains("TRAINING SCIENCE (curated"));
+        assert!(prompt.contains("SELECTION PRIORITY"), "the rest of the designer prompt is unaffected");
+    }
+
+    // ── Competing goals ───────────────────────────────────────────────────────
+
+    #[test]
+    fn competing_goals_are_ranked_by_priority_and_resolved_not_averaged() {
+        // A strength goal and a fat-loss goal: the conflict the ticket names, with fat loss ranked
+        // higher, so the block must not simply echo the order the goals arrived in.
+        let goals = vec![goal(GoalKind::Strength, 1, "Bench Press"), goal(GoalKind::BodyComposition, 9, "body_fat_pct")];
+        let prompt = designer_prompt_for(&goals, &[], &science_for(&goals));
+
+        let block = prompt.split("COMPETING GOALS").nth(1).expect("a competing-goals block");
+        let first = block.find("body_composition").expect("the higher-priority goal is listed");
+        let second = block.find("strength").expect("the lower-priority goal is listed");
+        assert!(first < second, "goals must be listed highest-priority first:\n{block}");
+        assert!(block.contains("1. body_composition — body_fat_pct (priority 9)"));
+        assert!(block.contains("2. strength — Bench Press (priority 1)"));
+        assert!(block.contains("do NOT average them"));
+    }
+
+    /// The resolution rule is science, so it is pinned into retrieval rather than restated in the
+    /// prompt: ranking must never be able to drop it.
+    #[test]
+    fn competing_goals_pin_the_curated_resolution_into_the_prompt() {
+        let goals = vec![goal(GoalKind::Strength, 5, "Bench Press"), goal(GoalKind::BodyComposition, 1, "body_fat_pct")];
+        let prompt = designer_prompt_for(&goals, &[], &science_for(&goals));
+        assert!(prompt.contains("[S:competing-goals]"));
+        assert!(prompt.contains("Goals are resolved by **priority**, not by averaging"), "the corpus's own rule must be quoted");
+    }
+
+    #[test]
+    fn a_single_goal_kind_is_not_a_conflict() {
+        // Two strength goals are one kind of prescription. Rendering a resolution rule here would
+        // invite the model to trade one lift off against another for no reason.
+        let goals = vec![goal(GoalKind::Strength, 5, "Bench Press"), goal(GoalKind::Strength, 1, "Squat")];
+        let prompt = designer_prompt_for(&goals, &[], &science_for(&goals));
+        assert!(!prompt.contains("COMPETING GOALS"));
+    }
+
+    // ── Budget ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_science_block_is_capped_and_says_when_it_truncated() {
+        // Eight chunks of real corpus prose comfortably exceed the budget.
+        let science: Vec<ScienceChunk> = crate::science::all_chunks().take(8).map(|(_, chunk)| chunk.clone()).collect();
+        let block = format_training_science(&science);
+        assert!(estimate_tokens(&block) <= SCIENCE_TOKEN_BUDGET + estimate_tokens("(8 further science excerpt(s) omitted…)\n"));
+        assert!(block.contains("omitted to fit the prompt budget"), "truncation must be announced:\n{block}");
+    }
+
+    #[test]
+    fn a_pinned_rail_survives_the_budget() {
+        // Rails arrive first, so the block that is never dropped is the one at the head.
+        let science: Vec<ScienceChunk> = crate::science::all_chunks().take(8).map(|(_, chunk)| chunk.clone()).collect();
+        let block = format_training_science(&science);
+        assert!(block.contains(&science[0].heading), "the leading (pinned) excerpt must survive truncation");
     }
 
     #[test]

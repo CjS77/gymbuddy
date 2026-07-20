@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 use crate::config::GymConfig;
 use crate::db::{Database, ExerciseSet, ExerciseTypeWithAncestry, MeasurementType, User, new_user, new_user_with_pubkey};
 use crate::github::IssueReporter;
+use crate::science::ScienceIndex;
 use crate::telegram::Message as TgMessage;
 
 use super::parser::parse_assistant_response;
@@ -29,6 +30,10 @@ pub struct AssistantHandler {
     llm: Box<dyn LlmProvider>,
     config: GymConfig,
     catalogue: Vec<ExerciseTypeWithAncestry>,
+    /// Retrieval over the curated training-science corpus, built once and held for the
+    /// process's life exactly like `catalogue`. See `crate::science::retrieval` for what
+    /// [R5.1] swaps in behind it.
+    science: ScienceIndex,
     issue_reporter: Option<Arc<dyn IssueReporter>>,
 }
 
@@ -65,7 +70,8 @@ impl AssistantHandler {
         issue_reporter: Option<Arc<dyn IssueReporter>>,
     ) -> anyhow::Result<Self> {
         let catalogue = db.lock().await.list_exercise_types_with_ancestry()?;
-        Ok(Self { db, llm, config, catalogue, issue_reporter })
+        let science = ScienceIndex::build().context("building the training-science index")?;
+        Ok(Self { db, llm, config, catalogue, science, issue_reporter })
     }
 
     /// Process an incoming Telegram text message and return a reply.

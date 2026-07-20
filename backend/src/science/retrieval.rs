@@ -91,7 +91,16 @@ const FOCUS_WEIGHT: i32 = 8;
 /// than a single tag match on purpose: the tag vocabulary cannot tell a document *about* strength
 /// from one that merely mentions it, and of the two, the prescribing document is the one worth the
 /// prompt's budget. This is the crudest part of the placeholder; BM25 over chunk text is the answer.
+///
+/// Document-level and uniform: *whether* a document prescribes decides its rank, *which* of its
+/// chunks prescribes best decides only what is quoted from it ([`chunk_bonus`]). Letting the second
+/// question leak into the first made a document's rank depend on how its author phrased a heading.
 const PRESCRIPTION_BONUS: i32 = 10;
+/// Chunk-level preference for a heading that *is* a prescription ("Prescription", "Prescription
+/// summary") over one that merely mentions the word ("Two goal kinds, one prescription", which
+/// introduces the bands rather than stating them).
+const PRESCRIPTION_HEADING_BONUS: i32 = 10;
+const PRESCRIPTION_MENTION_BONUS: i32 = 7;
 /// A chunk of evidence caveats. Worth reading, worth curating, worth spending prompt budget on last.
 const CAVEAT_PENALTY: i32 = 6;
 
@@ -123,7 +132,15 @@ impl ScienceIndex {
     /// remainder, at most one per document, so four slots buy four perspectives rather than four
     /// paragraphs of the same paper.
     pub fn search(&self, query: &ScienceQuery, k: usize) -> Vec<ScienceChunk> {
-        let mut chosen: Vec<ScienceChunk> = query.pinned_docs.iter().filter_map(|id| self.best_chunk(id)).collect();
+        // Two goal kinds can name one document (`bodyweight` and `body_composition` share a
+        // prescription), so duplicates are dropped here rather than pushed onto every caller.
+        let pinned = &query.pinned_docs;
+        let mut chosen: Vec<ScienceChunk> = pinned
+            .iter()
+            .enumerate()
+            .filter(|(idx, id)| !pinned[..*idx].contains(id))
+            .filter_map(|(_, id)| self.best_chunk(id))
+            .collect();
 
         let mut ranked: Vec<(i32, &ScienceDoc, &ScienceChunk)> = self
             .docs
@@ -131,7 +148,7 @@ impl ScienceIndex {
             .map(|doc| (doc_score(doc, query), doc))
             .filter(|(score, _)| *score > 0)
             .filter(|(_, doc)| !query.pinned_docs.contains(&doc.id))
-            .filter_map(|(score, doc)| best_chunk_of(doc).map(|(bonus, chunk)| (score + bonus, doc, chunk)))
+            .filter_map(|(score, doc)| best_chunk_of(doc).map(|chunk| (score + prescribes(doc), doc, chunk)))
             .collect();
         // Highest score first; ties fall back to corpus order, which is filename order — stable
         // across runs, which matters because a prompt that changes shape run to run cannot be tested.
@@ -144,7 +161,7 @@ impl ScienceIndex {
     /// The highest-scoring chunk of a document named by id, if the id exists.
     fn best_chunk(&self, doc_id: &str) -> Option<ScienceChunk> {
         let doc = self.docs.iter().find(|doc| doc.id == doc_id)?;
-        best_chunk_of(doc).map(|(_, chunk)| chunk.clone())
+        best_chunk_of(doc).cloned()
     }
 
 }
@@ -164,21 +181,34 @@ fn goal_weight(rank: usize) -> i32 {
     (TOP_GOAL_WEIGHT - RANK_STEP * rank as i32).max(MIN_GOAL_WEIGHT)
 }
 
+/// Whether a document prescribes at all — the document-level half of the prescription signal.
+fn prescribes(doc: &ScienceDoc) -> i32 {
+    match doc.chunks.iter().any(|chunk| chunk.heading.to_lowercase().contains(PRESCRIPTION_HEADING)) {
+        true => PRESCRIPTION_BONUS,
+        false => 0,
+    }
+}
+
 /// The structural preference between chunks of one document, standing in for the relevance score a
-/// real index computes over chunk text: prescriptions first, evidence caveats last.
+/// real index computes over chunk text: the chunk that states the bands first, evidence caveats last.
 fn chunk_bonus(chunk: &ScienceChunk) -> i32 {
     let heading = chunk.heading.to_lowercase();
     match heading {
-        h if h.contains(PRESCRIPTION_HEADING) => PRESCRIPTION_BONUS,
+        h if h.starts_with(PRESCRIPTION_HEADING) => PRESCRIPTION_HEADING_BONUS,
+        h if h.contains(PRESCRIPTION_HEADING) => PRESCRIPTION_MENTION_BONUS,
         h if h.contains(CAVEAT_HEADING) => -CAVEAT_PENALTY,
         _ => 0,
     }
 }
 
-/// A document's most useful chunk and the bonus that earned it. Ties keep the earliest chunk, so a
-/// document with no prescription heading reads from the top.
-fn best_chunk_of(doc: &ScienceDoc) -> Option<(i32, &ScienceChunk)> {
-    doc.chunks.iter().map(|chunk| (chunk_bonus(chunk), chunk)).reduce(|best, next| if next.0 > best.0 { next } else { best })
+/// A document's most useful chunk. Ties keep the earliest, so a document with no prescription
+/// heading reads from the top.
+fn best_chunk_of(doc: &ScienceDoc) -> Option<&ScienceChunk> {
+    doc.chunks
+        .iter()
+        .map(|chunk| (chunk_bonus(chunk), chunk))
+        .reduce(|best, next| if next.0 > best.0 { next } else { best })
+        .map(|(_, chunk)| chunk)
 }
 
 #[cfg(test)]

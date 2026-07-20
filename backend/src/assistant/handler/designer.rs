@@ -1,6 +1,7 @@
 //! The `/nextworkout` designer: builds a tailored workout from philosophy,
-//! recent history, recovery, goals and injuries, persists it as a `proposed`
-//! plan, and bounds how long that proposal stays eligible to bind to a session.
+//! recent history, recovery, goals, injuries and the curated training science
+//! retrieved for them, persists it as a `proposed` plan, and bounds how long that
+//! proposal stays eligible to bind to a session.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -10,12 +11,13 @@ use chrono::NaiveDateTime;
 use crate::assistant::actions::{AssistantAction, ProposedExercise};
 use crate::assistant::matching::find_exercise_type;
 use crate::assistant::parser::parse_assistant_response;
-use crate::assistant::prompts::{build_designer_prompt, format_muscle_recovery, format_session_outcome};
+use crate::assistant::prompts::{build_designer_prompt, estimate_tokens, format_muscle_recovery, format_session_outcome, goals_by_priority};
 use crate::config::DesignerHistoryConfig;
 use crate::db::{
-    Database, EntryWithSets, ExerciseSet, GoalProgress, MeasurementType, Session, SessionWithSets, TrainingMode, User, WorkoutPhilosophy,
-    RosterExercise,
+    Database, EntryWithSets, ExerciseSet, GoalKind, GoalProgress, HealthEntry, MeasurementType, RosterExercise, Session, SessionWithSets,
+    TrainingMode, User, WorkoutPhilosophy,
 };
+use crate::science::{ScienceQuery, normalise_body_part, prescription_doc};
 
 use super::AssistantHandler;
 use super::continuity::parse_sqlite_datetime;
@@ -62,7 +64,9 @@ impl AssistantHandler {
 
         let history_block = self.format_designer_history(&sessions, &goal_ids);
         let recovery_block = format_muscle_recovery(&recovery, chrono::Utc::now().date_naive());
-        let prompt = build_designer_prompt(&philosophy.content, &history_block, &recovery_block, &goals, &injuries, &self.catalogue);
+        let science = self.science.search(&science_query(&goals, &injuries, &guidance), SCIENCE_CHUNK_K);
+        let prompt =
+            build_designer_prompt(&philosophy.content, &history_block, &recovery_block, &goals, &injuries, &science, &self.catalogue);
         let user_text = if guidance.trim().is_empty() { "Design my next workout.".to_string() } else { guidance };
 
         // The design overruns the default token cap; logging is impossible here
@@ -178,10 +182,50 @@ fn goal_relevant_exercise_ids(db: &Database, goals: &[GoalProgress]) -> anyhow::
 /// Header for the older-sessions summary appended after the full recent block.
 const EARLIER_TRENDS_HEADER: &str = "EARLIER TRENDS (older sessions, oldest to newest; * = goal-relevant):\n";
 
-/// Rough token estimate for budgeting the history block: ~4 chars per token. Only
-/// needs to be monotonic and in the right ballpark, not exact.
-fn estimate_tokens(s: &str) -> usize {
-    s.len().div_ceil(4)
+/// How many science chunks the designer prompt carries. Four buys a prescription for the leading
+/// goal plus room for a conflict resolution, an injury rail and one supporting section, and still
+/// leaves the prompt dominated by the user's own history — which is the point of the design.
+const SCIENCE_CHUNK_K: usize = 4;
+
+/// The document holding the curated rule for goals that pull against each other.
+const COMPETING_GOALS_DOC: &str = "competing-goals";
+
+/// Compose the [`ScienceQuery`] for this design ([C5.2]).
+///
+/// Goal kinds go in **priority order** ([C3.1]) — the ordering *is* the resolution mechanism, so a
+/// user's highest-priority goal governs the session. Two things are pinned rather than left to
+/// ranking, because a prescription that arrives only when it happens to out-rank a general document
+/// is not one the designer can be held to:
+///
+/// - each goal kind's canonical prescription ([`crate::science::prescription_doc`]), highest
+///   priority first, so the bands for the goals in play always reach the model;
+/// - `competing-goals` when the kinds actually differ, so the rule that stops the model averaging
+///   two goals into a session serving neither cannot be ranked away.
+///
+/// Nothing here decides *how* goals combine; that judgement lives in the corpus, which is where it
+/// can be reviewed as science.
+fn science_query(goals: &[GoalProgress], injuries: &[HealthEntry], guidance: &str) -> ScienceQuery {
+    let goal_kinds = distinct_kinds_by_priority(goals);
+    let prescriptions = goal_kinds.iter().map(|kind| prescription_doc(*kind).to_string());
+    let resolution = (goal_kinds.len() > 1).then(|| COMPETING_GOALS_DOC.to_string());
+    ScienceQuery {
+        injuries: injuries.iter().filter_map(|e| e.body_part.as_deref()).filter_map(normalise_body_part).collect(),
+        pinned_docs: prescriptions.chain(resolution).collect(),
+        guidance: guidance.to_string(),
+        focus: Vec::new(),
+        goal_kinds,
+    }
+}
+
+/// The goal kinds in play, highest priority first, each appearing once. Two strength goals are one
+/// kind of prescription, not two, and would otherwise read as a conflict with itself.
+fn distinct_kinds_by_priority(goals: &[GoalProgress]) -> Vec<GoalKind> {
+    goals_by_priority(goals).iter().map(|gp| gp.goal.kind).fold(Vec::new(), |mut kinds, kind| {
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+        kinds
+    })
 }
 
 /// The representative set of an entry for a trend line: the heaviest/longest by
@@ -659,6 +703,172 @@ mod tests {
         let fresh = db.latest_draft_roster(user.id).unwrap().unwrap();
         assert_ne!(fresh.id, plan_id, "a new plan was designed");
         assert!(fresh.override_note.is_none(), "the one-off must not survive into the next design");
+    }
+
+    // ── Science grounding [C5.2] ──────────────────────────────────────────────
+
+    /// Register a user, give them a philosophy, and run `/nextworkout`, returning the system prompt
+    /// the designer actually sent. Goals are seeded by `seed` before the design runs.
+    async fn designer_system_prompt(seed: impl Fn(&Database, i64)) -> String {
+        let (handler, llm) = setup_handler(DESIGN_RESPONSE).await;
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
+        let user = { handler.db.lock().await.get_user_by_telegram_id("12345").unwrap().unwrap() };
+        {
+            let db = handler.db.lock().await;
+            db.insert_philosophy(user.id, "5x5, dumbbells to 24kg", "interview").unwrap();
+            seed(&db, user.id);
+        }
+        let _ = handler.handle_text_message(&msg, "/nextworkout").await.unwrap();
+        llm.recorded_requests().pop().unwrap().messages[0].content.clone()
+    }
+
+    /// Insert a goal of `kind` at `priority`, back-dating `start_date` so the date-windowed
+    /// `goal_progress_report` returns it (see [`seed_goal`]).
+    fn seed_goal_of_kind(db: &Database, user_id: i64, kind: crate::db::GoalKind, priority: i64, metric: &str) {
+        let mut goal = crate::db::new_goal(user_id, kind, None, Some(metric.to_string()), 80.0, crate::db::GoalDirection::Decrease);
+        goal.start_date = "2026-01-01".into();
+        goal.priority = priority;
+        db.insert_goal(&goal).unwrap();
+    }
+
+    /// The whole point of [C5.2], through the production path: a strength goal must put the
+    /// corpus's strength bands in front of the model, not leave it on its own recall.
+    #[tokio::test]
+    async fn nextworkout_grounds_the_prompt_in_the_corpus_band_for_the_goal() {
+        let prompt = designer_system_prompt(|db, user_id| {
+            let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+            seed_goal(db, user_id, bench.id);
+        })
+        .await;
+
+        assert!(prompt.contains("TRAINING SCIENCE"), "the designer prompt must carry a science section:\n{prompt}");
+        assert!(prompt.contains("[S:goal-strength]"), "the strength document must be cited");
+        assert!(prompt.contains("1-6 per working set"), "the repetition band must reach the model");
+        assert!(prompt.contains("80-90% of a one-rep maximum"), "the intensity band must reach the model");
+        assert!(prompt.contains("3-5 minutes"), "the rest band must reach the model");
+    }
+
+    /// Genuinely competing goals: the prompt must rank them by priority and carry the corpus's
+    /// resolution, rather than leaving the model to average a strength goal and a fat-loss goal
+    /// into a session that serves neither.
+    #[tokio::test]
+    async fn competing_goals_reach_the_prompt_ranked_and_with_the_curated_resolution() {
+        let prompt = designer_system_prompt(|db, user_id| {
+            let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+            let mut strength = new_exercise_goal(user_id, bench.id, 100.0);
+            strength.start_date = "2026-01-01".into();
+            strength.priority = 2;
+            db.insert_goal(&strength).unwrap();
+            seed_goal_of_kind(db, user_id, crate::db::GoalKind::BodyComposition, 7, "body_fat_pct");
+        })
+        .await;
+
+        let block = prompt.split("COMPETING GOALS").nth(1).unwrap_or_else(|| panic!("no competing-goals block:\n{prompt}"));
+        assert!(
+            block.find("body_composition") < block.find("strength"),
+            "the higher-priority goal must be listed first:\n{block}"
+        );
+        assert!(prompt.contains("[S:competing-goals]"), "the resolution document must be pinned in");
+        // Both goals' prescriptions must survive: resolving by priority is not the same as
+        // dropping the lower goal, and the model cannot honour a band it was never shown.
+        assert!(prompt.contains("[S:goal-body-composition]") && prompt.contains("[S:goal-strength]"), "both prescriptions must land");
+        assert!(!prompt.contains("omitted to fit the prompt budget"), "two goals plus a resolution must fit the budget:\n{prompt}");
+        assert!(prompt.contains("Goals are resolved by **priority**, not by averaging"), "the corpus rule itself must be present");
+    }
+
+    /// One kind of goal is not a conflict, and the resolution block must not appear for it.
+    #[tokio::test]
+    async fn a_lone_goal_produces_science_but_no_competing_goals_block() {
+        let prompt = designer_system_prompt(|db, user_id| {
+            let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+            seed_goal(db, user_id, bench.id);
+        })
+        .await;
+        assert!(!prompt.contains("COMPETING GOALS"));
+        assert!(prompt.contains("TRAINING SCIENCE"));
+    }
+
+    /// An active injury is a hard constraint, so its contraindications outrank the goal for the
+    /// scarce science budget. [C5.4] turns this into a check on the design itself; here it is only
+    /// a guarantee that the guidance is in front of the model at all.
+    #[tokio::test]
+    async fn an_active_injury_puts_its_contraindications_in_the_prompt() {
+        let prompt = designer_system_prompt(|db, user_id| {
+            let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+            seed_goal(db, user_id, bench.id);
+            let mut entry = crate::db::new_health_entry(user_id, crate::db::HealthEntryType::Injury, "lower back twinge");
+            // Free text as the assistant records it — the corpus spells it `lower_back`.
+            entry.body_part = Some("lower back".into());
+            db.insert_health_entry(&entry).unwrap();
+        })
+        .await;
+        assert!(prompt.contains("[S:injury-lower-back]"), "the injury document must reach the prompt:\n{prompt}");
+    }
+
+    #[test]
+    fn the_science_query_ranks_goal_kinds_by_priority_and_pins_the_resolution() {
+        let db = Database::open_in_memory().unwrap();
+        let user_id = db.insert_user(&new_user("Tester", None, "UTC")).unwrap();
+        let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+        let mut strength = new_exercise_goal(user_id, bench.id, 100.0);
+        strength.start_date = "2026-01-01".into();
+        strength.priority = 1;
+        db.insert_goal(&strength).unwrap();
+        seed_goal_of_kind(&db, user_id, crate::db::GoalKind::BodyComposition, 8, "body_fat_pct");
+
+        let goals = db.goal_progress_report(user_id, None, None).unwrap();
+        let query = science_query(&goals, &[], "");
+
+        assert_eq!(query.goal_kinds, [crate::db::GoalKind::BodyComposition, crate::db::GoalKind::Strength]);
+        // Each kind's prescription in priority order, then the resolution — none of them left to
+        // ranking, and the highest-priority prescription first so it survives the budget.
+        assert_eq!(query.pinned_docs, ["goal-body-composition", "goal-strength", COMPETING_GOALS_DOC]);
+    }
+
+    /// `bodyweight` and `body_composition` share one prescription document; holding both must not
+    /// spend two of four science slots saying the same thing twice.
+    #[test]
+    fn goal_kinds_sharing_a_prescription_yield_one_chunk() {
+        let db = Database::open_in_memory().unwrap();
+        let user_id = db.insert_user(&new_user("Tester", None, "UTC")).unwrap();
+        seed_goal_of_kind(&db, user_id, crate::db::GoalKind::Bodyweight, 5, "bodyweight_kg");
+        seed_goal_of_kind(&db, user_id, crate::db::GoalKind::BodyComposition, 3, "body_fat_pct");
+
+        let goals = db.goal_progress_report(user_id, None, None).unwrap();
+        let query = science_query(&goals, &[], "");
+        assert_eq!(query.pinned_docs, ["goal-body-composition", "goal-body-composition", COMPETING_GOALS_DOC]);
+
+        let hits = crate::science::ScienceIndex::build().unwrap().search(&query, 4);
+        let body_comp = hits.iter().filter(|c| c.doc_id == "goal-body-composition").count();
+        assert_eq!(body_comp, 1, "a document pinned twice appears once: {:?}", hits.iter().map(|c| &c.doc_id).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_science_query_for_one_kind_pins_nothing() {
+        let db = Database::open_in_memory().unwrap();
+        let user_id = db.insert_user(&new_user("Tester", None, "UTC")).unwrap();
+        let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+        seed_goal(&db, user_id, bench.id);
+        // A second goal of the same kind: still one prescription, so still no conflict.
+        seed_goal_of_kind(&db, user_id, crate::db::GoalKind::Strength, 3, "grip_kg");
+
+        let goals = db.goal_progress_report(user_id, None, None).unwrap();
+        assert_eq!(goals.len(), 2, "both goals should be active");
+        let query = science_query(&goals, &[], "");
+        assert_eq!(query.goal_kinds, [crate::db::GoalKind::Strength]);
+        assert_eq!(query.pinned_docs, ["goal-strength"], "the prescription is pinned; the resolution is not, since nothing competes");
+    }
+
+    #[test]
+    fn injury_body_parts_reach_the_query_normalised_and_unknown_ones_are_dropped() {
+        let entry = |part: Option<&str>| {
+            let mut e = crate::db::new_health_entry(1, crate::db::HealthEntryType::Injury, "ouch");
+            e.body_part = part.map(str::to_string);
+            e
+        };
+        let injuries = [entry(Some("lower back")), entry(Some("elbow")), entry(Some("aura")), entry(None)];
+        assert_eq!(science_query(&[], &injuries, "").injuries, ["lower_back", "elbow"]);
     }
 
     #[test]
