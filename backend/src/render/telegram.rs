@@ -4,8 +4,8 @@
 //! the Telegram bot is visually unchanged — locked down by golden tests below.
 
 use gymbuddy_proto::{
-    CatalogView, HistoryView, PROGRAMME_LOCK_IN_ASK, ProgrammeView, ProgressView, Render, SeriesShape, SeriesView, SessionRosterView,
-    SetLine, StatusView, TrainingModeView, View,
+    CatalogView, HistoryView, PROGRAMME_LOCK_IN_ASK, ProgrammeView, ProgressView, Render, SeriesShape, SeriesView, SessionReviewView,
+    SessionRosterView, SetLine, StatusView, TrainingModeView, View,
 };
 
 /// The Telegram renderer. `Output` is `(text, parse_mode)` — `parse_mode` is
@@ -26,6 +26,7 @@ impl Render for Telegram {
             View::ProgrammeSessionRoster { roster, mode } => (render_session_roster(roster, Some(mode)), Some("HTML")),
             View::Programme(programme) => (render_programme(programme), Some("HTML")),
             View::Progress(progress) => (render_progress(progress), Some("HTML")),
+            View::SessionReview(review) => (render_session_review(review), Some("HTML")),
             View::Timers { enabled } => (format!("Rest timers are now {}.", if *enabled { "on" } else { "off" }), None),
             // `View` is `#[non_exhaustive]`: a variant from a newer server lands here.
             // Degrade to plain text rather than sending Telegram an empty message
@@ -233,6 +234,70 @@ fn render_progress(p: &ProgressView) -> String {
 }
 
 /// One series: a title, then the shape's own rendering.
+/// The post-session review ([C6.5]).
+///
+/// Ordered by what the user most needs to see: a completed goal first, because finishing one
+/// is the only thing here worth interrupting for, then the coach's read, then the numbers it
+/// was drawn from. Records come before the per-exercise list — a PR is the one line a user
+/// will screenshot.
+fn render_session_review(r: &SessionReviewView) -> String {
+    let mut out = format!("<b>{}</b>\n", escape_html(&r.summary_line()));
+
+    if let Some(position) = &r.position {
+        out.push_str(&format!("<i>{}</i>\n", escape_html(&position.summary())));
+    }
+    if let Some(intent) = &r.intent {
+        out.push_str(&format!("<i>Set out to: {}</i>\n", escape_html(intent)));
+    }
+
+    if !r.achieved_goals.is_empty() {
+        out.push_str("\n<b>Goal reached</b>\n");
+        out.extend(r.achieved_goals.iter().map(|g| format!("- {}\n", escape_html(g))));
+    }
+
+    // The commentary is the model's, and only the programme tier has one. It sits under its
+    // own heading so the user can always tell which words were computed and which were written.
+    if let Some(commentary) = &r.commentary {
+        out.push_str(&format!("\n{}\n", escape_html(commentary)));
+    }
+
+    if !r.records.is_empty() {
+        out.push_str("\n<b>Personal records</b>\n");
+        out.extend(r.records.iter().map(|record| format!("- {}\n", escape_html(&record.line()))));
+    }
+
+    if !r.exercises.is_empty() {
+        out.push_str("\n<b>What you did</b>\n");
+        out.extend(r.exercises.iter().map(|e| format!("- {}\n", escape_html(&e.line()))));
+    }
+
+    let context: Vec<String> = r
+        .effort
+        .iter()
+        .map(|e| e.line())
+        .chain(r.streak_days.map(|d| format!("Streak: {d} day{}", if d == 1 { "" } else { "s" })))
+        .chain(r.week_line.clone().map(|w| format!("This week: {w}")))
+        .collect();
+    if !context.is_empty() {
+        out.push('\n');
+        out.extend(context.iter().map(|line| format!("{}\n", escape_html(line))));
+    }
+
+    if !r.goals.is_empty() {
+        out.push_str("\n<b>Goals</b>\n");
+        out.extend(r.goals.iter().map(|g| format!("- {}\n", escape_html(g))));
+    }
+
+    // The charts share the [C6.2] series renderer rather than growing a second one.
+    out.extend(r.series.iter().map(|series| format!("\n{}", render_series(series))));
+
+    if !r.notes.is_empty() {
+        out.push_str("\n<b>Notes:</b>\n");
+        out.extend(r.notes.iter().map(|note| format!("- {}\n", escape_html(note))));
+    }
+    out
+}
+
 fn render_series(s: &SeriesView) -> String {
     let body = match s.shape {
         SeriesShape::Breakdown => render_bars(s),
@@ -304,7 +369,10 @@ pub(crate) fn escape_html(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gymbuddy_proto::{CatalogEntry, CatalogGroup, Direction, ExerciseLog, HealthNote, Measurement, SeriesPointView, SessionView};
+    use gymbuddy_proto::{
+        CatalogEntry, CatalogGroup, Direction, ExerciseLog, HealthNote, Measurement, ReviewEffortView, ReviewExerciseView,
+        ReviewKindView, ReviewRecordView, SeriesPointView, SessionView,
+    };
 
     fn set(count: Option<u32>, value: f64) -> SetLine {
         SetLine { measurement: Measurement::WeightReps, count, value }
@@ -495,6 +563,147 @@ mod tests {
                         \n<b>Notes:</b>\n\
                         - Squat has too few sessions to trend.\n";
         assert_eq!(html, expected);
+    }
+
+    /// A programme-tier report, end to end. Golden because the *order* is the design:
+    /// a completed goal leads, the commentary follows, and the numbers it was drawn from
+    /// come after — a user who reads only the first line should get the important part.
+    #[test]
+    fn a_programme_report_leads_with_the_goal_then_the_commentary() {
+        let view = View::SessionReview(Box::new(review_fixture()));
+        let (html, mode) = Telegram.render(&view);
+        assert_eq!(mode, Some("HTML"));
+        let expected = "<b>Goal reached: Overhead Press to 40</b>\n\
+                        <i>Programme: 12-week hypertrophy — week 2, day 1: upper</i>\n\
+                        <i>Set out to: upper push</i>\n\
+                        \n<b>Goal reached</b>\n\
+                        - Overhead Press to 40\n\
+                        \nThe extra 2.5kg held for all three sets.\n\
+                        \n<b>Personal records</b>\n\
+                        - Bench Press: 67.5kg × 6 (was 65kg × 6)\n\
+                        \n<b>What you did</b>\n\
+                        - Bench Press: 3 sets × 6 reps @ 67.5kg (asked 3 sets × 6 reps @ 65kg) — +2.5kg\n\
+                        \nEffort: hard\n\
+                        Streak: 4 days\n\
+                        This week: 3 sessions, 12400 kg total volume\n";
+        assert_eq!(html, expected);
+    }
+
+    /// The ad-hoc tier renders without a commentary section at all — the visible half of
+    /// the [C6.5] guarantee that no model was asked.
+    #[test]
+    fn an_adhoc_summary_renders_no_commentary_section() {
+        let review = SessionReviewView {
+            headline: "Session logged — 1 exercise".into(),
+            kind: ReviewKindView::Summary,
+            commentary: None,
+            position: None,
+            achieved_goals: vec![],
+            records: vec![],
+            exercises: vec![ReviewExerciseView {
+                name: "Bench Press".into(),
+                prescribed: None,
+                actual: "3 sets × 6 reps @ 67.5kg".into(),
+                delta: None,
+            }],
+            ..review_fixture()
+        };
+        let (html, _) = Telegram.render(&View::SessionReview(Box::new(review)));
+        let expected = "<b>Session logged — 1 exercise</b>\n\
+                        <i>Set out to: upper push</i>\n\
+                        \n<b>What you did</b>\n\
+                        - Bench Press: 3 sets × 6 reps @ 67.5kg\n\
+                        \nEffort: hard\n\
+                        Streak: 4 days\n\
+                        This week: 3 sessions, 12400 kg total volume\n";
+        assert_eq!(html, expected);
+    }
+
+    /// A derived effort says so, so the user knows it is open to correction — the note
+    /// the auto-close path sends depends on this reading as a guess, not a verdict.
+    #[test]
+    fn a_derived_effort_is_rendered_as_a_guess() {
+        let review =
+            SessionReviewView { effort: Some(ReviewEffortView { label: "hard".into(), confirmed: false }), ..review_fixture() };
+        let (html, _) = Telegram.render(&View::SessionReview(Box::new(review)));
+        assert!(html.contains("Effort: hard (my read, not yours)"), "{html}");
+    }
+
+    /// A review's charts go through the same [C6.2] series renderer as /progress, rather
+    /// than a second one grown for the review.
+    #[test]
+    fn a_review_renders_its_series_with_the_shared_sparkline() {
+        let review = SessionReviewView {
+            series: vec![SeriesView {
+                title: "Bench Press".into(),
+                unit: "kg".into(),
+                better: Direction::Higher,
+                shape: SeriesShape::Trend,
+                points: points(&[("2026-05-01", 80.0), ("2026-06-01", 85.0), ("2026-07-01", 92.5)]),
+            }],
+            ..review_fixture()
+        };
+        let (html, _) = Telegram.render(&View::SessionReview(Box::new(review)));
+        assert!(html.contains("<code>▁▄█</code>"), "{html}");
+        assert!(html.contains("80 → 92.5 kg (+12.5, better)"), "{html}");
+    }
+
+    /// Everything a review carries is user-supplied or model-written, so all of it is
+    /// escaped — an exercise name with an angle bracket must not become markup.
+    #[test]
+    fn review_escapes_every_text_field() {
+        let review = SessionReviewView {
+            headline: "A <b>bold</b> session".into(),
+            commentary: Some("You & I both know <that>".into()),
+            exercises: vec![ReviewExerciseView {
+                name: "<script>".into(),
+                prescribed: None,
+                actual: "1 set".into(),
+                delta: None,
+            }],
+            ..review_fixture()
+        };
+        let (html, _) = Telegram.render(&View::SessionReview(Box::new(review)));
+        assert!(html.contains("A &lt;b&gt;bold&lt;/b&gt; session"), "{html}");
+        assert!(html.contains("You &amp; I both know &lt;that&gt;"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+        assert!(!html.contains("<script>"), "{html}");
+    }
+
+    /// A representative programme-tier review, shared by the tests above.
+    fn review_fixture() -> SessionReviewView {
+        SessionReviewView {
+            headline: "Goal reached: Overhead Press to 40".into(),
+            kind: ReviewKindView::Report,
+            session_date: "2026-07-19 10:00:00".into(),
+            intent: Some("upper push".into()),
+            effort: Some(ReviewEffortView { label: "hard".into(), confirmed: true }),
+            exercises: vec![ReviewExerciseView {
+                name: "Bench Press".into(),
+                prescribed: Some("3 sets × 6 reps @ 65kg".into()),
+                actual: "3 sets × 6 reps @ 67.5kg".into(),
+                delta: Some("+2.5kg".into()),
+            }],
+            records: vec![ReviewRecordView {
+                exercise: "Bench Press".into(),
+                detail: "67.5kg × 6".into(),
+                previous: Some("65kg × 6".into()),
+            }],
+            commentary: Some("The extra 2.5kg held for all three sets.".into()),
+            goals: vec![],
+            achieved_goals: vec!["Overhead Press to 40".into()],
+            position: Some(TrainingModeView::Programme {
+                programme_title: "12-week hypertrophy".into(),
+                week: 2,
+                day: 1,
+                focus: "upper".into(),
+            }),
+            adherence: Some("1 of 1 prescribed exercises completed".into()),
+            streak_days: Some(4),
+            week_line: Some("3 sessions, 12400 kg total volume".into()),
+            series: vec![],
+            notes: vec![],
+        }
     }
 
     /// The [C6.2] rule that makes the whole contract worth having: "better" is the

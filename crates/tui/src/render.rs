@@ -11,8 +11,8 @@
 //! this side of the wall, where `app.rs` never has to know about them ([T1.1]).
 
 use gymbuddy_proto::{
-    CatalogView, ExerciseLog, HistoryView, PROGRAMME_LOCK_IN_ASK, ProgrammeView, ProgressView, SeriesShape, SeriesView, SessionRosterView,
-    SetLine, StatusView, TrainingModeView, View,
+    CatalogView, ExerciseLog, HistoryView, PROGRAMME_LOCK_IN_ASK, ProgrammeView, ProgressView, SeriesShape, SeriesView, SessionReviewView,
+    SessionRosterView, SetLine, StatusView, TrainingModeView, View,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -45,6 +45,7 @@ pub fn render_view(view: &View, width: u16) -> Vec<Line<'static>> {
         View::ProgrammeSessionRoster { roster, mode } => render_session_roster(roster, Some(mode)),
         View::Programme(programme) => render_programme(programme),
         View::Progress(progress) => render_progress(progress, width),
+        View::SessionReview(review) => render_session_review(review),
         View::Timers { enabled } => vec![Line::from(Span::styled(
             format!("Rest timers {}", if *enabled { "on" } else { "off" }),
             Style::default().fg(if *enabled { SUCCESS } else { MUTED }).add_modifier(Modifier::BOLD),
@@ -52,6 +53,25 @@ pub fn render_view(view: &View, width: u16) -> Vec<Line<'static>> {
         // `View` is `#[non_exhaustive]`: degrade gracefully on an unknown variant.
         _ => vec![Line::from(Span::styled("[unsupported message]", Style::default().fg(MUTED)))],
     }
+}
+
+/// The post-session review ([C6.5]).
+///
+/// Deliberately minimal: the headline, the goal and record lines, and the per-exercise
+/// deltas, as plain text. The rich terminal rendering — charts, colour, the layout — is
+/// [T2.3]'s, and this arm exists so the variant renders something honest until then rather
+/// than falling through to "[unsupported message]".
+fn render_session_review(r: &SessionReviewView) -> Vec<Line<'static>> {
+    let mut lines = vec![heading(r.summary_line())];
+    lines.extend(r.position.iter().map(|p| muted(p.summary())));
+    lines.extend(r.achieved_goals.iter().map(|g| bold(&format!("Goal reached: {g}"))));
+    lines.extend(r.commentary.iter().flat_map(|c| plain_lines(c)));
+    lines.extend(r.records.iter().map(|record| Line::from(Span::raw(format!("  {}", record.line())))));
+    lines.extend(r.exercises.iter().map(|e| Line::from(Span::raw(format!("  {}", e.line())))));
+    lines.extend(r.adherence.iter().map(|a| muted(a.clone())));
+    lines.extend(r.effort.iter().map(|e| muted(e.line())));
+    lines.extend(r.notes.iter().map(|n| muted(n.clone())));
+    lines
 }
 
 fn render_message(text: &str, notes: &[String], failures: &[String]) -> Vec<Line<'static>> {
@@ -526,6 +546,43 @@ mod tests {
 
     fn render(view: &View) -> Vec<Line<'static>> {
         render_view(view, WIDE)
+    }
+    /// The minimal [C6.5] arm: enough that a review renders as itself rather than as
+    /// "[unsupported message]". The rich terminal rendering is [T2.3]'s.
+    #[test]
+    fn session_review_renders_its_headline_and_exercise_lines() {
+        use gymbuddy_proto::{ReviewEffortView, ReviewExerciseView, ReviewKindView, SessionReviewView};
+        let view = View::SessionReview(Box::new(SessionReviewView {
+            headline: "Solid session — 2 of 3 prescribed exercises completed".into(),
+            kind: ReviewKindView::Report,
+            session_date: "2026-07-19 10:00:00".into(),
+            intent: None,
+            effort: Some(ReviewEffortView { label: "hard".into(), confirmed: false }),
+            exercises: vec![ReviewExerciseView {
+                name: "Bench Press".into(),
+                prescribed: Some("3 sets × 6 reps @ 65kg".into()),
+                actual: "3 sets × 6 reps @ 67.5kg".into(),
+                delta: Some("+2.5kg".into()),
+            }],
+            records: vec![],
+            commentary: Some("The extra load held all three sets.".into()),
+            goals: vec![],
+            achieved_goals: vec!["Overhead Press to 40".into()],
+            position: None,
+            adherence: Some("2 of 3 prescribed exercises completed".into()),
+            streak_days: Some(4),
+            week_line: None,
+            series: vec![],
+            notes: vec![],
+        }));
+        let text = flat(&render(&view));
+        assert!(text.contains("Solid session — 2 of 3 prescribed exercises completed"), "{text}");
+        assert!(text.contains("Goal reached: Overhead Press to 40"), "{text}");
+        assert!(text.contains("The extra load held all three sets."), "{text}");
+        assert!(text.contains("Bench Press: 3 sets × 6 reps @ 67.5kg (asked 3 sets × 6 reps @ 65kg) — +2.5kg"), "{text}");
+        assert!(text.contains("Effort: hard (my read, not yours)"), "{text}");
+        assert!(!text.contains("[unsupported message]"), "the variant must not fall through: {text}");
+        assert!(!text.contains('<'), "no HTML markup should appear: {text}");
     }
 
     fn flat(lines: &[Line]) -> String {
