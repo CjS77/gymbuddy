@@ -178,3 +178,92 @@ fn every_goal_kind_reaches_the_corpus() {
     });
 }
 
+// ── What the index buys over a tag filter ─────────────────────────────────────
+//
+// The three tests below are the ones that fail against tag-only scoring. They are the point of
+// [R5.1]: tags mark a whole document, so they can say which document answers a session and never
+// which paragraph of it, nor anything at all about words the vocabulary does not contain.
+
+/// The headline capability. `progressive-overload` is tagged `deload`, so a tag filter could find
+/// the document — but every chunk of it matched equally and the one quoted was whichever the
+/// structural rules preferred. BM25 over chunk text reads the section that is actually about
+/// deloading.
+#[test]
+fn situational_language_chooses_the_chunk_within_a_document() {
+    let index = index();
+    let chunk = |q: &ScienceQuery, k: usize| {
+        index.search(q, k).into_iter().find(|c| c.doc_id == "progressive-overload").expect("progressive-overload retrieved")
+    };
+
+    let by_focus = ScienceQuery { focus: vec!["deload".to_string()], ..goal_query(GoalKind::Strength) };
+    assert_eq!(chunk(&by_focus, 4).heading, "Deloads", "a deload focus should quote the deload section");
+
+    // Free guidance, naming no tag at all, reaches a *different* section of the same document — the
+    // one whose words it used. This is the discrimination tags cannot express: both sections belong
+    // to a document tagged `deload`, and only the text tells them apart. `k` is wider here because
+    // vague guidance rightly does not outrank the goal's own prescription documents; the claim under
+    // test is which chunk is quoted, not that the document displaces them.
+    let backing_off = ScienceQuery { guidance: "can we back off the weight for a week".to_string(), ..goal_query(GoalKind::Strength) };
+    assert_eq!(chunk(&backing_off, 8).heading, "Back off, and when");
+}
+
+/// Guidance that lands on no corpus tag at all. The placeholder matched prose against the tag
+/// vocabulary and so returned nothing here; the index has the whole corpus text to work with.
+#[test]
+fn free_guidance_alone_retrieves_science() {
+    let query = ScienceQuery { guidance: "what should I do when the weight stops going up".to_string(), ..Default::default() };
+    let hits = index().search(&query, 4);
+    assert!(!hits.is_empty(), "free guidance with no tag words must still reach the corpus");
+    assert!(
+        hits.iter().all(|c| !c.text.trim().is_empty()),
+        "a hit must carry its chunk's text: {:?}",
+        hits.iter().map(|c| &c.heading).collect::<Vec<_>>()
+    );
+}
+
+/// A pin guarantees the document, not a fixed paragraph of it. The rails ([C5.2], [C5.4]) are
+/// pinned, and a pinned rail should still answer what the user actually said.
+#[test]
+fn a_pinned_document_still_answers_the_guidance() {
+    let query = ScienceQuery {
+        pinned_docs: vec!["progressive-overload".to_string()],
+        guidance: "can we deload this week".to_string(),
+        ..goal_query(GoalKind::Strength)
+    };
+    let hits = index().search(&query, 4);
+    assert_eq!(hits[0].doc_id, "progressive-overload", "the pin still leads: {:?}", doc_ids(&hits));
+    assert_eq!(hits[0].heading, "Deloads", "and the pinned document answers the guidance");
+}
+
+/// Top-k relevance on a tag match: a document the corpus author tagged for this goal beats one that
+/// merely discusses it. This is the ordering BM25 must not be allowed to decide — term rarity would
+/// promote whichever goal the corpus happens to cover least (see the module docs).
+#[test]
+fn tagged_documents_fill_the_ranked_slots_before_untagged_ones() {
+    let hits = index().search(&goal_query(GoalKind::Strength), 4);
+    let untagged: Vec<&str> = doc_ids(&hits)
+        .into_iter()
+        .filter(|id| !crate::science::doc(id).is_some_and(|d| d.has_tag("strength")))
+        .collect();
+    assert!(untagged.is_empty(), "untagged documents took ranked slots from tagged ones: {untagged:?}");
+}
+
+/// Retrieval is the side of the seam that can keep the prompt from truncating. `format_training_science`
+/// drops what does not fit and says so, but a dropped chunk is curated science the designer was meant
+/// to have — so `k = 4` and [`SCIENCE_TOKEN_BUDGET`] have to stay consistent with the corpus's own
+/// section lengths. If this fails, either a corpus section grew or the budget needs raising; the one
+/// thing to not do is leave the designer quietly reading three chunks where the code asked for four.
+#[test]
+fn a_four_chunk_retrieval_fits_the_prompt_budget() {
+    let index = index();
+    crate::science::GOAL_KINDS.iter().for_each(|kind| {
+        let hits = index.search(&goal_query(*kind), 4);
+        let rendered: usize =
+            hits.iter().map(|c| crate::assistant::prompts::estimate_tokens(&format!("{} {}\n{}\n", c.citation, c.heading, c.text))).sum();
+        assert!(
+            rendered <= crate::assistant::prompts::SCIENCE_TOKEN_BUDGET,
+            "{kind:?} retrieves {rendered} tokens, over the {} the prompt can carry",
+            crate::assistant::prompts::SCIENCE_TOKEN_BUDGET
+        );
+    });
+}

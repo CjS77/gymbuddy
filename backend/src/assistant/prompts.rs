@@ -928,7 +928,11 @@ pub(crate) fn estimate_tokens(s: &str) -> usize {
 /// Upper bound (estimated tokens) on the whole TRAINING SCIENCE block, bounding it the way the
 /// history block is bounded. Sized for roughly four chunks of curated prose — a corpus section runs
 /// 150-300 words.
-const SCIENCE_TOKEN_BUDGET: usize = 1200;
+///
+/// Visible to the crate so that retrieval can test against it: this module truncates what does not
+/// fit, and a chunk dropped here is science the designer was supposed to have. Retrieval is the side
+/// that can keep that from happening.
+pub(crate) const SCIENCE_TOKEN_BUDGET: usize = 1200;
 
 /// The TRAINING SCIENCE section: the retrieved chunks, each under its citation marker, bounded by
 /// [`SCIENCE_TOKEN_BUDGET`].
