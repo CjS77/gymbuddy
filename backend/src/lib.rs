@@ -1,6 +1,7 @@
 pub mod assistant;
 pub mod config;
 pub mod db;
+pub mod dump;
 pub mod github;
 pub mod render;
 pub mod telegram;

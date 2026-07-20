@@ -8,7 +8,9 @@ mod exercise_types;
 mod goals;
 mod groups;
 mod health;
-mod migrations;
+// `pub(crate)` so `crate::dump` can stand a v1 database up in its tests: the readers must be
+// exercised against the real migration set, not a hand-rolled approximation of it.
+pub(crate) mod migrations;
 mod models;
 mod planner;
 mod programs;
