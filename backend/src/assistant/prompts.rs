@@ -462,8 +462,8 @@ to save, keep `actions` empty and ask the next question.",
 
 /// System prompt for `/nextworkout`: design ONE tailored training session from the
 /// user's philosophy, recent history, goals, injuries, and the curated training
-/// science retrieved for them. It advertises ONLY the `propose_workout` action — the
-/// design is a proposal and logs nothing. Exercise selection follows the spec's
+/// science retrieved for them. It advertises ONLY the `propose_session_roster` action —
+/// the design is a proposal and logs nothing. Exercise selection follows the spec's
 /// decreasing priority order (goal contribution, done before, longest-rested muscles,
 /// philosophy fit, health issues, temporary requests); lower rungs break ties rather
 /// than veto, except active health issues, which stay a hard constraint.
@@ -530,11 +530,11 @@ and a target weight within the user's equipment limits. Add a short per-exercise
 RESPONSE FORMAT: You MUST respond with ONLY a JSON object. No text before or after.\n\
 {{\n\
   \"message\": \"<one or two sentences introducing the session>\",\n\
-  \"actions\": [{{\"type\": \"propose_workout\", ...}}]\n\
+  \"actions\": [{{\"type\": \"propose_session_roster\", ...}}]\n\
 }}\n\
 \n\
-You MUST emit EXACTLY ONE action, of type propose_workout:\n\
-- {{\"type\": \"propose_workout\", \"title\": \"<short session title>\", \
+You MUST emit EXACTLY ONE action, of type propose_session_roster:\n\
+- {{\"type\": \"propose_session_roster\", \"title\": \"<short session title>\", \
 \"rationale\": \"<2-4 sentences that MUST name which SELECTION PRIORITY items drove today's \
 picks (e.g. goal contribution, longest-rested muscles), plus any injury substitutions and why, \
 plus the [S:doc-id] marker of every TRAINING SCIENCE item that shaped the prescription>\", \

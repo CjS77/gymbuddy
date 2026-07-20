@@ -1,14 +1,14 @@
 //! The `/nextworkout` designer: builds a tailored workout from philosophy,
 //! recent history, recovery, goals, injuries and the curated training science
-//! retrieved for them, persists it as a `proposed` plan, and bounds how long that
-//! proposal stays eligible to bind to a session.
+//! retrieved for them, persists it as a draft session roster, and bounds how long
+//! that draft stays eligible to bind to a session.
 
 use std::collections::{BTreeMap, HashSet};
 
 use anyhow::Context as _;
 use chrono::NaiveDateTime;
 
-use crate::assistant::actions::{AssistantAction, ProposedExercise};
+use crate::assistant::actions::{AssistantAction, ProposedRosterExercise};
 use crate::assistant::matching::find_exercise_type;
 use crate::assistant::parser::parse_assistant_response;
 use crate::assistant::prompts::{build_designer_prompt, estimate_tokens, format_muscle_recovery, format_session_outcome, goals_by_priority};
@@ -25,8 +25,8 @@ use gymbuddy_proto::{PlannedExerciseView, TrainingModeView, View, WorkoutView};
 
 impl AssistantHandler {
     /// Design a tailored workout from the user's philosophy, recent history, goals,
-    /// and injuries, and present it as a [`View::Workout`]. Persists a `proposed`
-    /// plan but logs NOTHING and starts no session. Any text after the command
+    /// and injuries, and present it as a [`View::Workout`]. Persists a draft session
+    /// roster but logs NOTHING and starts no session. Any text after the command
     /// ("/nextworkout but something lighter") is passed to the designer as guidance.
     ///
     /// The design runs in an explicit [`TrainingMode`] ([C1.4]): with an active
@@ -78,17 +78,17 @@ impl AssistantHandler {
         let parsed = parse_assistant_response(&llm_response);
 
         let proposal = parsed.actions.into_iter().find_map(|action| match action {
-            AssistantAction::ProposeWorkout { title, rationale, exercises } => Some((title, rationale, exercises)),
+            AssistantAction::ProposeSessionRoster { title, rationale, exercises } => Some((title, rationale, exercises)),
             _ => None,
         });
 
         let Some((title, rationale, exercises)) = proposal else {
-            // The designer returned something that isn't a valid `propose_workout`
+            // The designer returned something that isn't a valid `propose_session_roster`
             // (unparseable JSON, or valid JSON without the required action). FAIL LOUD:
             // do NOT render the prose as if a workout were created, and persist nothing.
             // Rendering the fallback prose here used to silently mislead — the user saw a
             // "workout" that was never saved. See ticket C1.7.
-            tracing::warn!(user_id = user.id, response = %llm_response, "workout designer returned no valid propose_workout");
+            tracing::warn!(user_id = user.id, response = %llm_response, "session designer returned no valid propose_session_roster");
             return Ok(View::notice(
                 "I couldn't design a valid workout this time. Please try /nextworkout again, \
                  optionally adding a hint like /nextworkout upper body.",
@@ -98,12 +98,12 @@ impl AssistantHandler {
         self.persist_and_view_workout(user, &philosophy, &mode, title, rationale, exercises).await
     }
 
-    /// Persist a designed workout as a `proposed` plan and build its [`View::Workout`]
+    /// Persist a designed session as a draft roster and build its [`View::Workout`]
     /// (or [`View::ProgramWorkout`] when a programme is in play). Exercise names are
     /// resolved against the catalogue; unresolved ones are dropped with a note rather
     /// than failing the whole design.
     ///
-    /// In programme mode the plan is stamped with the slot it fills; in ad-hoc mode
+    /// In programme mode the roster is stamped with the slot it fills; in ad-hoc mode
     /// its `programme_slot_id` stays NULL and no slot status moves — a one-off under an
     /// active programme never touches adherence.
     async fn persist_and_view_workout(
@@ -113,7 +113,7 @@ impl AssistantHandler {
         mode: &TrainingMode,
         title: String,
         rationale: Option<String>,
-        exercises: Vec<ProposedExercise>,
+        exercises: Vec<ProposedRosterExercise>,
     ) -> anyhow::Result<View> {
         let mut planned: Vec<PlannedExerciseView> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
@@ -419,7 +419,7 @@ mod tests {
     #[tokio::test]
     async fn nextworkout_designs_and_persists_plan_without_logging() {
         let design = r#"{"message": "Here's today's session.", "actions": [
-            {"type": "propose_workout", "title": "Upper push", "rationale": "Bench was easy; push it.", "exercises": [
+            {"type": "propose_session_roster", "title": "Upper push", "rationale": "Bench was easy; push it.", "exercises": [
                 {"exercise": "Bench Press", "target_sets": 3, "target_reps": 6, "target_weight_kg": 65.0, "notes": "drive through heels"},
                 {"exercise": "One Arm Dumbbell Row", "target_sets": 3, "target_reps": 8, "target_weight_kg": 24.0}
             ]}
@@ -454,7 +454,7 @@ mod tests {
     #[tokio::test]
     async fn nextworkout_drops_unresolved_exercise_with_note() {
         let design = r#"{"message": "Plan ready.", "actions": [
-            {"type": "propose_workout", "title": "Mixed", "exercises": [
+            {"type": "propose_session_roster", "title": "Mixed", "exercises": [
                 {"exercise": "Bench Press", "target_sets": 3, "target_reps": 8, "target_weight_kg": 60.0},
                 {"exercise": "Jetpack Flips", "target_sets": 3, "target_reps": 8}
             ]}
@@ -478,7 +478,7 @@ mod tests {
     }
 
     const DESIGN_RESPONSE: &str = r#"{"message": "Here's your session.", "actions": [
-        {"type": "propose_workout", "title": "Upper", "exercises": [
+        {"type": "propose_session_roster", "title": "Upper", "exercises": [
             {"exercise": "Bench Press", "target_sets": 3, "target_reps": 6, "target_weight_kg": 65.0}
         ]}
     ]}"#;
@@ -569,7 +569,7 @@ mod tests {
 
     #[tokio::test]
     async fn nextworkout_without_valid_proposal_fails_loud_and_persists_nothing() {
-        // The designer replies with prose but never emits a `propose_workout` action.
+        // The designer replies with prose but never emits a `propose_session_roster` action.
         // The old behaviour rendered that prose as if a workout had been created while
         // saving nothing; now it must fail loudly and persist no plan (ticket C1.7).
         let (handler, _) = setup_handler("Here's a great session: heavy bench and some squats. Have fun!").await;
@@ -598,7 +598,7 @@ mod tests {
         }
         llm.set_response(
             r#"{"message": "Here's your session.", "actions": [
-                {"type": "propose_workout", "title": "Push", "exercises": [
+                {"type": "propose_session_roster", "title": "Push", "exercises": [
                     {"exercise": "Bench Press", "target_sets": 3, "target_reps": 6, "target_weight_kg": 60.0}
                 ]}
             ]}"#,
@@ -693,7 +693,7 @@ mod tests {
         llm.set_response(r#"{"message": "Done!", "actions": [{"type": "end_session"}]}"#);
         let _ = handler.handle_text_message(&msg, "done").await.unwrap();
         llm.set_response(
-            r#"{"message": "New plan.", "actions": [{"type": "propose_workout", "title": "Pull", "exercises": [
+            r#"{"message": "New plan.", "actions": [{"type": "propose_session_roster", "title": "Pull", "exercises": [
                 {"exercise": "Bench Press", "target_sets": 3, "target_reps": 6, "target_weight_kg": 60.0}
             ]}]}"#,
         );

@@ -158,15 +158,20 @@ pub enum AssistantAction {
         #[serde(alias = "philosophy")]
         content: String,
     },
-    /// Emitted by the `/nextworkout` designer prompt. The host persists a
-    /// `proposed` workout plan from it and shows it to the user; it NEVER logs
-    /// sets or starts a session.
-    ProposeWorkout {
+    /// Emitted by the `/nextworkout` designer prompt. The host persists a draft
+    /// session roster from it and shows it to the user; it NEVER logs sets or
+    /// starts a session.
+    ///
+    /// The `propose_workout` alias is a wire contract, not a leftover: replayed
+    /// conversation history holds envelopes carrying the old tag, and small models
+    /// imitate the shapes they see in that history.
+    #[serde(alias = "propose_workout")]
+    ProposeSessionRoster {
         title: String,
         #[serde(default)]
         rationale: Option<String>,
         #[serde(default)]
-        exercises: Vec<ProposedExercise>,
+        exercises: Vec<ProposedRosterExercise>,
     },
     /// Append a durable training preference or constraint the user voices mid-workout
     /// (e.g. "always give me goblet squats instead of barbell") to their philosophy,
@@ -202,11 +207,11 @@ pub enum AssistantAction {
     Unknown,
 }
 
-/// One prescribed exercise inside a [`AssistantAction::ProposeWorkout`]. The
-/// target fields mirror the plan storage: `(target_reps, target_weight_kg)` for
+/// One prescribed exercise inside a [`AssistantAction::ProposeSessionRoster`]. The
+/// target fields mirror the roster storage: `(target_reps, target_weight_kg)` for
 /// the weight_reps case, `target_secs` for timed work.
 #[derive(Debug, Deserialize)]
-pub struct ProposedExercise {
+pub struct ProposedRosterExercise {
     pub exercise: String,
     #[serde(default)]
     pub target_sets: Option<i32>,
@@ -498,9 +503,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_propose_workout() {
+    fn parse_propose_session_roster() {
         let json = r#"{
-            "type": "propose_workout",
+            "type": "propose_session_roster",
             "title": "Upper push + lat focus",
             "rationale": "2 days rest on bench; sub one-arm rows for the back niggle.",
             "exercises": [
@@ -510,7 +515,7 @@ mod tests {
         }"#;
         let action: AssistantAction = serde_json::from_str(json).unwrap();
         match action {
-            AssistantAction::ProposeWorkout { title, rationale, exercises } => {
+            AssistantAction::ProposeSessionRoster { title, rationale, exercises } => {
                 assert_eq!(title, "Upper push + lat focus");
                 assert!(rationale.unwrap().contains("2 days rest"));
                 assert_eq!(exercises.len(), 2);
@@ -519,22 +524,40 @@ mod tests {
                 assert_eq!(exercises[0].notes.as_deref(), Some("push the weight"));
                 assert_eq!(exercises[1].target_secs, Some(60));
             }
-            _ => panic!("expected ProposeWorkout"),
+            _ => panic!("expected ProposeSessionRoster"),
+        }
+    }
+
+    /// The pre-rename tag. Conversation history stored before the roster vocabulary
+    /// landed replays through this parser, so `propose_workout` must keep working —
+    /// do not "tidy" this alias away with the type rename.
+    #[test]
+    fn parse_propose_session_roster_legacy_tag_alias() {
+        let json = r#"{"type": "propose_workout", "title": "Legacy envelope", "exercises": [
+            {"exercise": "Squat", "target_sets": 3, "target_reps": 5}
+        ]}"#;
+        let action: AssistantAction = serde_json::from_str(json).unwrap();
+        match action {
+            AssistantAction::ProposeSessionRoster { title, exercises, .. } => {
+                assert_eq!(title, "Legacy envelope");
+                assert_eq!(exercises[0].exercise, "Squat");
+            }
+            _ => panic!("expected the propose_workout tag to alias onto ProposeSessionRoster"),
         }
     }
 
     #[test]
-    fn parse_propose_workout_weight_and_cue_aliases() {
-        let json = r#"{"type": "propose_workout", "title": "Quick", "exercises": [
+    fn parse_propose_session_roster_weight_and_cue_aliases() {
+        let json = r#"{"type": "propose_session_roster", "title": "Quick", "exercises": [
             {"exercise": "Squat", "target_weight": 100.0, "cue": "brace hard"}
         ]}"#;
         let action: AssistantAction = serde_json::from_str(json).unwrap();
         match action {
-            AssistantAction::ProposeWorkout { exercises, .. } => {
+            AssistantAction::ProposeSessionRoster { exercises, .. } => {
                 assert_eq!(exercises[0].target_weight_kg, Some(100.0));
                 assert_eq!(exercises[0].notes.as_deref(), Some("brace hard"));
             }
-            _ => panic!("expected ProposeWorkout"),
+            _ => panic!("expected ProposeSessionRoster"),
         }
     }
 

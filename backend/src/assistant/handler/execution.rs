@@ -289,10 +289,10 @@ impl AssistantHandler {
                 tracing::debug!("Ignoring save_philosophy outside the philosophy interview");
                 Ok(ActionOutcome::none())
             }
-            AssistantAction::ProposeWorkout { .. } => {
-                // Only meaningful for `/nextworkout`, which persists the plan directly
+            AssistantAction::ProposeSessionRoster { .. } => {
+                // Only meaningful for `/nextworkout`, which persists the roster directly
                 // and never routes it through here. Ignore it during normal chat.
-                tracing::debug!("Ignoring propose_workout outside /nextworkout");
+                tracing::debug!("Ignoring propose_session_roster outside /nextworkout");
                 Ok(ActionOutcome::none())
             }
             AssistantAction::AppendPhilosophyNote { note } => {
