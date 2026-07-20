@@ -3,7 +3,7 @@ use rusqlite::{Connection, Row, params};
 
 use super::database::Database;
 use super::models::{
-    Difficulty, ExerciseEntry, ExerciseSet, ExerciseTypeWithAncestry, MeasurementType, Session, SessionFeel, SessionSummary,
+    Difficulty, EffortSource, ExerciseEntry, ExerciseSet, ExerciseTypeWithAncestry, MeasurementType, Session, SessionFeel, SessionSummary,
 };
 
 /// An exercise entry paired with the sets logged into it.
@@ -23,14 +23,15 @@ fn row_to_session(row: &Row) -> rusqlite::Result<Session> {
         ended_at: row.get(3)?,
         notes: row.get(4)?,
         overall_effort: row.get::<_, Option<String>>(5)?.map(|s| Difficulty::from_str_loose(&s)),
-        felt: row.get::<_, Option<String>>(6)?.map(|s| SessionFeel::from_str_loose(&s)),
-        cut_short: row.get(7)?,
-        cut_short_reason: row.get(8)?,
+        effort_source: row.get::<_, Option<String>>(6)?.map(|s| EffortSource::from_str_loose(&s)),
+        felt: row.get::<_, Option<String>>(7)?.map(|s| SessionFeel::from_str_loose(&s)),
+        cut_short: row.get(8)?,
+        cut_short_reason: row.get(9)?,
     })
 }
 
-const SELECT_SESSION: &str =
-    "SELECT id, user_id, started_at, ended_at, intent, overall_effort, felt, cut_short, cut_short_reason FROM sessions";
+const SELECT_SESSION: &str = "SELECT id, user_id, started_at, ended_at, intent, overall_effort, effort_source, felt, cut_short, \
+                              cut_short_reason FROM sessions";
 
 /// The perceived difficulty of the LAST set of each distinct exercise in a
 /// session — the sets that best capture how the session finished.
@@ -121,11 +122,16 @@ impl Database {
              WHERE session_id = ?1 AND end_timestamp IS NULL",
             params![session_id],
         )?;
-        // COALESCE keeps any effort the user already voiced mid-session.
+        // COALESCE keeps any effort the user already voiced mid-session — and with it
+        // that effort's `confirmed` provenance, so distilling here can only ever fill
+        // in a verdict nobody has given, never downgrade one the user stood behind.
         if let Some(effort) = distil_overall_effort(&last_set_difficulties(&tx, session_id)?) {
             tx.execute(
-                "UPDATE sessions SET overall_effort = COALESCE(overall_effort, ?2) WHERE id = ?1",
-                params![session_id, effort.as_str()],
+                "UPDATE sessions SET \
+                     effort_source = CASE WHEN overall_effort IS NULL THEN ?3 ELSE effort_source END, \
+                     overall_effort = COALESCE(overall_effort, ?2) \
+                 WHERE id = ?1",
+                params![session_id, effort.as_str(), EffortSource::Derived.as_str()],
             )?;
         }
         tx.commit()?;
@@ -143,14 +149,25 @@ impl Database {
         cut_short: Option<bool>,
         cut_short_reason: Option<&str>,
     ) -> anyhow::Result<()> {
+        // An effort arriving here came from the user, so it is confirmed — that is what
+        // separates it from the reading `end_session` distilled. Saying only how the
+        // session *felt* leaves the effort, and its provenance, untouched.
         let rows = self.conn().execute(
             "UPDATE sessions SET \
                  overall_effort = COALESCE(?2, overall_effort), \
+                 effort_source = CASE WHEN ?2 IS NULL THEN effort_source ELSE ?6 END, \
                  felt = COALESCE(?3, felt), \
                  cut_short = COALESCE(?4, cut_short), \
                  cut_short_reason = COALESCE(?5, cut_short_reason) \
              WHERE id = ?1",
-            params![session_id, overall_effort.map(|d| d.as_str()), felt.map(|f| f.as_str()), cut_short, cut_short_reason],
+            params![
+                session_id,
+                overall_effort.map(|d| d.as_str()),
+                felt.map(|f| f.as_str()),
+                cut_short,
+                cut_short_reason,
+                EffortSource::Confirmed.as_str(),
+            ],
         )?;
         anyhow::ensure!(rows > 0, "session id {session_id} not found");
         Ok(())
@@ -195,7 +212,8 @@ impl Database {
 
     pub fn list_session_summaries(&self, user_id: i64, from: Option<&str>, to: Option<&str>) -> anyhow::Result<Vec<SessionSummary>> {
         let mut stmt = self.conn().prepare(
-            "SELECT s.id, s.user_id, s.started_at, s.ended_at, s.intent, s.overall_effort, s.felt, s.cut_short, s.cut_short_reason, \
+            "SELECT s.id, s.user_id, s.started_at, s.ended_at, s.intent, s.overall_effort, s.effort_source, s.felt, s.cut_short, \
+                    s.cut_short_reason, \
                     COUNT(DISTINCT ee.id) AS exercise_count, \
                     CASE WHEN s.ended_at IS NULL THEN NULL \
                          ELSE CAST((julianday(s.ended_at) - julianday(s.started_at)) * 24 * 60 AS INTEGER) \
@@ -210,7 +228,7 @@ impl Database {
         )?;
         let rows = stmt.query_map(params![user_id, from, to], |row| {
             let session = row_to_session(row)?;
-            Ok(SessionSummary { session, exercise_count: row.get(9)?, duration_mins: row.get(10)? })
+            Ok(SessionSummary { session, exercise_count: row.get(10)?, duration_mins: row.get(11)? })
         })?;
         rows.collect::<Result<Vec<_>, _>>().context("Failed to list session summaries")
     }
@@ -932,6 +950,86 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].1.len(), 1);
         assert_eq!(entries[0].1[0].value, 60.0);
+    }
+
+    /// Ending a session distils an effort nobody has given yet, and says so. That
+    /// provenance is what lets the auto-close path offer its reading back for
+    /// correction instead of asserting it.
+    #[test]
+    fn ending_a_session_marks_its_distilled_effort_as_derived() {
+        let (db, user_id, bp_id) = fixture();
+        let session = db.start_session(user_id, None).unwrap();
+        let entry_id = db.insert_entry(&new_exercise_entry(user_id, Some(session.id), None)).unwrap();
+        let mut set = new_exercise_set(entry_id, bp_id, MeasurementType::WeightReps, 60.0);
+        set.count = Some(8);
+        set.perceived_difficulty = Difficulty::Hard;
+        db.insert_set(&set).unwrap();
+
+        db.end_session(session.id).unwrap();
+
+        let ended = db.get_session(session.id).unwrap().unwrap();
+        assert_eq!(ended.overall_effort, Some(Difficulty::Hard));
+        assert_eq!(ended.effort_source, Some(EffortSource::Derived), "nobody was asked, so it is a reading");
+    }
+
+    /// The user's own verdict is confirmed, and overrides the reading — this is the
+    /// correction path the auto-close note invites.
+    #[test]
+    fn recording_an_outcome_confirms_the_effort() {
+        let (db, user_id, bp_id) = fixture();
+        let session = db.start_session(user_id, None).unwrap();
+        let entry_id = db.insert_entry(&new_exercise_entry(user_id, Some(session.id), None)).unwrap();
+        let mut set = new_exercise_set(entry_id, bp_id, MeasurementType::WeightReps, 60.0);
+        set.count = Some(8);
+        set.perceived_difficulty = Difficulty::Hard;
+        db.insert_set(&set).unwrap();
+        db.end_session(session.id).unwrap();
+
+        db.set_session_outcome(session.id, Some(Difficulty::Easy), None, None, None).unwrap();
+
+        let updated = db.get_session(session.id).unwrap().unwrap();
+        assert_eq!(updated.overall_effort, Some(Difficulty::Easy));
+        assert_eq!(updated.effort_source, Some(EffortSource::Confirmed));
+    }
+
+    /// Saying only how a session *felt* is not a verdict on how hard it was, so it
+    /// must not promote the server's reading to the user's word.
+    #[test]
+    fn recording_only_a_feeling_leaves_the_effort_provenance_alone() {
+        let (db, user_id, bp_id) = fixture();
+        let session = db.start_session(user_id, None).unwrap();
+        let entry_id = db.insert_entry(&new_exercise_entry(user_id, Some(session.id), None)).unwrap();
+        let mut set = new_exercise_set(entry_id, bp_id, MeasurementType::WeightReps, 60.0);
+        set.count = Some(8);
+        set.perceived_difficulty = Difficulty::Hard;
+        db.insert_set(&set).unwrap();
+        db.end_session(session.id).unwrap();
+
+        db.set_session_outcome(session.id, None, Some(SessionFeel::Great), None, None).unwrap();
+
+        let updated = db.get_session(session.id).unwrap().unwrap();
+        assert_eq!(updated.effort_source, Some(EffortSource::Derived), "a feeling is not an effort verdict");
+        assert_eq!(updated.felt, Some(SessionFeel::Great));
+    }
+
+    /// An effort the user voiced mid-session is already theirs; ending the session
+    /// must not overwrite it, nor downgrade its provenance to a reading.
+    #[test]
+    fn ending_a_session_does_not_downgrade_a_confirmed_effort() {
+        let (db, user_id, bp_id) = fixture();
+        let session = db.start_session(user_id, None).unwrap();
+        let entry_id = db.insert_entry(&new_exercise_entry(user_id, Some(session.id), None)).unwrap();
+        let mut set = new_exercise_set(entry_id, bp_id, MeasurementType::WeightReps, 60.0);
+        set.count = Some(8);
+        set.perceived_difficulty = Difficulty::Hard;
+        db.insert_set(&set).unwrap();
+
+        db.set_session_outcome(session.id, Some(Difficulty::Easy), None, None, None).unwrap();
+        db.end_session(session.id).unwrap();
+
+        let ended = db.get_session(session.id).unwrap().unwrap();
+        assert_eq!(ended.overall_effort, Some(Difficulty::Easy), "the user's word stands");
+        assert_eq!(ended.effort_source, Some(EffortSource::Confirmed));
     }
 
     /// `start_session_at` is the DAO's answer to back-dated fixtures — the reason

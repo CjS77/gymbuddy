@@ -84,8 +84,20 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().context("Failed to list goals in period")
     }
 
+    /// Flip a goal to achieved, stamping *when* it happened.
+    ///
+    /// `achieved_at` is written only on the transition: a goal already marked keeps its
+    /// original date, so regenerating a review — after an effort correction, say —
+    /// cannot quietly move the day the user hit their target forward to today.
     pub fn mark_goal_achieved(&self, id: i64) -> anyhow::Result<()> {
-        let rows = self.conn().execute("UPDATE goals SET achieved = 1, updated_at = datetime('now') WHERE id = ?1", params![id])?;
+        let rows = self.conn().execute(
+            "UPDATE goals SET \
+                 achieved = 1, \
+                 achieved_at = COALESCE(achieved_at, datetime('now')), \
+                 updated_at = datetime('now') \
+             WHERE id = ?1",
+            params![id],
+        )?;
         anyhow::ensure!(rows > 0, "Goal with id {id} not found");
         Ok(())
     }
@@ -157,6 +169,32 @@ mod tests {
 
         let active = db.list_active_goals(user_id).unwrap();
         assert!(active.is_empty());
+    }
+
+    /// Achieving a goal records *when*. The stamp is what a later review reads back to
+    /// say the goal was hit on the day it was hit, so it must survive a regeneration
+    /// rather than drifting to whenever the review was last rebuilt.
+    #[test]
+    fn mark_goal_achieved_stamps_the_date_once() {
+        let db = test_db();
+        let user_id = db.insert_user(&new_user("Tester", None, "UTC")).unwrap();
+        let bp = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+        let goal_id = db.insert_goal(&new_exercise_goal(user_id, bp.id, 100.0)).unwrap();
+
+        let achieved_at = |db: &Database| -> Option<String> {
+            db.conn().query_row("SELECT achieved_at FROM goals WHERE id = ?1", params![goal_id], |r| r.get(0)).unwrap()
+        };
+        assert!(achieved_at(&db).is_none(), "an unachieved goal carries no date");
+
+        db.mark_goal_achieved(goal_id).unwrap();
+        let first = achieved_at(&db).expect("achieving a goal stamps the date");
+
+        // Backdate it, then re-run: a second call must not move the day the user hit
+        // their target forward.
+        db.conn().execute("UPDATE goals SET achieved_at = '2020-01-01 00:00:00' WHERE id = ?1", params![goal_id]).unwrap();
+        db.mark_goal_achieved(goal_id).unwrap();
+        assert_eq!(achieved_at(&db).as_deref(), Some("2020-01-01 00:00:00"), "the original date stands");
+        assert!(!first.is_empty());
     }
 
     #[test]

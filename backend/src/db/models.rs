@@ -200,6 +200,49 @@ impl fmt::Display for Difficulty {
     }
 }
 
+/// Where a session's `overall_effort` came from.
+///
+/// The two are not equally trustworthy, which is why the column exists: a
+/// [`Derived`](Self::Derived) effort is the server's own reading of the last set of
+/// each exercise, written when a session ends with nobody around to ask, and it is
+/// worth offering back for correction. A [`Confirmed`](Self::Confirmed) one is the
+/// user's own verdict and must not be second-guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffortSource {
+    /// Distilled by `end_session` from the logged sets — a proposal, not an answer.
+    Derived,
+    /// The user said so, through `RecordSessionOutcome`.
+    Confirmed,
+}
+
+impl EffortSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Derived => "derived",
+            Self::Confirmed => "confirmed",
+        }
+    }
+
+    pub fn from_str_loose(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "confirmed" => Self::Confirmed,
+            _ => Self::Derived,
+        }
+    }
+
+    /// Whether the user stood behind this verdict themselves.
+    pub fn is_confirmed(self) -> bool {
+        matches!(self, Self::Confirmed)
+    }
+}
+
+impl fmt::Display for EffortSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// How a whole session subjectively felt, as opposed to how mechanically hard it
 /// was ([`Difficulty`]): a hard session can still feel great. Part of the
 /// session outcome recorded at session end.
@@ -563,6 +606,10 @@ pub struct Session {
     /// `notes` these fields are structured and feed the designer's feedback loop.
     #[serde(default)]
     pub overall_effort: Option<Difficulty>,
+    /// Whether `overall_effort` is the user's own verdict or the server's reading of
+    /// the logged sets. `None` when no effort has been settled either way.
+    #[serde(default)]
+    pub effort_source: Option<EffortSource>,
     /// How the session subjectively felt, independent of `overall_effort`.
     #[serde(default)]
     pub felt: Option<SessionFeel>,
@@ -718,6 +765,40 @@ pub struct WeekSummary {
     pub total_volume: f64,
 }
 
+/// A personal record set during one particular session, with the mark it beat.
+///
+/// Not a [`PersonalRecord`]: that one is an all-time leaderboard row with no session
+/// linkage, which is exactly the question a post-session review cannot answer with it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionPersonalRecord {
+    pub exercise_name: String,
+    pub measurement_type: MeasurementType,
+    /// The new best — weight in kg, seconds, metres, level or score per
+    /// `measurement_type`.
+    pub value: f64,
+    /// Reps at `value`, for `weight_reps` work. `None` for every other measurement.
+    pub count: Option<i32>,
+    /// The best that stood before this session. `None` when this is the first time the
+    /// exercise has been logged at all — a record only in the trivial sense, and one a
+    /// review should not celebrate as a breakthrough.
+    pub previous_value: Option<f64>,
+    pub previous_count: Option<i32>,
+}
+
+/// A persisted post-session review, straight out of `session_reviews`.
+///
+/// `body` stays an opaque JSON string at this layer: the schema's one JSON column is
+/// deliberately not interpreted by SQL, and the review generator owns its shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredReview {
+    pub session_id: i64,
+    pub roster_id: Option<i64>,
+    /// `summary` (deterministic, ad-hoc) or `report` (programme mode, with commentary).
+    pub kind: String,
+    pub body: String,
+    pub created_at: String,
+}
+
 // ── Constructors (drafts; id is set by the insert function via last_insert_rowid) ──
 
 fn now_str() -> String {
@@ -768,6 +849,7 @@ pub fn new_session(user_id: i64, notes: Option<&str>) -> Session {
         ended_at: None,
         notes: notes.map(String::from),
         overall_effort: None,
+        effort_source: None,
         felt: None,
         cut_short: false,
         cut_short_reason: None,

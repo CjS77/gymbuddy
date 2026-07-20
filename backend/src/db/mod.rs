@@ -18,6 +18,7 @@ mod models;
 mod philosophy;
 mod programmes;
 mod progress;
+mod reviews;
 mod rosters;
 mod users;
 
