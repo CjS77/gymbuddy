@@ -247,9 +247,10 @@ const CHART_HEIGHT: u16 = 9;
 const MIN_CHART_WIDTH: u16 = 32;
 
 /// The integer domain [`Bar`] values are scaled into. `Bar` counts in `u64` and a
-/// reading is an `f64`, so bar *lengths* are scaled integers while the number itself
-/// is carried verbatim by [`Bar::text_value`] — the bar is the comparison, the text is
-/// the reading, and neither is rounded into the other.
+/// reading is an `f64`, so bar *lengths* are scaled integers, finely enough that the
+/// rounding never reaches a column. The reading itself is printed verbatim beside the
+/// bar: the bar is the comparison, the text is the number, and neither is rounded into
+/// the other.
 const BAR_TICKS: u64 = 10_000;
 
 /// Render progress ([C6.2]) as ratatui charts and text ([T2.2]).
