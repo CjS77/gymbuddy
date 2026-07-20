@@ -177,3 +177,4 @@ fn every_goal_kind_reaches_the_corpus() {
         );
     });
 }
+
