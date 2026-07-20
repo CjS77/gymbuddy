@@ -96,18 +96,18 @@ impl MovementPattern {
     /// is not in the catalogue, would not resolve, and is precisely the prescription that must never
     /// reach a user with a sore shoulder.
     ///
-    /// The fragments are specific on purpose — the failure mode to design against is a rail so broad
-    /// it bars the substitutions the corpus recommends. There is no bare `"squat"` here because
-    /// `injury-knee` prescribes box and belt squats; no bare `"lat pulldown"` because
-    /// `injury-shoulder` prescribes the front pulldown as the fix for the behind-neck one.
+    /// Broad where the movement family is the risk, narrow where it is not. `"squat"` is bare on
+    /// purpose: the catalogue really does contain a `Squat` category, and the designer may prescribe
+    /// it by that name — a rule written only for `"back squat"` waves it straight through.
+    /// [`Self::exemptions`] carves the variants the corpus prescribes back out. There is no bare
+    /// `"lat pulldown"`, by contrast, because `injury-shoulder` offers the front pulldown as the
+    /// *fix* for the behind-neck one: there the family is not the risk, one position is.
     fn fragments(&self) -> &'static [&'static str] {
         match self {
             Self::LoadedSpinalFlexion => {
                 &["deadlift", "good morning", "bent over row", "bent-over row", "barbell row", "pendlay row", "kettlebell swing"]
             }
-            Self::AxialCompression => {
-                &["back squat", "front squat", "overhead squat", "military press", "push press", "shrug", "farmer", "loaded carry"]
-            }
+            Self::AxialCompression => &["squat", "military press", "push press", "shrug", "farmer", "loaded carry"],
             Self::EndRangeSpinalFlexion => &["sit-up", "situp", "sit up", "crunch", "leg raise", "ab wheel", "roman chair", "toe touch"],
             Self::LoadedSpinalRotation => &["russian twist", "woodchop", "wood chop", "side bend", "landmine twist", "rotational throw"],
             Self::OverheadPressing => &["overhead press", "military press", "push press", "shoulder press", "arnold press"],
@@ -116,19 +116,43 @@ impl MovementPattern {
             Self::DeepDipping => &["dip"],
             Self::UprightRowing => &["upright row"],
             Self::RaiseAboveShoulderHeight => &["lateral raise", "front raise"],
-            Self::DeepKneeFlexionUnderLoad => {
-                &["back squat", "front squat", "overhead squat", "lunge", "bulgarian split squat", "deep leg press", "sissy squat"]
-            }
+            // No bare "step-up": the knee document's concern is step-ups "through a large range" and
+            // its substitution is a step-up "to a low box" — a range qualifier a name cannot carry.
+            Self::DeepKneeFlexionUnderLoad => &["squat", "lunge", "deep leg press"],
             Self::OpenChainKneeExtension => &["leg extension"],
             Self::HighImpactPlyometrics => &["jump", "plyometric", "bounding", "box jump", "depth jump", "burpee"],
             Self::RunningVolume => &["running", "sprint", "jogging"],
         }
     }
 
+    /// The variants a fragment catches but the corpus prescribes anyway — checked after
+    /// [`Self::fragments`] and overriding it.
+    ///
+    /// This is where "reduce the range" survives contact with a matcher that can only read a name. A
+    /// box squat and a belt squat are squats that the knee document offers *as the substitution*, and
+    /// the load is taken off the lumbar spine in a hack or split squat. Each of these is named in the
+    /// document cited by the rail that would otherwise bar it.
+    ///
+    /// What is deliberately *not* exempt: qualifiers the corpus attaches to a movement but a name
+    /// cannot carry — "lighter", "to a pain-free depth", "through a shortened range". Those describe
+    /// the mild response, and mild does not reach most thresholds in the first place.
+    fn exemptions(&self) -> &'static [&'static str] {
+        match self {
+            // The lower-back document's own substitution table: leg press, split squat, hack squat,
+            // belt squat. Each keeps the pattern's training effect with the spine unloaded.
+            Self::AxialCompression => &["split squat", "hack squat", "belt squat", "box squat"],
+            // The knee document prescribes squatting to a controlled depth rather than not at all.
+            // A Bulgarian split squat is *not* exempt: it is named in the list to avoid, at depth.
+            Self::DeepKneeFlexionUnderLoad => &["box squat", "belt squat", "wall sit"],
+            _ => &[],
+        }
+    }
+
     /// Whether `exercise_name` is an instance of this pattern.
     pub fn matches(&self, exercise_name: &str) -> bool {
         let name = exercise_name.to_lowercase();
-        self.fragments().iter().any(|fragment| name.contains(fragment))
+        let hit = self.fragments().iter().any(|fragment| name.contains(fragment));
+        hit && !self.exemptions().iter().any(|exempt| name.contains(exempt))
     }
 }
 
@@ -250,7 +274,7 @@ pub static RAILS: &[BodyPartRails] = &[
             Contraindication {
                 pattern: MovementPattern::DeepKneeFlexionUnderLoad,
                 bars_from: Severity::Moderate,
-                substitutions: &["box squat to a pain-free depth", "belt squat", "split squat with reduced depth", "step-up to a low box", "hip thrust"],
+                substitutions: &["box squat to a pain-free depth", "belt squat", "step-up to a low box", "hip thrust", "leg curl"],
             },
             // As with the shoulder raise: the corpus offers "a lighter leg extension through a
             // pain-free range", which is the mild response and does not reach this threshold.

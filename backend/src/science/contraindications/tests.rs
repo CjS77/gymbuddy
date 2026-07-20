@@ -175,8 +175,38 @@ fn the_corpus_recommended_substitutions_are_never_barred() {
     assert!(violations(&shoulder, &roster(&shoulder_safe)).is_empty(), "{:?}", barred(&shoulder, &shoulder_safe));
 
     let knee = [injury("knee", Severity::Severe)];
-    let knee_safe = ["Leg Press", "Split Squat", "Hip Thrust", "Seated Leg Curl", "Cycling", "Swimming", "Rowing"];
+    let knee_safe = ["Leg Press", "Box Squat", "Belt Squat", "Hip Thrust", "Seated Leg Curl", "Cycling", "Swimming", "Rowing"];
     assert!(violations(&knee, &roster(&knee_safe)).is_empty(), "{:?}", barred(&knee, &knee_safe));
+}
+
+/// The catalogue carries bare category names — `Squat`, `Deadlift`, `Lunge` — and the designer may
+/// prescribe one by that name. A rail written only for the named variants would wave the category
+/// straight through, which is the gap a sweep over the real catalogue turned up.
+#[test]
+fn a_bare_category_name_is_caught_like_its_variants() {
+    let back = [injury("lower_back", Severity::Moderate)];
+    assert_eq!(barred(&back, &["Squat"]), vec!["Squat"], "the bare `Squat` category loads the spine too");
+    assert_eq!(barred(&back, &["Deadlift"]), vec!["Deadlift"]);
+
+    let knee = [injury("knee", Severity::Moderate)];
+    assert_eq!(barred(&knee, &["Squat"]), vec!["Squat"]);
+    assert_eq!(barred(&knee, &["Lunge"]), vec!["Lunge"]);
+}
+
+/// The exemptions are the counterweight to a broad fragment: `"squat"` catches the category, and
+/// these carve back out the variants the cited document prescribes as the way round it.
+#[test]
+fn exempted_variants_survive_a_broad_fragment() {
+    let back = [injury("lower_back", Severity::Severe)];
+    for safe in ["Hack Squat", "Split Squat", "Belt Squat", "Box Squat"] {
+        assert!(violations(&back, &roster(&[safe])).is_empty(), "`{safe}` is a lower-back substitution, not a bar");
+    }
+
+    // A Bulgarian split squat is *not* exempt for the knee: the document names it, at depth, in the
+    // list to avoid. The lower back tolerates it — it is the spine that is spared, not the knee.
+    let knee = [injury("knee", Severity::Moderate)];
+    assert_eq!(barred(&knee, &["Bulgarian Split Squat"]), vec!["Bulgarian Split Squat"]);
+    assert!(violations(&[injury("lower_back", Severity::Severe)], &roster(&["Bulgarian Split Squat"])).is_empty());
 }
 
 /// Only an unresolved injury constrains the design. An illness has a severity but no movement
