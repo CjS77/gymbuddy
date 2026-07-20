@@ -161,7 +161,7 @@ fn render_session_roster(roster: &SessionRosterView, mode: Option<&TrainingModeV
         }
     }
 
-    result.push_str("\nThis is just a plan -- log your sets as you go and I'll adjust.");
+    result.push_str("\nNothing is logged yet -- log your sets as you go and I'll adjust.");
     result
 }
 
@@ -305,7 +305,7 @@ mod tests {
                         3. <b>Plank</b> — 3 sets × 60s\n\
                         \n<b>Notes:</b>\n\
                         - Skipped deadlift to protect your lower back.\n\
-                        \nThis is just a plan -- log your sets as you go and I'll adjust.";
+                        \nNothing is logged yet -- log your sets as you go and I'll adjust.";
         assert_eq!(html, expected);
     }
 
@@ -332,15 +332,15 @@ mod tests {
     fn programme_session_roster_html_names_the_slot() {
         let view = View::ProgrammeSessionRoster {
             roster: one_exercise_roster(),
-            mode: TrainingModeView::Programme { programme_title: "12-week <plan>".into(), week: 2, day: 1, focus: "upper".into() },
+            mode: TrainingModeView::Programme { programme_title: "12-week <hyper>".into(), week: 2, day: 1, focus: "upper".into() },
         };
         let (html, mode) = Telegram.render(&view);
         assert_eq!(mode, Some("HTML"));
         let expected = "<b>Upper</b>\n\
-                        <i>Programme: 12-week &lt;plan&gt; — week 2, day 1: upper</i>\n\
+                        <i>Programme: 12-week &lt;hyper&gt; — week 2, day 1: upper</i>\n\
                         \n\
                         1. <b>Bench Press</b> — 3 sets × 6 reps @ 65kg\n\
-                        \nThis is just a plan -- log your sets as you go and I'll adjust.";
+                        \nNothing is logged yet -- log your sets as you go and I'll adjust.";
         assert_eq!(html, expected);
     }
 

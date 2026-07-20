@@ -175,7 +175,7 @@ fn render_session_roster(roster: &SessionRosterView, mode: Option<&TrainingModeV
     }
 
     lines.push(Line::from(""));
-    lines.push(muted("This is just a plan — log your sets as you go and I'll adjust.".into()));
+    lines.push(muted("Nothing is logged yet — log your sets as you go and I'll adjust.".into()));
     lines
 }
 
