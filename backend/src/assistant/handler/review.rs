@@ -675,3 +675,404 @@ fn trim_decimal(v: f64) -> String {
         false => format!("{rounded}"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_support::*;
+    use super::*;
+    use crate::db::{
+        LifecycleStatus, Programme, ProgrammeSlot, RosterExercise, SlotStatus, new_exercise_entry_at, new_exercise_goal, new_exercise_set,
+    };
+    use crate::db::SetEdit;
+    use gymbuddy_proto::{ReviewKindView, View};
+
+    /// A canned commentary reply in the envelope every prompt asks for.
+    const COMMENTARY: &str = r#"{"message": "You held the extra load for every set. Keep it there next week.", "actions": []}"#;
+
+    /// A registered user with one bench-press goal on file.
+    async fn ready_user(handler: &AssistantHandler) -> User {
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
+        let user = { handler.db.lock().await.get_user_by_telegram_id("12345").unwrap().unwrap() };
+        let db = handler.db.lock().await;
+        let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+        let mut goal = new_exercise_goal(user.id, bench.id, 200.0);
+        goal.start_date = "2026-01-01".into();
+        db.insert_goal(&goal).unwrap();
+        user
+    }
+
+    /// An ended session with one bench-press entry of `sets` sets at `weight`.
+    async fn logged_session(handler: &AssistantHandler, user: &User, weight: f64, sets: usize) -> i64 {
+        let db = handler.db.lock().await;
+        let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+        let session_id = db.start_session_at(user.id, "2026-07-01 09:00:00", None, Some("upper push")).unwrap();
+        let entry_id = db.insert_entry(&new_exercise_entry_at(user.id, Some(session_id), None, "2026-07-01 09:05:00")).unwrap();
+        (0..sets).for_each(|i| {
+            let mut set = new_exercise_set(entry_id, bench.id, MeasurementType::WeightReps, weight);
+            set.count = Some(6);
+            set.order_idx = i as i32;
+            set.logged_at = "2026-07-01 09:10:00".to_string();
+            db.insert_set(&set).unwrap();
+        });
+        db.end_session(session_id).unwrap();
+        session_id
+    }
+
+    /// Bind a roster to a session, optionally filling a programme slot — which is what
+    /// makes the session programme-mode.
+    async fn bind_roster(handler: &AssistantHandler, user: &User, session_id: i64, target_weight: f64, programme: bool) {
+        let db = handler.db.lock().await;
+        let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+        let roster_id = db.create_roster(user.id, "Upper push", None, None).unwrap();
+        db.add_roster_exercise(&RosterExercise {
+            id: 0,
+            roster_id,
+            exercise_type_id: bench.id,
+            order_idx: 0,
+            target_sets: Some(3),
+            target_reps: Some(6),
+            target_weight_kg: Some(target_weight),
+            target_secs: None,
+            notes: None,
+        })
+        .unwrap();
+
+        if programme {
+            let programme_id = db
+                .create_programme(&Programme {
+                    id: 0,
+                    user_id: user.id,
+                    title: "12-week hypertrophy".into(),
+                    start_date: "2026-06-01".into(),
+                    target_end_date: None,
+                    days_per_week: 3,
+                    split: "upper/lower".into(),
+                    progression_policy: "double progression".into(),
+                    status: LifecycleStatus::Active,
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                })
+                .unwrap();
+            let slot_id = db
+                .add_programme_slot(&ProgrammeSlot {
+                    id: 0,
+                    programme_id,
+                    week_idx: 2,
+                    day_idx: 1,
+                    focus: "upper".into(),
+                    status: SlotStatus::Pending,
+                    updated_at: String::new(),
+                })
+                .unwrap();
+            db.bind_roster_to_slot(roster_id, slot_id).unwrap();
+        }
+        db.bind_roster_to_session(roster_id, session_id).unwrap();
+    }
+
+    // ── The two-tier split ────────────────────────────────────────────────────
+
+    /// The safety property [C6.5] is built around: an ad-hoc session's review is assembled
+    /// entirely from the logged sets, and **no model is consulted at all**. Asserted on the
+    /// mock's recorded requests rather than on the output, because "the commentary field is
+    /// empty" would also be true of a call that was made and then discarded.
+    #[tokio::test]
+    async fn an_adhoc_session_review_makes_no_llm_call() {
+        let (handler, llm) = setup_handler(COMMENTARY).await;
+        let user = ready_user(&handler).await;
+        let session_id = logged_session(&handler, &user, 80.0, 3).await;
+        let before = llm.recorded_requests().len();
+
+        let review = handler.generate_session_review(&user, session_id).await.unwrap();
+
+        assert_eq!(llm.recorded_requests().len(), before, "the ad-hoc tier must not reach the model");
+        assert_eq!(review.kind, ReviewKindView::Summary);
+        assert!(review.commentary.is_none());
+        assert!(!review.headline.is_empty(), "and it still produces a verdict");
+    }
+
+    /// The programme tier makes exactly one call, and the prompt it sends carries the
+    /// already-computed numbers — the grounding that stops the model inventing its own.
+    #[tokio::test]
+    async fn a_programme_session_grounds_one_commentary_call_in_the_stats() {
+        let (handler, llm) = setup_handler(COMMENTARY).await;
+        let user = ready_user(&handler).await;
+        let session_id = logged_session(&handler, &user, 82.5, 3).await;
+        bind_roster(&handler, &user, session_id, 80.0, true).await;
+        let before = llm.recorded_requests().len();
+
+        let review = handler.generate_session_review(&user, session_id).await.unwrap();
+
+        let calls = llm.recorded_requests();
+        assert_eq!(calls.len() - before, 1, "exactly one commentary call");
+        assert_eq!(review.kind, ReviewKindView::Report);
+        assert_eq!(review.commentary.as_deref(), Some("You held the extra load for every set. Keep it there next week."));
+
+        let prompt = &calls[before].messages[0].content;
+        assert!(prompt.contains("SESSION FACTS"), "the call is grounded in the assembled facts: {prompt}");
+        assert!(prompt.contains("Bench Press"), "{prompt}");
+        assert!(prompt.contains("+2.5kg"), "the computed delta reaches the prompt: {prompt}");
+        assert!(prompt.contains("DO NOT DO ARITHMETIC"), "{prompt}");
+        assert!(prompt.contains("NEVER congratulate a session that missed its targets"), "{prompt}");
+    }
+
+    /// A commentary call that fails costs the commentary, never the record.
+    #[tokio::test]
+    async fn a_failed_commentary_still_produces_the_numbers() {
+        let (handler, _llm) = setup_handler("not json at all, and no message field").await;
+        let user = ready_user(&handler).await;
+        let session_id = logged_session(&handler, &user, 82.5, 3).await;
+        bind_roster(&handler, &user, session_id, 80.0, true).await;
+
+        let review = handler.generate_session_review(&user, session_id).await.unwrap();
+        assert!(!review.exercises.is_empty(), "the deterministic half survives");
+        assert!(!review.headline.is_empty());
+    }
+
+    // ── Deterministic content ─────────────────────────────────────────────────
+
+    /// The delta against the prescription is the review's core sentence.
+    #[tokio::test]
+    async fn the_review_reports_the_delta_against_the_prescription() {
+        let (handler, _) = setup_handler(COMMENTARY).await;
+        let user = ready_user(&handler).await;
+        let session_id = logged_session(&handler, &user, 82.5, 3).await;
+        bind_roster(&handler, &user, session_id, 80.0, false).await;
+
+        let review = handler.generate_session_review(&user, session_id).await.unwrap();
+        let bench = review.exercises.iter().find(|e| e.name == "Bench Press").expect("bench press line");
+        assert_eq!(bench.prescribed.as_deref(), Some("3 sets × 6 reps @ 80kg"));
+        assert_eq!(bench.actual, "3 sets × 6 reps @ 82.5kg");
+        assert_eq!(bench.delta.as_deref(), Some("+2.5kg"));
+        assert_eq!(review.adherence.as_deref(), Some("1 of 1 prescribed exercises completed"));
+    }
+
+    /// A session that fell short is described as one. The adjective is computed here, in
+    /// code, precisely so a model inclined to encourage cannot upgrade it.
+    #[tokio::test]
+    async fn a_session_that_skipped_prescribed_work_is_not_called_solid() {
+        let (handler, _) = setup_handler(COMMENTARY).await;
+        let user = ready_user(&handler).await;
+        let session_id = logged_session(&handler, &user, 80.0, 3).await;
+        {
+            // A roster prescribing two exercises, of which only bench was performed.
+            let db = handler.db.lock().await;
+            let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+            let squat = db.get_exercise_type_by_name("Squat").unwrap().unwrap();
+            let roster_id = db.create_roster(user.id, "Upper", None, None).unwrap();
+            [(bench.id, 0), (squat.id, 1)].iter().for_each(|(id, idx)| {
+                db.add_roster_exercise(&RosterExercise {
+                    id: 0,
+                    roster_id,
+                    exercise_type_id: *id,
+                    order_idx: *idx,
+                    target_sets: Some(3),
+                    target_reps: Some(6),
+                    target_weight_kg: Some(80.0),
+                    target_secs: None,
+                    notes: None,
+                })
+                .unwrap();
+            });
+            db.bind_roster_to_session(roster_id, session_id).unwrap();
+        }
+
+        let review = handler.generate_session_review(&user, session_id).await.unwrap();
+        assert!(review.headline.starts_with("Partial session"), "half the prescription is not a solid session: {}", review.headline);
+        assert!(review.exercises.iter().any(|e| e.delta.as_deref() == Some("skipped")), "the skipped work is named");
+    }
+
+    /// A PR set this session is reported with the mark it beat.
+    #[tokio::test]
+    async fn the_review_reports_records_set_this_session() {
+        let (handler, _) = setup_handler(COMMENTARY).await;
+        let user = ready_user(&handler).await;
+        let _older = logged_session(&handler, &user, 80.0, 3).await;
+
+        // A second, later session that beats it.
+        let session_id = {
+            let db = handler.db.lock().await;
+            let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+            let id = db.start_session_at(user.id, "2026-07-08 09:00:00", None, None).unwrap();
+            let entry = db.insert_entry(&new_exercise_entry_at(user.id, Some(id), None, "2026-07-08 09:05:00")).unwrap();
+            let mut set = new_exercise_set(entry, bench.id, MeasurementType::WeightReps, 85.0);
+            set.count = Some(5);
+            set.logged_at = "2026-07-08 09:10:00".to_string();
+            db.insert_set(&set).unwrap();
+            db.end_session(id).unwrap();
+            id
+        };
+
+        let review = handler.generate_session_review(&user, session_id).await.unwrap();
+        let pr = review.records.first().expect("a record");
+        assert_eq!(pr.exercise, "Bench Press");
+        assert_eq!(pr.detail, "85kg × 5");
+        assert_eq!(pr.previous.as_deref(), Some("80kg × 6"));
+    }
+
+    // ── Persistence and snapshot semantics ────────────────────────────────────
+
+    /// The review is a record of what was true when the session ended. Editing a set
+    /// afterwards must not rewrite it.
+    #[tokio::test]
+    async fn a_later_set_edit_does_not_rewrite_the_stored_review() {
+        let (handler, _) = setup_handler(COMMENTARY).await;
+        let user = ready_user(&handler).await;
+        let session_id = logged_session(&handler, &user, 80.0, 3).await;
+
+        let original = handler.generate_session_review(&user, session_id).await.unwrap();
+        assert!(original.exercises[0].actual.contains("80kg"));
+
+        // Rewrite history through the real edit path: the set now says something else.
+        {
+            let db = handler.db.lock().await;
+            let entry = db.list_entries_for_session(session_id).unwrap().remove(0);
+            let set_id = db.list_sets_for_entry(entry.id).unwrap()[0].id;
+            let edit = SetEdit { value: Some(200.0), ..Default::default() };
+            db.edit_set(set_id, user.id, &[], &edit).unwrap();
+        }
+
+        let replayed = handler.latest_stored_review(&user).await.unwrap().expect("a stored review");
+        assert_eq!(replayed.exercises[0].actual, original.exercises[0].actual, "the snapshot stands");
+        assert!(!replayed.exercises[0].actual.contains("200kg"), "the review must not have followed the edit");
+    }
+
+    /// Regenerating replaces the stored review rather than adding a second one.
+    #[tokio::test]
+    async fn regenerating_replaces_the_stored_review() {
+        let (handler, _) = setup_handler(COMMENTARY).await;
+        let user = ready_user(&handler).await;
+        let session_id = logged_session(&handler, &user, 80.0, 3).await;
+
+        handler.generate_session_review(&user, session_id).await.unwrap();
+        let first = { handler.db.lock().await.get_session_review(session_id).unwrap().unwrap() };
+
+        handler.generate_session_review(&user, session_id).await.unwrap();
+        let second = { handler.db.lock().await.get_session_review(session_id).unwrap().unwrap() };
+
+        assert_eq!(first.session_id, second.session_id, "one review, regenerated in place");
+        assert_eq!(first.body, second.body, "and the same session yields the same record");
+    }
+
+    /// Goal achievement is persisted at generation time — the first production caller of
+    /// `mark_goal_achieved`, and the only moment the date a goal was hit is knowable.
+    #[tokio::test]
+    async fn reaching_a_goal_is_persisted_and_leads_the_review() {
+        let (handler, _) = setup_handler(COMMENTARY).await;
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
+        let user = { handler.db.lock().await.get_user_by_telegram_id("12345").unwrap().unwrap() };
+
+        let goal_id = {
+            let db = handler.db.lock().await;
+            let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+            // A goal the session below clears outright.
+            let mut goal = new_exercise_goal(user.id, bench.id, 60.0);
+            goal.start_date = "2026-01-01".into();
+            db.insert_goal(&goal).unwrap()
+        };
+        let session_id = logged_session(&handler, &user, 80.0, 3).await;
+
+        let review = handler.generate_session_review(&user, session_id).await.unwrap();
+        assert!(!review.achieved_goals.is_empty(), "the completed goal is named");
+        assert!(review.headline.starts_with("Goal reached:"), "and it leads: {}", review.headline);
+
+        let db = handler.db.lock().await;
+        let goal = db.get_goal(goal_id).unwrap().unwrap();
+        assert!(goal.achieved, "the goal is marked achieved in the database");
+    }
+
+    // ── The auto-close path ───────────────────────────────────────────────────
+
+    /// The gap the spec called out: a session the user walked away from used to be closed
+    /// in silence. Now the triggering turn says so, quotes the review's headline, and offers
+    /// the derived effort back for correction.
+    #[tokio::test]
+    async fn auto_closing_a_stale_session_reviews_it_and_says_so() {
+        let (handler, _) = setup_handler(COMMENTARY).await;
+        let user = ready_user(&handler).await;
+
+        // An active session whose last activity is long past the 4-hour test threshold.
+        let session_id = {
+            let db = handler.db.lock().await;
+            let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+            let id = db.start_session_at(user.id, "2026-01-01 09:00:00", None, Some("upper push")).unwrap();
+            let entry = db.insert_entry(&new_exercise_entry_at(user.id, Some(id), None, "2026-01-01 09:05:00")).unwrap();
+            let mut set = new_exercise_set(entry, bench.id, MeasurementType::WeightReps, 80.0);
+            set.count = Some(6);
+            set.perceived_difficulty = crate::db::Difficulty::Hard;
+            set.logged_at = "2026-01-01 09:10:00".to_string();
+            db.insert_set(&set).unwrap();
+            id
+        };
+
+        let reply = handler.handle_text_message(&make_message(12345, "morning"), "morning").await.unwrap();
+
+        let text = shown(&reply);
+        assert!(text.contains("I closed your last session."), "{text}");
+        assert!(text.contains("/review for the full report"), "{text}");
+        assert!(text.contains("tell me if hard sounds wrong"), "the derived effort is offered back: {text}");
+
+        let db = handler.db.lock().await;
+        assert!(db.get_session(session_id).unwrap().unwrap().ended_at.is_some(), "the session is closed");
+        assert!(db.get_session_review(session_id).unwrap().is_some(), "and reviewed");
+        assert_eq!(
+            db.get_session(session_id).unwrap().unwrap().effort_source,
+            Some(EffortSource::Derived),
+            "nobody was asked, so the verdict is a reading",
+        );
+    }
+
+    /// The correction the note invites: stating the effort confirms it and rewrites the
+    /// review that quoted the guess.
+    #[tokio::test]
+    async fn correcting_the_effort_regenerates_the_review() {
+        let (handler, _) = setup_handler(COMMENTARY).await;
+        let user = ready_user(&handler).await;
+        let session_id = logged_session(&handler, &user, 80.0, 3).await;
+        handler.generate_session_review(&user, session_id).await.unwrap();
+
+        let outcome = crate::assistant::actions::AssistantAction::RecordSessionOutcome {
+            overall_effort: Some(crate::db::Difficulty::Easy),
+            felt: None,
+            cut_short: None,
+            cut_short_reason: None,
+        };
+        handler.execute_action(&outcome, &user).await.unwrap();
+
+        let review = handler.latest_stored_review(&user).await.unwrap().expect("a review");
+        let effort = review.effort.expect("an effort");
+        assert_eq!(effort.label, "easy");
+        assert!(effort.confirmed, "the regenerated review carries the user's own verdict");
+    }
+
+    // ── The /review command ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn slash_review_with_no_finished_session_says_so() {
+        let (handler, _) = setup_handler(COMMENTARY).await;
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
+
+        let reply = handler.handle_text_message(&msg, "/review").await.unwrap();
+        assert!(shown(&reply).contains("finished session to review"), "{}", shown(&reply));
+    }
+
+    /// `/review` replays the stored snapshot without consulting the model again — the
+    /// review was written once, and re-reading it is not a second opinion.
+    #[tokio::test]
+    async fn slash_review_replays_the_stored_review_without_calling_the_model() {
+        let (handler, llm) = setup_handler(COMMENTARY).await;
+        let user = ready_user(&handler).await;
+        let session_id = logged_session(&handler, &user, 82.5, 3).await;
+        bind_roster(&handler, &user, session_id, 80.0, true).await;
+        handler.generate_session_review(&user, session_id).await.unwrap();
+        let after_generate = llm.recorded_requests().len();
+
+        let reply = handler.handle_text_message(&make_message(12345, "/review"), "/review").await.unwrap();
+
+        assert_eq!(llm.recorded_requests().len(), after_generate, "replaying a review consults nobody");
+        assert!(matches!(reply.view, View::SessionReview(_)), "the command returns the review view");
+        assert!(shown(&reply).contains("Bench Press"), "{}", shown(&reply));
+    }
+}
