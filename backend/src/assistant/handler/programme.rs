@@ -20,8 +20,8 @@ use crate::assistant::actions::{AssistantAction, ProposedProgrammeBlock, Propose
 use crate::assistant::parser::parse_assistant_response;
 use crate::assistant::prompts::build_programme_prompt;
 use crate::db::{
-    Database, GoalProgress, InterviewState, Programme, ProgrammeStatus, User, new_programme, new_programme_block, new_programme_slot,
-    today_str,
+    Database, GoalProgress, InterviewState, Programme, ProgrammeDrift, ProgrammeStatus, ReschedulePolicy, User, new_programme,
+    new_programme_block, new_programme_slot, today_str,
 };
 
 use super::AssistantHandler;
@@ -77,9 +77,14 @@ impl AssistantHandler {
         let db = self.db.lock().await;
         // Sweeps stale weeks before reading, so the counts can never show a week as
         // still owed that the calendar has already closed.
-        let status = db.programme_status(programme, &today_str())?;
+        let today = today_str();
+        let status = db.programme_status(programme, &today)?;
+        // Drift reads the same settled grid ([C4.4]): a consistently missed day earns a
+        // kind, actionable suggestion under the tally rather than a scolding in it.
+        let drift = db.programme_drift(programme, &today)?;
         let goals = linked_goal_labels(&db, user.id, programme.id)?;
-        let view = stored_programme_view(&db, programme, goals, vec![next_step_note(&status)], true)?;
+        let notes = [next_step_note(&status)].into_iter().chain(drift_note(&drift)).collect();
+        let view = stored_programme_view(&db, programme, goals, notes, true)?;
 
         tracing::info!(user_id = user.id, programme_id = programme.id, week = status.current_week, "programme status");
         Ok(View::Programme(Box::new(ProgrammeView { status: Some(status_view(&status)), ..view })))
@@ -275,6 +280,28 @@ fn next_step_note(status: &ProgrammeStatus) -> String {
     match &status.next_slot {
         Some(slot) => format!("Next up -- week {}, day {}: {}. Run /nextworkout when you're ready.", slot.week_idx, slot.day_idx, slot.focus),
         None => "Every slot is settled. Run /programme new when you want to build the next one.".to_string(),
+    }
+}
+
+/// The reschedule suggestion, when drift ([C4.4]) has earned one, as a note under the status
+/// report. Voices only the recommendation and offers to act — a PT moving leg day, not a scold —
+/// and leaves the per-day arithmetic to the tally above it. `None` when the programme is on track,
+/// so a kept programme's status carries no drift line at all.
+fn drift_note(drift: &ProgrammeDrift) -> Option<String> {
+    match drift.recommendation.as_ref()? {
+        ReschedulePolicy::Shift { day_idx, focus } => Some(format!(
+            "You keep missing day {day_idx} ({focus}) -- that usually means the day is wrong, not the effort. \
+             Tell me a day that works and I'll shift it."
+        )),
+        ReschedulePolicy::Drop { day_idx, focus } => Some(format!(
+            "Day {day_idx} ({focus}) keeps slipping -- it may be one day a week more than fits your life right now. \
+             Say the word and I'll drop it from the weeks ahead."
+        )),
+        ReschedulePolicy::Compress => Some(
+            "You're behind where the calendar expected and the end date is close. I can compress what's left into \
+             the weeks that remain so it still lands on time -- want me to?"
+                .to_string(),
+        ),
     }
 }
 
@@ -890,6 +917,58 @@ mod tests {
         assert!(text.contains("/nextworkout"), "and what to do about it: {text}");
         assert!(!text.contains("Lock it in?"), "a live programme is not asking to be confirmed: {text}");
         assert_eq!(llm.recorded_requests().len(), before, "the status report costs no LLM call");
+    }
+
+    /// Drift surfaces in the status report ([C4.4]): a recurring day missed week after week earns
+    /// a suggestion to move it, worded as an offer rather than a reprimand.
+    #[tokio::test]
+    async fn a_consistently_missed_day_earns_a_reschedule_suggestion() {
+        let (handler, _llm) = setup_handler("").await;
+        let msg = make_message(12345, "hello");
+        let user = setup_ready_user(&handler, &msg).await;
+        {
+            let db = handler.db.lock().await;
+            let programme_id = activate_programme_started(&db, user.id, 3, 6);
+            // Day 2 ("lower") trained for the three elapsed weeks; day 1 ("upper") left to lapse.
+            let slots = db.list_programme_slots(programme_id).unwrap();
+            [slots[1].id, slots[3].id, slots[5].id].iter().for_each(|slot_id| {
+                let roster = db.create_roster(user.id, "Trained", None, None).unwrap();
+                db.bind_roster_to_slot(roster, *slot_id).unwrap();
+                let session = db.start_session(user.id, None).unwrap();
+                db.bind_roster_to_session(roster, session.id).unwrap();
+            });
+        }
+
+        let reply = handler.handle_text_message(&msg, "/programme status").await.unwrap();
+        let text = shown(&reply);
+        assert!(text.contains("missing day 1 (upper)"), "the drifting day must be named: {text}");
+        assert!(text.contains("shift it"), "and the offer to move it made: {text}");
+    }
+
+    /// A programme being kept to carries no drift line — the suggestion appears only when it is
+    /// earned, so an on-track status stays clean.
+    #[tokio::test]
+    async fn a_kept_programme_status_carries_no_reschedule_line() {
+        let (handler, _llm) = setup_handler("").await;
+        let msg = make_message(12345, "hello");
+        let user = setup_ready_user(&handler, &msg).await;
+        {
+            let db = handler.db.lock().await;
+            let programme_id = activate_programme_started(&db, user.id, 2, 6);
+            // Both of week 1's slots trained, so the only settled week is fully kept.
+            let slots = db.list_programme_slots(programme_id).unwrap();
+            [slots[0].id, slots[1].id].iter().for_each(|slot_id| {
+                let roster = db.create_roster(user.id, "Trained", None, None).unwrap();
+                db.bind_roster_to_slot(roster, *slot_id).unwrap();
+                let session = db.start_session(user.id, None).unwrap();
+                db.bind_roster_to_session(roster, session.id).unwrap();
+            });
+        }
+
+        let reply = handler.handle_text_message(&msg, "/programme").await.unwrap();
+        let text = shown(&reply);
+        assert!(!text.to_lowercase().contains("shift it"), "a kept programme needs no reschedule note: {text}");
+        assert!(!text.to_lowercase().contains("drop it"), "a kept programme needs no reschedule note: {text}");
     }
 
     /// Reading the status sweeps, so the report can never show a week as still owed that
