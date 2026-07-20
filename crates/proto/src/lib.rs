@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 
 pub mod view;
 pub use view::{
-    CatalogEntry, CatalogGroup, CatalogView, ExerciseLog, HealthNote, HistoryView, Measurement, Render, RosterExerciseView,
-    SessionRosterView, SessionSummaryView, SessionView, SetLine, StatusView, TrainingModeView, View,
+    CatalogEntry, CatalogGroup, CatalogView, ExerciseLog, HealthNote, HistoryView, Measurement, ProgrammeBlockView, ProgrammeDayView,
+    ProgrammeView, Render, RosterExerciseView, SessionRosterView, SessionSummaryView, SessionView, SetLine, StatusView, TrainingModeView,
+    View,
 };
 
 /// Discriminator placed in confide's `Message::Custom { kind, .. }` so the peer
@@ -26,6 +27,15 @@ pub const KIND: &str = "gymbuddy/v1";
 /// matches an incoming affirmative against the *stored* copy of this line, so the
 /// two must be the same string, not two hand-kept ones.
 pub const ONBOARDING_ASK: &str = "Want to set up your training philosophy and goals now? (You can also just start logging.)";
+
+/// The closing line under a *draft* [`View::Programme`], asking the user to activate it.
+///
+/// Shared for the same reason as [`ONBOARDING_ASK`]: every client renderer appends it,
+/// and the server decides the affirmative reply server-side, so one string beats several
+/// hand-kept ones. Only shown while [`ProgrammeView::active`] is false — once a programme
+/// is live there is nothing left to lock in.
+pub const PROGRAMME_LOCK_IN_ASK: &str =
+    "Lock it in? Say yes and I'll make this your active programme -- or /cancel to leave it as a draft.";
 
 /// A request sent from a client to the server.
 ///
@@ -137,6 +147,7 @@ pub fn decode_response(data: &[u8]) -> postcard::Result<ServerResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use view::tests::programme_view;
 
     fn roundtrip_request(req: ClientRequest) {
         let bytes = encode_request(&req).expect("encode");
@@ -238,6 +249,7 @@ mod tests {
                 roster: view::SessionRosterView { title: "Upper".into(), rationale: None, exercises: vec![], notes: vec![] },
                 mode: view::TrainingModeView::Programme { programme_title: "12-week".into(), week: 1, day: 2, focus: "upper".into() },
             },
+            View::Programme(programme_view()),
         ] {
             roundtrip_response(ServerResponse::Reply { view, timer: None });
         }
@@ -273,6 +285,7 @@ mod tests {
             7,
             "ProgrammeSessionRoster keeps the pre-[R1.5] `ProgramWorkout` discriminant",
         );
+        assert_eq!(tag(&View::Programme(programme_view())), 8, "Programme appended for [C4.2]");
     }
 
     /// `TrainingModeView` rides inside tag 7, so its own variant order is wire format

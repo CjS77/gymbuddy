@@ -4,7 +4,10 @@
 //! headings, bullets, and space-aligned columns (no bordered `Table` widget,
 //! which clashes with the flowing transcript).
 
-use gymbuddy_proto::{CatalogView, ExerciseLog, HistoryView, SessionRosterView, SetLine, StatusView, TrainingModeView, View};
+use gymbuddy_proto::{
+    CatalogView, ExerciseLog, HistoryView, PROGRAMME_LOCK_IN_ASK, ProgrammeView, SessionRosterView, SetLine, StatusView, TrainingModeView,
+    View,
+};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -25,6 +28,7 @@ pub fn render_view(view: &View) -> Vec<Line<'static>> {
         View::History(history) => render_history(history),
         View::SessionRoster(roster) => render_session_roster(roster, None),
         View::ProgrammeSessionRoster { roster, mode } => render_session_roster(roster, Some(mode)),
+        View::Programme(programme) => render_programme(programme),
         View::Timers { enabled } => vec![Line::from(Span::styled(
             format!("Rest timers {}", if *enabled { "on" } else { "off" }),
             Style::default().fg(if *enabled { SUCCESS } else { MUTED }).add_modifier(Modifier::BOLD),
@@ -176,6 +180,43 @@ fn render_session_roster(roster: &SessionRosterView, mode: Option<&TrainingModeV
 
     lines.push(Line::from(""));
     lines.push(muted("Nothing is logged yet — log your sets as you go and I'll adjust.".into()));
+    lines
+}
+
+/// Render a designed programme ([C4.2]): its shape, the goals it serves, its blocks and
+/// the repeating week. It holds no exercises by design — those arrive per session, when
+/// `/nextworkout` designs a roster for a slot.
+///
+/// A draft closes with the lock-in ask; an active programme has nothing left to confirm.
+fn render_programme(p: &ProgrammeView) -> Vec<Line<'static>> {
+    let mut lines = vec![heading(p.title.clone()), muted(p.shape_line())];
+
+    lines.push(muted(match &p.target_end_date {
+        Some(end) => format!("{} to {end}", p.start_date),
+        None => format!("from {}", p.start_date),
+    }));
+    lines.push(muted(format!("Progression: {}", p.progression_policy)));
+
+    let section = |lines: &mut Vec<Line<'static>>, title: &str, items: Vec<String>| {
+        if items.is_empty() {
+            return;
+        }
+        lines.push(Line::from(""));
+        lines.push(bold(title));
+        lines.extend(
+            items.into_iter().map(|item| Line::from(vec![Span::styled("  • ", Style::default().fg(MUTED)), Span::raw(item)])),
+        );
+    };
+
+    section(&mut lines, "Goals served", p.goals.clone());
+    section(&mut lines, "Blocks", p.blocks.iter().map(|b| format!("{}: {}", b.weeks_label(), b.focus)).collect());
+    section(&mut lines, "Each week", p.week_template.iter().map(|d| format!("Day {}: {}", d.day_idx, d.focus)).collect());
+    section(&mut lines, "Notes", p.notes.clone());
+
+    if !p.active {
+        lines.push(Line::from(""));
+        lines.push(muted(PROGRAMME_LOCK_IN_ASK.to_string()));
+    }
     lines
 }
 

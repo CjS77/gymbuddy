@@ -3,7 +3,9 @@
 //! Reproduces the exact output the handler emitted before the view refactor, so
 //! the Telegram bot is visually unchanged — locked down by golden tests below.
 
-use gymbuddy_proto::{CatalogView, HistoryView, Render, SessionRosterView, SetLine, StatusView, TrainingModeView, View};
+use gymbuddy_proto::{
+    CatalogView, HistoryView, PROGRAMME_LOCK_IN_ASK, ProgrammeView, Render, SessionRosterView, SetLine, StatusView, TrainingModeView, View,
+};
 
 /// The Telegram renderer. `Output` is `(text, parse_mode)` — `parse_mode` is
 /// `Some("HTML")` for the rich `/status` and `/exercises` views, `None` otherwise.
@@ -21,6 +23,7 @@ impl Render for Telegram {
             View::Catalog(catalog) => (render_catalog(catalog), Some("HTML")),
             View::SessionRoster(roster) => (render_session_roster(roster, None), Some("HTML")),
             View::ProgrammeSessionRoster { roster, mode } => (render_session_roster(roster, Some(mode)), Some("HTML")),
+            View::Programme(programme) => (render_programme(programme), Some("HTML")),
             View::Timers { enabled } => (format!("Rest timers are now {}.", if *enabled { "on" } else { "off" }), None),
             // `View` is `#[non_exhaustive]`: a variant from a newer server lands here.
             // Degrade to plain text rather than sending Telegram an empty message
@@ -162,6 +165,49 @@ fn render_session_roster(roster: &SessionRosterView, mode: Option<&TrainingModeV
     }
 
     result.push_str("\nNothing is logged yet -- log your sets as you go and I'll adjust.");
+    result
+}
+
+/// Render a designed programme ([C4.2]): its shape, the goals it serves, its mesocycle
+/// blocks and the repeating week. No exercises appear — a programme is a skeleton, and
+/// each session is still designed against it by `/nextworkout`.
+///
+/// A draft closes with [`PROGRAMME_LOCK_IN_ASK`]; an already-active programme does not,
+/// because there is nothing left to confirm.
+fn render_programme(p: &ProgrammeView) -> String {
+    let mut result = format!("<b>{}</b>\n<i>{}</i>\n", escape_html(&p.title), escape_html(&p.shape_line()));
+
+    let dates = match &p.target_end_date {
+        Some(end) => format!("{} to {}", escape_html(&p.start_date), escape_html(end)),
+        None => format!("from {}", escape_html(&p.start_date)),
+    };
+    result.push_str(&format!("{dates}\nProgression: {}\n", escape_html(&p.progression_policy)));
+
+    if !p.goals.is_empty() {
+        result.push_str("\n<b>Goals served:</b>\n");
+        result.extend(p.goals.iter().map(|goal| format!("- {}\n", escape_html(goal))));
+    }
+
+    if !p.blocks.is_empty() {
+        result.push_str("\n<b>Blocks:</b>\n");
+        result.extend(
+            p.blocks.iter().map(|b| format!("- {}: {}\n", escape_html(&b.weeks_label()), escape_html(&b.focus))),
+        );
+    }
+
+    if !p.week_template.is_empty() {
+        result.push_str("\n<b>Each week:</b>\n");
+        result.extend(p.week_template.iter().map(|d| format!("- Day {}: {}\n", d.day_idx, escape_html(&d.focus))));
+    }
+
+    if !p.notes.is_empty() {
+        result.push_str("\n<b>Notes:</b>\n");
+        result.extend(p.notes.iter().map(|note| format!("- {}\n", escape_html(note))));
+    }
+
+    if !p.active {
+        result.push_str(&format!("\n{PROGRAMME_LOCK_IN_ASK}"));
+    }
     result
 }
 

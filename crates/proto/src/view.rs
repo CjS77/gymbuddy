@@ -48,6 +48,11 @@ pub enum View {
     /// [`SessionRosterView`] itself would silently reshape existing messages — see the
     /// append-only rule on the envelope enums).
     ProgrammeSessionRoster { roster: SessionRosterView, mode: TrainingModeView },
+    /// A multi-week programme skeleton ( `/programme` ): the goals it serves, its
+    /// dates, its mesocycle blocks and the week template its slot grid was built
+    /// from. Holds no exercises — a programme is a skeleton, not a script, and each
+    /// session is still designed on demand against it.
+    Programme(ProgrammeView),
 }
 
 impl View {
@@ -80,6 +85,7 @@ impl View {
             View::History(_) => "Here's your recent workout history.".to_string(),
             View::SessionRoster(r) => format!("Here's a workout: {}.", r.title),
             View::ProgrammeSessionRoster { roster, mode } => format!("Here's a workout: {} ({}).", roster.title, mode.summary()),
+            View::Programme(p) => format!("Here's a programme: {} ({}).", p.title, p.shape_line()),
         }
     }
 }
@@ -293,8 +299,81 @@ impl RosterExerciseView {
     }
 }
 
+// ── /programme ───────────────────────────────────────────────────────────────────
+
+/// A designed programme: the long-term skeleton a user's sessions are then designed
+/// against. Deliberately carries no exercises — a [`ProgrammeSlotView`]'s `focus` is a
+/// text intent ("upper"), and exercises appear only once a session roster is designed
+/// for that slot.
+///
+/// `week_template` is the repeating week the slot grid was expanded from, not the whole
+/// grid: `weeks × days_per_week` cells all read from the same handful of day intents, so
+/// sending the grid itself would be the same few strings repeated dozens of times.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgrammeView {
+    pub title: String,
+    /// `YYYY-MM-DD`, or the stored datetime — clients display it as given.
+    pub start_date: String,
+    /// The date the programme aims to conclude by; `None` when open-ended.
+    pub target_end_date: Option<String>,
+    pub weeks: u32,
+    pub days_per_week: u32,
+    /// Free text, e.g. "upper/lower".
+    pub split: String,
+    /// Free text, e.g. "double progression: add reps, then load".
+    pub progression_policy: String,
+    /// The mesocycles, in week order.
+    pub blocks: Vec<ProgrammeBlockView>,
+    /// One repeating week, in day order.
+    pub week_template: Vec<ProgrammeDayView>,
+    /// The goals this programme serves, highest priority first, already rendered as
+    /// display labels ("Bench Press to 100.0").
+    pub goals: Vec<String>,
+    /// Free-text caveats from persisting the design (e.g. a goal that could not be linked).
+    pub notes: Vec<String>,
+    /// Whether this programme is live. A draft is still awaiting the user's "lock it in";
+    /// clients use this to decide whether to ask for that confirmation.
+    pub active: bool,
+}
+
+impl ProgrammeView {
+    /// One-line shape of the programme, e.g. "8 weeks x 3 days, upper/lower". Shared by
+    /// every client renderer so the summary reads identically everywhere.
+    pub fn shape_line(&self) -> String {
+        format!("{} weeks × {} days/week, {}", self.weeks, self.days_per_week, self.split)
+    }
+}
+
+/// One mesocycle of a [`ProgrammeView`]: an inclusive, 1-based week range with an intent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgrammeBlockView {
+    pub start_week: u32,
+    pub end_week: u32,
+    pub focus: String,
+}
+
+impl ProgrammeBlockView {
+    /// The week-range label, e.g. "Weeks 1-4" or "Week 5" for a single-week block.
+    pub fn weeks_label(&self) -> String {
+        if self.start_week == self.end_week {
+            format!("Week {}", self.start_week)
+        } else {
+            format!("Weeks {}-{}", self.start_week, self.end_week)
+        }
+    }
+}
+
+/// One training day of a [`ProgrammeView`]'s repeating week. `day_idx` is the 1-based
+/// ordinal training day within the week, never a calendar weekday, and `focus` is a
+/// text intent — never an exercise list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgrammeDayView {
+    pub day_idx: u32,
+    pub focus: String,
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Every variant must yield non-empty fallback text — that is the whole point of
@@ -315,10 +394,44 @@ mod tests {
                 roster: SessionRosterView { title: "Upper".into(), rationale: None, exercises: vec![], notes: vec![] },
                 mode: TrainingModeView::Programme { programme_title: "12-week".into(), week: 1, day: 1, focus: "upper".into() },
             },
+            View::Programme(programme_view()),
         ];
         for view in &views {
             assert!(!view.fallback_text().is_empty(), "empty fallback for {view:?}");
         }
+    }
+
+    /// A representative designed programme, shared by the tests below.
+    pub(crate) fn programme_view() -> ProgrammeView {
+        ProgrammeView {
+            title: "12-week hypertrophy".into(),
+            start_date: "2026-07-20".into(),
+            target_end_date: Some("2026-10-12".into()),
+            weeks: 12,
+            days_per_week: 3,
+            split: "upper/lower".into(),
+            progression_policy: "double progression".into(),
+            blocks: vec![
+                ProgrammeBlockView { start_week: 1, end_week: 4, focus: "accumulation".into() },
+                ProgrammeBlockView { start_week: 5, end_week: 5, focus: "deload".into() },
+            ],
+            week_template: vec![
+                ProgrammeDayView { day_idx: 1, focus: "upper".into() },
+                ProgrammeDayView { day_idx: 2, focus: "lower".into() },
+            ],
+            goals: vec!["Bench Press to 100.0".into()],
+            notes: vec![],
+            active: false,
+        }
+    }
+
+    #[test]
+    fn programme_shape_and_block_labels_read_for_humans() {
+        let p = programme_view();
+        assert_eq!(p.shape_line(), "12 weeks × 3 days/week, upper/lower");
+        // A multi-week block reads as a range; a one-week deload must not say "Weeks 5-5".
+        assert_eq!(p.blocks[0].weeks_label(), "Weeks 1-4");
+        assert_eq!(p.blocks[1].weeks_label(), "Week 5");
     }
 
     /// The mode summary is what every renderer surfaces, so both modes must name
