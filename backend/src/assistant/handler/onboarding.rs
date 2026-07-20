@@ -1,26 +1,18 @@
 //! First-run onboarding: the welcome that actively asks whether to set things up,
-//! and the deterministic yes-detection that routes an affirmative straight into the
-//! `/philosophy` interview.
+//! and the routing that takes an affirmative straight into the `/philosophy`
+//! interview.
 //!
 //! The decision is made server-side, with no LLM round-trip — exactly like the
 //! session-continuity resume in [`super::continuity`], and for the same reason: a
 //! small model is unreliable at turning "yeah go on" into the right control flow,
-//! and this one has to work on the user's very first message.
+//! and this one has to work on the user's very first message. Reading the answer is
+//! [`super::affirmative::is_affirmative`]'s job, shared with the programme lock-in.
 
 use crate::db::{ConversationRole, User, new_conversation_message};
 
 use super::AssistantHandler;
+use super::affirmative::is_affirmative;
 use gymbuddy_proto::{ONBOARDING_ASK, View};
-
-/// Distinctive multi-word acceptances. Safe to match anywhere in the message
-/// because none of them says anything else.
-const ONBOARDING_YES_PHRASES: &[&str] =
-    &["let's do it", "lets do it", "set it up", "sounds good", "go for it", "yes please", "sure thing", "why not"];
-
-/// Bare acknowledgements, matched ONLY as the whole message. "ok" alone is a yes;
-/// "ok but I'll just log today" is not, and must reach the normal chat path.
-const ONBOARDING_YES_WORDS: &[&str] =
-    &["yes", "yeah", "yep", "yup", "ya", "sure", "ok", "okay", "please", "absolutely", "definitely"];
 
 impl AssistantHandler {
     /// The new-user welcome. Ends with [`ONBOARDING_ASK`], which is what
@@ -80,18 +72,6 @@ impl AssistantHandler {
     }
 }
 
-/// Deterministic yes-detection over the user's reply to the onboarding ask.
-/// Same two-tier shape as the continuity resume: distinctive phrases match
-/// anywhere, bare acknowledgements only as the entire message.
-fn is_affirmative(text: &str) -> bool {
-    let lowered = text.to_lowercase();
-    if ONBOARDING_YES_PHRASES.iter().any(|phrase| lowered.contains(phrase)) {
-        return true;
-    }
-    let bare = lowered.trim().trim_end_matches(['.', '!', '?', ' ']);
-    ONBOARDING_YES_WORDS.contains(&bare)
-}
-
 /// Did `reply` end with the onboarding ask? Compared against the one shared
 /// [`ONBOARDING_ASK`] constant so the Telegram welcome and a confide client's own
 /// greeting are recognised by the same rule.
@@ -103,16 +83,6 @@ fn contains_onboarding_ask(reply: &str) -> bool {
 mod tests {
     use super::super::test_support::*;
     use super::*;
-
-    #[test]
-    fn affirmatives_and_refusals_are_told_apart() {
-        for yes in ["yes", "Yes", "yeah", "yep", "OK", "okay!", "sure.", "Let's do it", "yes please", "why not"] {
-            assert!(is_affirmative(yes), "{yes:?} should read as a yes");
-        }
-        for no in ["no", "no thanks", "not now", "later", "ok but I'll just log for now", "3 sets of bench at 80kg"] {
-            assert!(!is_affirmative(no), "{no:?} should NOT read as a yes");
-        }
-    }
 
     #[tokio::test]
     async fn welcome_ends_with_the_ask() {

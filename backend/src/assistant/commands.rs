@@ -26,6 +26,7 @@ pub enum Command {
     Exercises,
     Philosophy,
     NextWorkout,
+    Programme,
     Cancel,
     Clear,
     Timers,
@@ -111,10 +112,17 @@ pub const COMMANDS: &[CommandSpec] = &[
         visibility: Visibility::Everyone,
     },
     CommandSpec {
+        command: Command::Programme,
+        name: "/programme",
+        args: None,
+        description: "Build a multi-week programme your sessions are designed against (multi-turn)",
+        visibility: Visibility::Everyone,
+    },
+    CommandSpec {
         command: Command::Cancel,
         name: "/cancel",
         args: None,
-        description: "Cancel an in-progress interview (e.g. /philosophy)",
+        description: "Cancel an in-progress interview (e.g. /philosophy or /programme)",
         visibility: Visibility::Everyone,
     },
     CommandSpec {
@@ -175,6 +183,22 @@ pub fn advertised_to(user: &User) -> Vec<CommandInfo> {
         .collect()
 }
 
+/// Every slash-word in `text` that does not name a real command.
+///
+/// User-facing copy that says "run /programme" is a promise the dispatcher has to
+/// keep, and for a while it did not: [R1.7] shipped onboarding copy naming
+/// `/programme` several tickets before [C4.2] registered the command, so following
+/// the suggestion fell through to the LLM as ordinary chat. Tests over the strings
+/// that name commands use this to make that class of gap fail here instead.
+#[cfg(test)]
+pub(crate) fn unknown_commands_in(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(|word| word.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', '"']).to_lowercase())
+        .filter(|word| word.starts_with('/') && word.len() > 1)
+        .filter(|word| Command::parse(word).is_none())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +224,16 @@ mod tests {
         assert_eq!(Command::parse("/feedback the timer never stops"), Some(Command::Feedback));
         assert_eq!(Command::parse("/STATUS"), Some(Command::Status));
         assert_eq!(Command::parse("  /status  "), Some(Command::Status));
+    }
+
+    /// The guard used by the copy tests has to actually catch a bad reference, or those
+    /// tests pass by finding nothing rather than by the commands being real.
+    #[test]
+    fn unknown_commands_in_spots_a_command_that_does_not_exist() {
+        assert_eq!(unknown_commands_in("Run /nosuchthing to begin."), ["/nosuchthing"]);
+        // Real commands, trailing punctuation and mid-sentence use are all accepted.
+        assert!(unknown_commands_in("Try /philosophy, then /programme. Or /nextworkout!").is_empty());
+        assert!(unknown_commands_in("no commands here").is_empty());
     }
 
     #[test]

@@ -459,6 +459,101 @@ to save, keep `actions` empty and ask the next question.",
     )
 }
 
+/// System prompt for the multi-turn `/programme` interview ([C4.2]): agree a multi-week
+/// programme with the user and emit it as one `propose_programme` action.
+///
+/// Unlike `/philosophy` this is not a blank-slate interview. The philosophy is an
+/// INPUT — frequency and equipment are already on file, so the prompt tells the model to
+/// confirm rather than re-elicit them, and to spend its questions on what a programme
+/// actually adds: how long it runs and which goals it serves. `goals` is rendered by
+/// [`format_goals_with_ids`] because `propose_programme` has to name goal ids, and
+/// `history` is the same condensed block the session designer reads.
+///
+/// Advertises ONLY `propose_programme`: the interview persists a draft and never logs,
+/// starts a session, or activates anything. `turns` drives the same convergence nudge as
+/// the philosophy interview, so a small model cannot loop forever without proposing.
+pub fn build_programme_prompt(
+    philosophy: &str,
+    goals: &[GoalProgress],
+    history: &str,
+    health_entries: &[HealthEntry],
+    turns: i32,
+) -> String {
+    let goals_section = format_goals_with_ids(goals);
+    let health_section = format_health_entries(health_entries);
+    let wrap_up = if turns >= PROGRAMME_WRAP_UP_TURNS {
+        "WRAP UP: You have gathered several turns of answers. Unless the user clearly has more to add, \
+confirm the shape in your message and emit propose_programme NOW.\n\n"
+    } else {
+        ""
+    };
+
+    format!(
+        "You are a personal gym trainer designing a multi-week training PROGRAMME with the user. \
+A programme is a SKELETON, NOT A SCRIPT: it fixes how long the block of training runs, how many \
+days a week it trains, how the week is split, how load progresses, and which goals it serves. It \
+contains NO exercises — each session is still designed on demand against it later. You NEVER log \
+exercises or start sessions here.\n\
+\n\
+THE PHILOSOPHY BELOW IS AN INPUT, NOT A QUESTION. Weekly frequency and available equipment are \
+already on file: confirm them back to the user in one line ({confirm_hint}) and let them correct \
+you. Do NOT re-interview the user about them.\n\
+\n\
+ASK ONLY WHAT A PROGRAMME ADDS, one or two questions at a time:\n\
+1. How long it should run, or what date they are training toward (an event, a trip, a test week).\n\
+2. Which of their ACTIVE GOALS this programme is for — a programme that serves no goal is just a \
+calendar. Use their answer to fill `goal_ids`.\n\
+3. Anything that constrains the calendar: travel, a known deload need, days they cannot train.\n\
+\n\
+HOW TO DESIGN THE SKELETON:\n\
+- Set `days_per_week` from the philosophy's stated frequency unless the user says otherwise.\n\
+- Choose a `split` that fits that frequency (e.g. full body at 2-3 days, upper/lower at 4, \
+push/pull/legs at 5-6) and state it as free text.\n\
+- Divide the weeks into `blocks` (mesocycles) with 1-based, INCLUSIVE, non-overlapping week \
+ranges that together cover week 1 to the last week. Build toward the goal rather than repeating: \
+accumulate, then intensify, and include a deload block for any programme longer than about 4 weeks.\n\
+- Give a `week_template`: exactly `days_per_week` entries, `day_idx` counting 1..days_per_week. \
+Each `focus` is a SHORT TEXT INTENT (\"upper push\", \"lower\", \"full body\") — NEVER a list of \
+exercises, and never a weekday name. This template repeats every week; the blocks are what make \
+week 9 harder than week 1.\n\
+- State a `progression_policy` in free text concrete enough to act on (e.g. \"add 2.5kg to upper \
+compounds when all prescribed reps are hit at the top of the range; hold on a deload week\").\n\
+- Respect ACTIVE HEALTH ISSUES: they are a hard constraint on what a block may focus on.\n\
+\n\
+{wrap_up}\
+{philosophy_section}\n\
+{goals_section}\n\
+{history}\n\
+{health_section}\n\
+SCOPE: Stay on the programme. If the user drifts, gently steer back.\n\
+\n\
+RESPONSE FORMAT: You MUST respond with ONLY a JSON object. No text before or after.\n\
+{{\n\
+  \"message\": \"Your next question, or a short introduction when you propose\",\n\
+  \"actions\": []\n\
+}}\n\
+\n\
+THE ONLY ACTION available to you is:\n\
+- {{\"type\": \"propose_programme\", \"title\": \"<short programme title>\", \"weeks\": N, \
+\"days_per_week\": N, \"split\": \"<free text>\", \"progression_policy\": \"<free text>\", \
+\"blocks\": [{{\"start_week\": 1, \"end_week\": 4, \"focus\": \"<intent>\"}}, ...], \
+\"week_template\": [{{\"day_idx\": 1, \"focus\": \"<intent>\"}}, ...], \"goal_ids\": [N, ...]}}\n\
+\n\
+WHEN TO PROPOSE: emit propose_programme ONLY once you know the length and which goals it serves. \
+Emit it EXACTLY ONCE, with `goal_ids` drawn from the id values in ACTIVE GOALS above — never \
+invent an id, and never send a goal name in that field. Until you are ready, keep `actions` empty \
+and ask the next question. The user gets the last word: after you propose, they confirm it before \
+anything becomes active.",
+        philosophy_section = format_philosophy_section(philosophy),
+        confirm_hint = "\"That's 3 days a week with dumbbells to 24kg — still right?\"",
+    )
+}
+
+/// After this many turns the `/programme` interview is told to stop asking and propose.
+/// Matches the philosophy interview's guard, and for the same reason: a small model will
+/// otherwise keep interviewing without ever emitting the action.
+const PROGRAMME_WRAP_UP_TURNS: i32 = 4;
+
 /// Everything [`build_designer_prompt`] reads. A struct rather than a parameter list because the
 /// designer draws on eight distinct inputs, several of them string blocks, and a positional call of
 /// that length is one transposition away from a prompt that is wrong in a way no type catches.
@@ -1127,6 +1222,33 @@ pub fn format_active_goals(goals: &[GoalProgress]) -> String {
     result
 }
 
+/// The ACTIVE GOALS block for the `/programme` interview ([C4.2]), which differs from
+/// [`format_active_goals`] in one way that matters: each goal is prefixed with its
+/// database id.
+///
+/// The programme has to record *which* goals it serves, and `propose_programme`
+/// carries `goal_ids`. A model can only return an id it was shown, so listing them is
+/// what makes the link possible at all — without it the host would be reduced to
+/// matching goal names out of free text.
+pub fn format_goals_with_ids(goals: &[GoalProgress]) -> String {
+    if goals.is_empty() {
+        return "ACTIVE GOALS: None\n".to_string();
+    }
+    let lines = goals.iter().map(|gp| {
+        let current = gp.current_value.map(|v| format!("{v:.1}")).unwrap_or_else(|| "N/A".to_string());
+        let by = gp.goal.target_date.as_deref().map(|d| format!(" by {d}")).unwrap_or_default();
+        let dir = match gp.goal.direction {
+            crate::db::GoalDirection::Increase => "",
+            crate::db::GoalDirection::Decrease => " (lower is better)",
+        };
+        format!(
+            "- id={} {}: {current}/{:.1}{by}{dir} (priority {}, {:.0}%)\n",
+            gp.goal.id, gp.exercise_name, gp.goal.target_value, gp.goal.priority, gp.percentage
+        )
+    });
+    std::iter::once("ACTIVE GOALS (use these `id` values in goal_ids):\n".to_string()).chain(lines).collect()
+}
+
 pub fn capitalize(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {
@@ -1398,6 +1520,20 @@ mod tests {
         let no_programme = format_setup(true, true, false);
         assert!(no_programme.contains("/programme"));
         assert!(!no_programme.contains("/philosophy"));
+    }
+
+    /// Every command the SETUP nudges tell the user to run must actually exist. The
+    /// `/programme` nudge shipped in [R1.7] against a command that was only registered
+    /// in [C4.2] — until then it sent users at a word the dispatcher did not know.
+    #[test]
+    fn every_command_the_setup_nudges_name_is_a_real_command() {
+        for (philosophy, goals, programme) in [(false, false, false), (true, false, false), (true, true, false)] {
+            let nudge = format_setup(philosophy, goals, programme);
+            assert!(
+                crate::assistant::commands::unknown_commands_in(&nudge).is_empty(),
+                "SETUP names a command that does not exist: {nudge}"
+            );
+        }
     }
 
     /// A philosophy on file is enough to stop the `/philosophy` nudge whatever else

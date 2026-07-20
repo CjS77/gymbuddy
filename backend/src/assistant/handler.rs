@@ -13,6 +13,7 @@ use crate::telegram::Message as TgMessage;
 use super::parser::parse_assistant_response;
 use gymbuddy_proto::{Measurement, SetLine, TimerSignal, View};
 
+mod affirmative;
 mod context;
 mod continuity;
 mod designer;
@@ -21,6 +22,7 @@ mod execution;
 mod interview;
 mod llm;
 mod onboarding;
+mod programme;
 #[cfg(test)]
 mod test_support;
 

@@ -52,7 +52,12 @@ pub enum View {
     /// dates, its mesocycle blocks and the week template its slot grid was built
     /// from. Holds no exercises — a programme is a skeleton, not a script, and each
     /// session is still designed on demand against it.
-    Programme(ProgrammeView),
+    ///
+    /// Boxed only to keep [`View`] small: a `ProgrammeView` is several times the size
+    /// of every other variant, and `View` travels inside `ServerResponse` on every
+    /// reply. `Box` is transparent to serde, so the wire bytes are exactly those of an
+    /// unboxed `ProgrammeView` — the indirection is invisible to any peer.
+    Programme(Box<ProgrammeView>),
 }
 
 impl View {
@@ -394,7 +399,7 @@ pub(crate) mod tests {
                 roster: SessionRosterView { title: "Upper".into(), rationale: None, exercises: vec![], notes: vec![] },
                 mode: TrainingModeView::Programme { programme_title: "12-week".into(), week: 1, day: 1, focus: "upper".into() },
             },
-            View::Programme(programme_view()),
+            View::Programme(Box::new(programme_view())),
         ];
         for view in &views {
             assert!(!view.fallback_text().is_empty(), "empty fallback for {view:?}");

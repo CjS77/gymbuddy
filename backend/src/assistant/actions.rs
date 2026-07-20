@@ -175,6 +175,35 @@ pub enum AssistantAction {
         #[serde(default)]
         exercises: Vec<ProposedRosterExercise>,
     },
+    /// Emitted by the `/programme` interview prompt once it has enough to design a
+    /// multi-week programme. The host persists a draft [`crate::db::Programme`] from it,
+    /// expands `week_template` across `weeks` into `programme_slots`, and links
+    /// `goal_ids` through `programme_goals`. It activates nothing — the user's
+    /// "lock it in" does that.
+    ///
+    /// Deliberately carries no exercises: a programme is a skeleton, not a script, and
+    /// each session is still designed against it by `/nextworkout`.
+    ProposeProgramme {
+        title: String,
+        /// How many weeks the programme runs for.
+        weeks: i32,
+        #[serde(alias = "days")]
+        days_per_week: i32,
+        /// Free text the designer reads, e.g. "upper/lower".
+        #[serde(default)]
+        split: String,
+        /// Free text the designer reads, e.g. "double progression: add reps, then load".
+        #[serde(default, alias = "progression")]
+        progression_policy: String,
+        #[serde(default)]
+        blocks: Vec<ProposedProgrammeBlock>,
+        /// The repeating week, expanded across `weeks` into the slot grid.
+        #[serde(default)]
+        week_template: Vec<ProposedProgrammeDay>,
+        /// Ids of the goals this programme serves, as listed in the prompt's ACTIVE GOALS.
+        #[serde(default, alias = "goals")]
+        goal_ids: Vec<i64>,
+    },
     /// Append a durable training preference or constraint the user voices mid-workout
     /// (e.g. "always give me goblet squats instead of barbell") to their philosophy,
     /// so future designs respect it.
@@ -225,6 +254,25 @@ pub struct ProposedRosterExercise {
     pub target_secs: Option<i32>,
     #[serde(default, alias = "cue")]
     pub notes: Option<String>,
+}
+
+/// One mesocycle inside a [`AssistantAction::ProposeProgramme`]: an inclusive, 1-based
+/// week range with a focus. Mirrors [`crate::db::ProgrammeBlock`]'s storage.
+#[derive(Debug, Deserialize)]
+pub struct ProposedProgrammeBlock {
+    pub start_week: i32,
+    pub end_week: i32,
+    pub focus: String,
+}
+
+/// One training day of the repeating week in a [`AssistantAction::ProposeProgramme`].
+/// `day_idx` is the 1-based ordinal training day within the week, never a calendar
+/// weekday, and `focus` is a text intent ("upper") — never an exercise list.
+#[derive(Debug, Deserialize)]
+pub struct ProposedProgrammeDay {
+    #[serde(alias = "day")]
+    pub day_idx: i32,
+    pub focus: String,
 }
 
 #[cfg(test)]
@@ -556,6 +604,76 @@ mod tests {
                 assert_eq!(exercises[0].notes.as_deref(), Some("brace hard"));
             }
             _ => panic!("expected ProposeSessionRoster"),
+        }
+    }
+
+    #[test]
+    fn parse_propose_programme() {
+        let json = r#"{
+            "type": "propose_programme",
+            "title": "12-week hypertrophy base",
+            "weeks": 12,
+            "days_per_week": 3,
+            "split": "upper/lower",
+            "progression_policy": "double progression: add reps, then load",
+            "blocks": [
+                {"start_week": 1, "end_week": 4, "focus": "accumulation"},
+                {"start_week": 5, "end_week": 5, "focus": "deload"}
+            ],
+            "week_template": [
+                {"day_idx": 1, "focus": "upper push"},
+                {"day_idx": 2, "focus": "lower"},
+                {"day_idx": 3, "focus": "upper pull"}
+            ],
+            "goal_ids": [3, 7]
+        }"#;
+        let action: AssistantAction = serde_json::from_str(json).unwrap();
+        match action {
+            AssistantAction::ProposeProgramme { title, weeks, days_per_week, split, progression_policy, blocks, week_template, goal_ids } => {
+                assert_eq!(title, "12-week hypertrophy base");
+                assert_eq!((weeks, days_per_week), (12, 3));
+                assert_eq!(split, "upper/lower");
+                assert!(progression_policy.contains("double progression"));
+                assert_eq!(blocks.len(), 2);
+                assert_eq!((blocks[1].start_week, blocks[1].end_week), (5, 5));
+                assert_eq!(week_template.len(), 3);
+                assert_eq!(week_template[2].day_idx, 3);
+                assert_eq!(week_template[2].focus, "upper pull");
+                assert_eq!(goal_ids, [3, 7]);
+            }
+            _ => panic!("expected ProposeProgramme"),
+        }
+    }
+
+    /// A small model will drop the optional free-text fields and the goal links; the
+    /// envelope must still parse, since the host can persist a programme without them.
+    #[test]
+    fn parse_propose_programme_minimal() {
+        let json = r#"{"type": "propose_programme", "title": "Simple", "weeks": 4, "days_per_week": 2}"#;
+        let action: AssistantAction = serde_json::from_str(json).unwrap();
+        match action {
+            AssistantAction::ProposeProgramme { split, progression_policy, blocks, week_template, goal_ids, .. } => {
+                assert!(split.is_empty() && progression_policy.is_empty());
+                assert!(blocks.is_empty() && week_template.is_empty() && goal_ids.is_empty());
+            }
+            _ => panic!("expected ProposeProgramme"),
+        }
+    }
+
+    #[test]
+    fn parse_propose_programme_aliases() {
+        let json = r#"{"type": "propose_programme", "title": "Aliased", "weeks": 6, "days": 4,
+                       "progression": "add 2.5kg when all reps are hit", "goals": [1],
+                       "week_template": [{"day": 1, "focus": "full body"}]}"#;
+        let action: AssistantAction = serde_json::from_str(json).unwrap();
+        match action {
+            AssistantAction::ProposeProgramme { days_per_week, progression_policy, goal_ids, week_template, .. } => {
+                assert_eq!(days_per_week, 4);
+                assert!(progression_policy.contains("2.5kg"));
+                assert_eq!(goal_ids, [1]);
+                assert_eq!(week_template[0].day_idx, 1);
+            }
+            _ => panic!("expected ProposeProgramme"),
         }
     }
 

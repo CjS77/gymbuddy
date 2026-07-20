@@ -294,6 +294,14 @@ impl AssistantHandler {
                 tracing::debug!("Ignoring propose_session_roster outside /nextworkout");
                 Ok(ActionOutcome::none())
             }
+            AssistantAction::ProposeProgramme { .. } => {
+                // Only meaningful inside the `/programme` interview, which persists the
+                // draft directly. Committing a multi-week programme to the database
+                // because the model volunteered one mid-chat is exactly what must not
+                // happen, so this arm stays a no-op.
+                tracing::debug!("Ignoring propose_programme outside the programme interview");
+                Ok(ActionOutcome::none())
+            }
             AssistantAction::AppendPhilosophyNote { note } => {
                 self.db.lock().await.append_philosophy_note(user.id, note)?;
                 Ok(Some("Noted for future workouts.".to_string()).into())

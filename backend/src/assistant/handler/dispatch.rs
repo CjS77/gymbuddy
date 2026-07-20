@@ -32,6 +32,7 @@ impl AssistantHandler {
             Command::Timers => Ok(Some(self.cmd_timers(user).await?)),
             Command::Philosophy => Ok(Some(self.cmd_philosophy_start(user, platform).await?.into())),
             Command::NextWorkout => Ok(Some(self.cmd_next_workout(user, text).await?.into())),
+            Command::Programme => Ok(Some(self.cmd_programme_start(user, platform).await?.into())),
             Command::Cancel => Ok(Some(self.cmd_cancel(user, platform).await?.into())),
             Command::Feedback => Ok(self.cmd_feedback(user, text).await?.map(Into::into)),
         }
@@ -526,7 +527,9 @@ mod tests {
     fn help_lists_every_command_the_user_can_run() {
         let msg = AssistantHandler::cmd_help(&command_list_user(false));
         assert!(msg.starts_with("Available commands:\n/start -- Introduction and registration\n"));
-        assert!(msg.contains("\n/cancel -- Cancel an in-progress interview (e.g. /philosophy)\n"));
+        assert!(msg.contains("\n/cancel -- Cancel an in-progress interview (e.g. /philosophy or /programme)\n"));
+        // [C4.2]: `/programme` must reach the help, since K-49's onboarding copy names it.
+        assert!(msg.contains("\n/programme -- Build a multi-week programme"), "help must advertise /programme: {msg}");
         assert!(msg.contains("\n/help -- This message\n\n"));
         assert!(msg.ends_with("- \"What did I do today?\""));
     }

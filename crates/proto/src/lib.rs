@@ -249,7 +249,7 @@ mod tests {
                 roster: view::SessionRosterView { title: "Upper".into(), rationale: None, exercises: vec![], notes: vec![] },
                 mode: view::TrainingModeView::Programme { programme_title: "12-week".into(), week: 1, day: 2, focus: "upper".into() },
             },
-            View::Programme(programme_view()),
+            View::Programme(Box::new(programme_view())),
         ] {
             roundtrip_response(ServerResponse::Reply { view, timer: None });
         }
@@ -285,7 +285,20 @@ mod tests {
             7,
             "ProgrammeSessionRoster keeps the pre-[R1.5] `ProgramWorkout` discriminant",
         );
-        assert_eq!(tag(&View::Programme(programme_view())), 8, "Programme appended for [C4.2]");
+        assert_eq!(tag(&View::Programme(Box::new(programme_view()))), 8, "Programme appended for [C4.2]");
+    }
+
+    /// `View::Programme` boxes its payload purely to keep `View` small. That is an
+    /// in-memory decision and must stay invisible on the wire, so the encoding has to
+    /// be the tag byte followed by exactly the bytes of an unboxed `ProgrammeView` —
+    /// otherwise the box would have quietly become part of the format.
+    #[test]
+    fn boxing_the_programme_payload_does_not_change_its_wire_bytes() {
+        let programme = programme_view();
+        let boxed = postcard::to_allocvec(&View::Programme(Box::new(programme.clone()))).unwrap();
+        let bare = postcard::to_allocvec(&programme).unwrap();
+        assert_eq!(boxed[0], 8);
+        assert_eq!(&boxed[1..], &bare[..], "the box must add nothing to the encoding");
     }
 
     /// `TrainingModeView` rides inside tag 7, so its own variant order is wire format

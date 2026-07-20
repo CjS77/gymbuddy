@@ -62,7 +62,8 @@ This is the **only** per-exercise prescription table in the schema; ProgrammeSlo
 **Programme** — a long-term training plan-of-record: goals served, dates, days per week, split, progression policy.
 Table `programmes`, type `Programme`. **A skeleton, not a script** — it does not contain sessions; each session is
 still designed on demand against it. `split` and `progression_policy` are free text the LLM reads; no query looks
-inside. At most one Programme per user is `active`.
+inside. Built by the `/programme` interview, which leaves it `draft` until the user locks it in. At most one Programme
+per user is `active`.
 
 **ProgrammeBlock** — a mesocycle within a Programme: an inclusive, 1-based week range with a focus (weeks 1–4
 "hypertrophy", 5–6 "deload"). Table `programme_blocks`, type `ProgrammeBlock`. The designer reads the block the current
@@ -74,6 +75,13 @@ programme start; `day_idx` is the ordinal *training day within the week*, not a 
 *Not to be confused with Programme, and not a roster.* The Programme is the whole skeleton; a Slot is one cell of it.
 A Slot's `focus` is a text intent ("upper") — never an exercise list. Exercises appear only when a SessionRoster is
 designed for that slot and stamped with its id.
+
+**week template** — the one repeating week a Programme's slot grid is expanded from: `days_per_week` entries of
+(`day_idx`, `focus`), written once and copied into every week. Not a table and not a persisted type — it exists as the
+`week_template` field of the `propose_programme` action and of `ProgrammeView`, and after expansion it is recoverable
+as week 1 of the grid. The ProgrammeSlots *are* the durable form; the template is only how they get written.
+*What varies week to week is the ProgrammeBlock, not the template* — that is what makes week 9 harder than week 1
+while both train the same days.
 
 **TrainingMode** — the mode a session design runs in. Type `TrainingMode`; resolved per design, never persisted.
 - `AdHoc` — a one-off. The first-class default: it never requires a Programme, and it stays available *while* one is

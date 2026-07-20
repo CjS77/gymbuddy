@@ -256,7 +256,10 @@ impl AssistantHandler {
     /// sessions collapsed to per-exercise trend lines, the whole thing bounded by the
     /// configured token budget with goal-relevant lifts favoured over incidental ones.
     /// See [`summarise_designer_history`].
-    fn format_designer_history(&self, sessions: &[SessionWithSets], goal_ids: &HashSet<i64>) -> String {
+    ///
+    /// Shared with the `/programme` interview ([C4.2]), which reads history the same way
+    /// — the condensed block is what fits a year of training into a prompt at all.
+    pub(super) fn format_designer_history(&self, sessions: &[SessionWithSets], goal_ids: &HashSet<i64>) -> String {
         summarise_designer_history(sessions, goal_ids, &self.config.designer_history, &|id| self.exercise_name(id))
     }
 }
@@ -266,7 +269,7 @@ impl AssistantHandler {
 /// "Bench Press") pulls in its variations too. Used to give those lifts more history
 /// depth in the designer prompt than incidental accessories. Metric-denominated goals
 /// (bodyweight, habit) name no exercise and so contribute nothing here.
-fn goal_relevant_exercise_ids(db: &Database, goals: &[GoalProgress]) -> anyhow::Result<HashSet<i64>> {
+pub(super) fn goal_relevant_exercise_ids(db: &Database, goals: &[GoalProgress]) -> anyhow::Result<HashSet<i64>> {
     goals.iter().filter_map(|g| g.goal.exercise_type_id).try_fold(HashSet::new(), |mut acc, et_id| {
         acc.extend(db.descendant_ids_inclusive(et_id)?);
         Ok(acc)
