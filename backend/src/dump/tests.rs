@@ -561,3 +561,313 @@ fn snapshot_mismatch(expected: &str, actual: &str) -> String {
         scratch.display()
     )
 }
+
+// -----------------------------------------------------------------------------------------------
+// Round-trip fidelity: export → import → re-export.
+//
+// This is the test the migration's safety argument rests on. Everything above proves the *export*
+// carries what the source held; these prove the import puts it back, and that `migrate --verify`
+// would notice if it did not. They run the real path — the same `export`, the same `import_dump`,
+// the same `compare` the binary uses — against the same seeded fixture, which is deliberately
+// exhaustive over every enum value and every NULL arm.
+// -----------------------------------------------------------------------------------------------
+
+use crate::db::Database;
+
+/// Export the fixture, import it into a fresh v2 database, and export that. Returns both dumps plus
+/// the database, so a test can also ask the storage directly.
+fn round_trip(conn: &Connection) -> (Dump, Dump, Database) {
+    let source = export(conn).expect("exporting the fixture");
+    let target = Database::open_in_memory().expect("creating a v2 database");
+    target.import_dump(&source).expect("importing the dump");
+    let reexported = export(target.test_conn()).expect("re-exporting the migrated database");
+    (source, reexported, target)
+}
+
+/// The whole point, in one assertion: a dump taken from the v1 fixture and a dump taken from the v2
+/// database built out of it describe the same data.
+#[test]
+fn round_trip_of_the_seeded_fixture_is_structurally_identical() {
+    let (source, reexported, _) = round_trip(&seeded_v1_db());
+    let differences = compare::compare(&source, &reexported);
+    assert!(differences.is_empty(), "the migrated database differs from its source:\n{}", compare::describe(&differences).unwrap_or_default());
+}
+
+/// The count invariant, run against the *database* rather than the dump — the check that catches a
+/// table the importer never wrote at all, which a compare of two exports made by the same reader
+/// could not.
+#[test]
+fn round_trip_preserves_every_row_count() {
+    let (source, _, target) = round_trip(&seeded_v1_db());
+    let dump_counts = source.row_counts();
+    let table_counts = target.import_row_counts().unwrap();
+    let mismatches: Vec<String> = table_counts
+        .iter()
+        .filter(|(collection, count)| dump_counts.get(collection) != **count)
+        .map(|(collection, count)| format!("{collection}: dump {} vs database {count}", dump_counts.get(collection)))
+        .collect();
+    assert!(mismatches.is_empty(), "row counts diverged: {mismatches:?}");
+    // A fixture that stopped seeding a table would make the invariant vacuously true.
+    assert!(table_counts.values().filter(|count| **count > 0).count() >= 15, "the fixture should populate nearly every table");
+}
+
+/// The arm that is invisible from `sessions` and therefore the easiest thing in the format to drop
+/// on a round trip. Asserted on the storage as well as on the re-export, because a bug that hung
+/// them off the wrong session would still show up as "three entries somewhere".
+#[test]
+fn unsessioned_entries_survive_the_round_trip() {
+    let (source, reexported, target) = round_trip(&seeded_v1_db());
+    let before: usize = source.users.iter().map(|user| user.unsessioned_entries.len()).sum();
+    let after: usize = reexported.users.iter().map(|user| user.unsessioned_entries.len()).sum();
+    assert_eq!(before, 3, "the fixture seeds three entries with a NULL session_id");
+    assert_eq!(after, before, "entries logged outside a session must not be reattached or dropped");
+
+    let orphans: i64 =
+        target.test_conn().query_row("SELECT COUNT(*) FROM exercise_entries WHERE session_id IS NULL", [], |row| row.get(0)).unwrap();
+    assert_eq!(orphans, 3, "they must still be unsessioned in storage, not silently bound to a session");
+
+    // Carol's is hers, not Alice's: a NULL session_id makes the user the only owner link there is.
+    assert_eq!(user(&reexported, "Carol").unsessioned_entries.len(), 1);
+}
+
+/// Nothing in the import path calls `datetime('now')`. Timestamps are the history — a migration
+/// that restamps them destroys exactly what it exists to preserve — so they are compared exactly
+/// rather than within a tolerance.
+#[test]
+fn timestamps_are_never_regenerated() {
+    let (_, reexported, _) = round_trip(&seeded_v1_db());
+    let alice = alice(&reexported);
+    assert_eq!(alice.created_at, "2026-01-01 09:00:00");
+    assert_eq!(alice.updated_at, "2026-02-01 09:00:00");
+    assert_eq!(session(alice, alice.sessions[0].id).started_at, "2026-02-01 17:00:00");
+    let first_set = &alice.sessions[0].entries[0].sets[0];
+    assert_eq!(first_set.logged_at, "2026-02-01 17:10:00");
+    assert_eq!(alice.body_metrics[0].measured_at, "2026-01-10 07:00:00");
+}
+
+/// v1's `proposed` is spelled `draft` in v2 and must survive the import, not be rejected by the
+/// CHECK or quietly rewritten to the column default.
+#[test]
+fn proposed_rosters_land_as_draft() {
+    let (_, reexported, _) = round_trip(&seeded_v1_db());
+    assert_eq!(roster(alice(&reexported), "Next Pull").status, "draft");
+    assert_eq!(distinct(alice(&reexported).session_rosters.iter().map(|r| r.status.as_str())).len(), 4, "all four statuses round-trip");
+}
+
+/// Intra-user references are rebuilt through the translation maps, so they must still point at the
+/// same logical rows — a roster at its session, a programme at its goals.
+#[test]
+fn references_still_point_at_the_same_rows() {
+    let (_, reexported, _) = round_trip(&seeded_v1_db());
+    let alice = alice(&reexported);
+    let push = roster(alice, "Push Day");
+    let bound = session(alice, push.session_id.expect("Push Day was executed as a session"));
+    assert_eq!(bound.started_at, "2026-02-01 17:00:00");
+
+    let slot_id = push.programme_slot_id.expect("Push Day was bound to a programme slot");
+    let winter = alice.programmes.iter().find(|p| p.title == "Winter Strength").unwrap();
+    let slot = winter.slots.iter().find(|slot| slot.id == slot_id).expect("the slot must belong to Winter Strength");
+    assert_eq!((slot.week_idx, slot.day_idx, slot.focus.as_str()), (1, 1, "push"));
+
+    let goals: Vec<f64> = winter.goal_ids.iter().map(|id| alice.goals.iter().find(|g| g.id == *id).unwrap().target_value).collect();
+    assert_eq!(distinct(goals.iter().map(|v| v.to_string())), distinct(["120".to_string(), "10".to_string()]));
+}
+
+/// `metric` travels as a name because v2 stores an id, and the two id spaces do not agree. Both
+/// sides of the join — the goal and its measurement series — must land on the same `metrics` row,
+/// which is the whole reason the table exists.
+#[test]
+fn metric_names_resolve_to_one_shared_row() {
+    let (_, _, target) = round_trip(&seeded_v1_db());
+    let shared: i64 = target
+        .test_conn()
+        .query_row(
+            "SELECT COUNT(*) FROM goals g JOIN body_metrics b ON b.metric_id = g.metric_id \
+             WHERE g.metric_id IS NOT NULL AND g.user_id = b.user_id",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(shared > 0, "a metric goal must find the weigh-ins it is judged against");
+    let names: i64 = target.test_conn().query_row("SELECT COUNT(DISTINCT name) FROM metrics", [], |row| row.get(0)).unwrap();
+    let rows: i64 = target.test_conn().query_row("SELECT COUNT(*) FROM metrics", [], |row| row.get(0)).unwrap();
+    assert_eq!(names, rows, "the importer must reuse metric rows, not create a duplicate per reference");
+}
+
+/// Schedules and `signal_id` are archival: preserved in the dump so the file stays a complete
+/// backup, never written into v2, which has nowhere to put them.
+#[test]
+fn the_legacy_block_is_preserved_in_the_dump_and_never_imported() {
+    let (source, reexported, target) = round_trip(&seeded_v1_db());
+    let before = alice(&source);
+    assert_eq!(before.legacy.signal_id.as_deref(), Some("signal-alice"));
+    assert_eq!(before.legacy.schedules.len(), 2);
+    assert_eq!(before.legacy.session_plan_names.len(), 2);
+
+    assert_eq!(alice(&reexported).legacy, Default::default(), "a v2 database has nothing to put in the legacy block");
+    let has_schedules: i64 = target
+        .test_conn()
+        .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schedules'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(has_schedules, 0, "schema v2 does not have the table at all");
+}
+
+/// A v1 database can only name exercises the v1 migrations seeded, and v2's catalogue is a superset
+/// of those — so an unresolvable name is a bug in the catalogue or a reader, not a stray row. The
+/// importer must refuse the whole import rather than drop the set and report success.
+#[test]
+fn an_unknown_exercise_name_aborts_the_whole_import() {
+    let mut dump = export(&seeded_v1_db()).unwrap();
+    dump.users
+        .iter_mut()
+        .flat_map(|user| user.sessions.iter_mut())
+        .flat_map(|session| session.entries.iter_mut())
+        .flat_map(|entry| entry.sets.iter_mut())
+        .for_each(|set| set.exercise.name = "Moon Press".to_string());
+
+    let target = Database::open_in_memory().unwrap();
+    let error = target.import_dump(&dump).unwrap_err().to_string();
+    assert!(error.contains("Moon Press"), "the failure must name the exercise, got: {error}");
+
+    // All or nothing: the transaction rolled back, so the users inserted before the bad set are gone.
+    let users: i64 = target.test_conn().query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0)).unwrap();
+    assert_eq!(users, 0, "a failed import must leave the target untouched, not half-populated");
+}
+
+/// Importing the *re-export* of a migrated database must reach the same place again. This is what
+/// makes a dump a restorable backup rather than a one-way migration artefact — and it is the only
+/// test here that exercises the v2 reader as an importer's input.
+#[test]
+fn a_v2_dump_re_imports_to_the_same_database() {
+    let (_, reexported, _) = round_trip(&seeded_v1_db());
+    let second = Database::open_in_memory().unwrap();
+    second.import_dump(&reexported).expect("a v2 dump must import as readily as a v1 one");
+    let third = export(second.test_conn()).unwrap();
+    let differences = compare::compare(&reexported, &third);
+    assert!(differences.is_empty(), "restoring a v2 dump changed it:\n{}", compare::describe(&differences).unwrap_or_default());
+}
+
+/// The dump travels as JSON, so the round trip has to survive serialisation too — the unicode, the
+/// embedded quotes and the backslashes the fixture seeds precisely for this.
+#[test]
+fn the_round_trip_survives_the_json_encoding() {
+    let source = export(&seeded_v1_db()).unwrap();
+    let parsed = from_json(&to_json(&source).unwrap()).unwrap();
+    let target = Database::open_in_memory().unwrap();
+    target.import_dump(&parsed).unwrap();
+    let reexported = export(target.test_conn()).unwrap();
+    assert!(compare::compare(&source, &reexported).is_empty(), "a dump must survive being written to disk and read back");
+}
+
+
+/// A v1 database holding a non-canonical metric spelling must still verify.
+///
+/// `goals.metric` and `body_metrics.metric` were free text in schema v1, and the importer resolves
+/// every spelling onto one `metrics` row — so `weight` legitimately comes back as `bodyweight_kg`.
+/// Left alone this fails `--verify` on a *correct* migration, and because collections sort by
+/// content the rename also reorders `body_metrics` and reports a cascade of unrelated `value`
+/// mismatches on top. This is the deployment gate's own scenario: the first thing the operator does
+/// is run `migrate --verify` against a copy of the live database.
+#[test]
+fn a_non_canonical_metric_spelling_still_verifies() {
+    let conn = seeded_v1_db();
+    conn.execute_batch(
+        "UPDATE goals SET metric = 'weight' WHERE metric = 'bodyweight_kg';
+         UPDATE body_metrics SET metric = 'Body Weight' WHERE metric = 'bodyweight_kg';",
+    )
+    .unwrap();
+
+    let (source, reexported, _) = round_trip(&conn);
+    let differences = compare::compare(&source, &reexported);
+    assert!(
+        differences.is_empty(),
+        "an equivalent metric spelling is the join v2 repaired, not a difference:\n{}",
+        compare::describe(&differences).unwrap_or_default()
+    );
+    // The spelling really did change — otherwise this test would pass without exercising anything.
+    let migrated = user(&reexported, "Alice");
+    assert!(migrated.body_metrics.iter().any(|metric| metric.metric == "bodyweight_kg"));
+}
+
+/// The other half: canonicalising spellings must not blind the compare to a metric that became a
+/// genuinely different quantity.
+#[test]
+fn a_metric_that_becomes_a_different_quantity_is_still_a_difference() {
+    let (source, mut reexported, _) = round_trip(&seeded_v1_db());
+    let victim = reexported.users.iter_mut().find(|user| !user.body_metrics.is_empty()).expect("the fixture seeds body metrics");
+    victim.body_metrics[0].metric = "waist_cm".to_string();
+
+    assert!(!compare::compare(&source, &reexported).is_empty(), "a different metric is a real difference, not a spelling");
+}
+
+/// The v2 catalogue must be a superset of the v1 one, by name and parent.
+///
+/// The importer fails loud on an exercise it cannot resolve — deliberately, since a dump can only
+/// name exercises some catalogue seeded. The cost of that choice is that a name v1 shipped and v2
+/// dropped aborts a real migration part-way through, and the round-trip tests would not catch it:
+/// they only cover the exercises the seed happens to reference. This checks the whole taxonomy.
+#[test]
+fn the_v2_catalogue_covers_every_v1_exercise_name() {
+    const QUERY: &str = "SELECT e.name, p.name FROM exercise_types e LEFT JOIN exercise_types p ON p.id = e.parent_id";
+    // Lowercased on both sides: `exercise_types.name` is COLLATE NOCASE, so the two spellings are
+    // one row as far as the schema is concerned, and the importer's own lookup agrees.
+    fn taxonomy(conn: &Connection) -> Vec<(String, Option<String>)> {
+        let mut stmt = conn.prepare(QUERY).unwrap();
+        let rows = stmt
+            .query_map([], |row| {
+                let (name, parent): (String, Option<String>) = (row.get(0)?, row.get(1)?);
+                Ok((name.to_lowercase(), parent.map(|parent| parent.to_lowercase())))
+            })
+            .unwrap();
+        rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    }
+
+    let legacy = taxonomy(&fixtures::empty_v1_db());
+    assert!(legacy.len() > 50, "the v1 fixture should carry a full taxonomy, got {}", legacy.len());
+
+    let current: BTreeSet<(String, Option<String>)> = taxonomy(Database::open_in_memory().unwrap().test_conn()).into_iter().collect();
+    let missing: Vec<String> = legacy
+        .iter()
+        .filter(|entry| !current.contains(entry))
+        .map(|(name, parent)| format!("{name} (parent {})", parent.as_deref().unwrap_or("<none>")))
+        .collect();
+    assert!(missing.is_empty(), "the v2 catalogue dropped {} v1 exercise(s), which would abort a migration:\n  {}", missing.len(), missing.join("\n  "));
+}
+
+/// A live v1 database spells metrics however the user said them — `weight`, `Body Weight` — because
+/// v1 had only free text and a convention. Schema v2 resolves all of them onto one `metrics` row,
+/// so the re-export comes back canonicalised. That is the repair, not a loss, and `--verify` must
+/// pass on it: an operator whose real database fails verification for a correct migration learns to
+/// ignore the verifier.
+///
+/// The seeded fixture cannot cover this — it was written in canonical spellings — so this builds its
+/// own v1 database out of the frozen migrations.
+#[test]
+fn a_v1_database_with_uncanonical_metric_spellings_migrates_and_verifies() {
+    let conn = fixtures::empty_v1_db();
+    conn.execute_batch(
+        "INSERT INTO users (id, name, timezone, created_at, updated_at) \
+             VALUES (1, 'Dana', 'UTC', '2026-01-01 09:00:00', '2026-01-01 09:00:00');
+         INSERT INTO goals (id, user_id, kind, metric, target_value, direction, priority, start_date, achieved, created_at, updated_at) \
+             VALUES (1, 1, 'bodyweight', 'weight', 78.0, 'decrease', 1, '2026-01-01', 0, '2026-01-01 09:00:00', '2026-01-01 09:00:00');
+         INSERT INTO body_metrics (id, user_id, metric, value, measured_at) VALUES \
+             (1, 1, 'Body Weight', 82.5, '2026-01-10 07:00:00'), \
+             (2, 1, 'body fat', 19.4, '2026-01-10 07:00:00');",
+    )
+    .expect("seeding the uncanonical fixture");
+
+    let (source, reexported, target) = round_trip(&conn);
+    assert_eq!(source.users[0].goals[0].metric.as_deref(), Some("weight"), "the dump carries what v1 actually held");
+
+    let differences = compare::compare(&source, &reexported);
+    assert!(differences.is_empty(), "canonicalising a metric must not fail verification:\n{}", compare::describe(&differences).unwrap_or_default());
+
+    // And the repair actually happened: the goal and its series now share one row, which is the
+    // join v1 could only hope for.
+    let shared: i64 = target
+        .test_conn()
+        .query_row("SELECT COUNT(*) FROM goals g JOIN body_metrics b ON b.metric_id = g.metric_id", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(shared, 1, "`weight` and `Body Weight` must resolve to the same metric row");
+    assert_eq!(user(&reexported, "Dana").goals[0].metric.as_deref(), Some("bodyweight_kg"));
+}

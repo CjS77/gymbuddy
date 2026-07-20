@@ -95,8 +95,8 @@ async fn main() -> anyhow::Result<()> {
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => serve(&cli.config).await,
         Command::Export { db, out } => run_export(&db, &out),
-        Command::Import { .. } => anyhow::bail!("`gymbuddy import` is not implemented yet — it lands with the schema v2 importer"),
-        Command::Migrate { .. } => anyhow::bail!("`gymbuddy migrate` is not implemented yet — it lands with the schema v2 importer"),
+        Command::Import { db, input } => run_import(&db, &input),
+        Command::Migrate { db, out, verify } => run_migrate(&db, &out, verify),
     }
 }
 
@@ -133,6 +133,33 @@ fn run_export(db: &Path, out: &Path) -> anyhow::Result<()> {
         "Export complete"
     );
     tracing::info!(%counts, "Rows exported per collection");
+    Ok(())
+}
+
+/// `gymbuddy import --db <path> --in dump.json`.
+fn run_import(db: &Path, input: &Path) -> anyhow::Result<()> {
+    tracing::info!(db = %db.display(), input = %input.display(), "Importing");
+    let counts = dump::import(db, input)?;
+    tracing::info!(rows = counts.total(), "Import complete");
+    tracing::info!(%counts, "Rows imported per collection");
+    Ok(())
+}
+
+/// `gymbuddy migrate --db old.db --out new.db [--verify true|false]`.
+///
+/// The old database is opened read-only and never written; it is the rollback. See
+/// [`dump::migrate`] for the deployment gate this is meant to be run behind.
+fn run_migrate(db: &Path, out: &Path, verify: bool) -> anyhow::Result<()> {
+    tracing::info!(db = %db.display(), out = %out.display(), verify, "Migrating to schema v2");
+    let report = dump::migrate(db, out, verify)?;
+    tracing::info!(
+        source_generation = report.source_generation,
+        rows = report.counts.total(),
+        verified = report.verified,
+        "Migration complete"
+    );
+    tracing::info!(counts = %report.counts, "Rows migrated per collection");
+    tracing::info!("The original database at {} was not modified — keep it as the rollback", db.display());
     Ok(())
 }
 

@@ -2,8 +2,8 @@
 //!
 //! These drive the real binary rather than calling into the library, because what they are
 //! checking is the clap wiring itself: that `serve` stays the default, that `export` reaches the
-//! dump module, and that the not-yet-built subcommands fail loudly instead of silently doing
-//! nothing.
+//! dump module, and that `import` and `migrate` behave on real files on disk — including the two
+//! refusals that protect the only copy of the user's data.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -81,22 +81,115 @@ fn export_reports_a_missing_database_instead_of_creating_one() {
     assert!(!out.exists(), "no dump should be written when the source cannot be read");
 }
 
-#[test]
-fn import_and_migrate_are_wired_but_refuse_to_pretend() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("gym.db");
-    let other = dir.path().join("other");
+/// Run a subcommand and return `(success, stderr)`.
+fn run(args: &[&str]) -> (bool, String) {
+    let output = Command::new(GYMBUDDY).args(args).output().expect("running gymbuddy");
+    (output.status.success(), String::from_utf8_lossy(&output.stderr).to_string())
+}
 
-    let cases = [
-        (vec!["import", "--db", db.to_str().unwrap(), "--in", other.to_str().unwrap()], "import"),
-        (vec!["migrate", "--db", db.to_str().unwrap(), "--out", other.to_str().unwrap()], "migrate"),
-    ];
-    for (args, name) in cases {
-        let output = Command::new(GYMBUDDY).args(&args).output().expect("running gymbuddy");
-        assert!(!output.status.success(), "`{name}` must not report success while unimplemented");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("not implemented yet"), "`{name}` should say so plainly, got: {stderr}");
-    }
+/// The migration end to end, through the real binary: a seeded legacy database in, a verified
+/// schema v2 database out, and the original untouched.
+///
+/// `--verify` is on by default and is not passed here on purpose — the default is the safety
+/// property, and a test that opted into it would not notice the default flipping.
+#[test]
+fn migrate_builds_a_verified_v2_database_and_leaves_the_original_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = dir.path().join("gym.db");
+    let new = dir.path().join("gym.v2.db");
+    fixtures::seeded_v1_db_at(&old);
+    let before = std::fs::metadata(&old).unwrap().len();
+    let before_bytes = std::fs::read(&old).unwrap();
+
+    let (ok, stderr) = run(&["migrate", "--db", old.to_str().unwrap(), "--out", new.to_str().unwrap()]);
+    assert!(ok, "migrate failed: {stderr}");
+    assert!(stderr.contains("Verification passed"), "verification should have run by default, got: {stderr}");
+
+    assert_eq!(std::fs::metadata(&old).unwrap().len(), before, "the source must not have been written");
+    assert_eq!(std::fs::read(&old).unwrap(), before_bytes, "the source must be byte-identical — it is the rollback");
+
+    // The new file is a v2 database holding the same rows.
+    assert!(!gymbuddy_backend::dump::is_legacy_database(&new).unwrap(), "the output must be schema v2");
+    let source = rusqlite::Connection::open(&old).unwrap();
+    let migrated = gymbuddy_backend::dump::export_path(&new).unwrap();
+    let counts: BTreeMap<&str, usize> = migrated.row_counts().iter().collect();
+    let expected: BTreeMap<&str, usize> = fixtures::source_row_counts(&source)
+        .into_iter()
+        // Schedules and `signal_id` are dropped by schema v2 by design, so a v2 export carries none.
+        .map(|(key, count)| (key, if key.starts_with("legacy_") { 0 } else { count }))
+        .collect();
+    assert_eq!(counts, expected, "every non-archival row must have survived the migration");
+}
+
+/// A migration that would clobber an existing file is refused outright. `--out` is a new database,
+/// and guessing that an existing one is disposable is not a guess this tool gets to make.
+#[test]
+fn migrate_refuses_to_overwrite_an_existing_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = dir.path().join("gym.db");
+    let new = dir.path().join("taken.db");
+    fixtures::seeded_v1_db_at(&old);
+    std::fs::write(&new, b"not a database").unwrap();
+
+    let (ok, stderr) = run(&["migrate", "--db", old.to_str().unwrap(), "--out", new.to_str().unwrap()]);
+    assert!(!ok, "migrating onto an existing file must fail");
+    assert!(stderr.contains("already exists"), "the refusal should say why, got: {stderr}");
+    assert_eq!(std::fs::read(&new).unwrap(), b"not a database", "the existing file must be untouched");
+}
+
+/// `import` is the restore half of the backup tool: a dump written by `export` loads into a fresh
+/// database.
+#[test]
+fn import_loads_a_dump_into_a_fresh_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let legacy = dir.path().join("gym.db");
+    let dump_file = dir.path().join("dump.json");
+    let restored = dir.path().join("restored.db");
+    fixtures::seeded_v1_db_at(&legacy);
+    let dump = export_via_cli(&legacy, &dump_file);
+
+    let (ok, stderr) = run(&["import", "--db", restored.to_str().unwrap(), "--in", dump_file.to_str().unwrap()]);
+    assert!(ok, "import failed: {stderr}");
+
+    let reexported = gymbuddy_backend::dump::export_path(&restored).unwrap();
+    assert_eq!(reexported.users.len(), dump.users.len());
+    let differences = gymbuddy_backend::dump::compare::compare(&dump, &reexported);
+    assert!(differences.is_empty(), "a restored dump must match the one that was written: {differences:?}");
+}
+
+/// Importing into a database that already holds data would merge two id spaces with no way to tell
+/// the halves apart afterwards.
+#[test]
+fn import_refuses_a_database_that_already_holds_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let legacy = dir.path().join("gym.db");
+    let dump_file = dir.path().join("dump.json");
+    let target = dir.path().join("target.db");
+    fixtures::seeded_v1_db_at(&legacy);
+    export_via_cli(&legacy, &dump_file);
+
+    let args = ["import", "--db", target.to_str().unwrap(), "--in", dump_file.to_str().unwrap()];
+    assert!(run(&args).0, "the first import should succeed");
+    let (ok, stderr) = run(&args);
+    assert!(!ok, "a second import must be refused");
+    assert!(stderr.contains("already holds data"), "the refusal should say why, got: {stderr}");
+}
+
+/// `import` must not be a way to trip the trap `serve` refuses to walk into: pointed at a legacy
+/// file, `Database::open` would build the v2 tables beside the v1 ones, in place.
+#[test]
+fn import_refuses_a_legacy_target_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let legacy = dir.path().join("gym.db");
+    let dump_file = dir.path().join("dump.json");
+    fixtures::seeded_v1_db_at(&legacy);
+    export_via_cli(&legacy, &dump_file);
+    let before = std::fs::read(&legacy).unwrap();
+
+    let (ok, stderr) = run(&["import", "--db", legacy.to_str().unwrap(), "--in", dump_file.to_str().unwrap()]);
+    assert!(!ok, "importing into a legacy database must fail");
+    assert!(stderr.contains("legacy"), "the refusal should name the problem, got: {stderr}");
+    assert_eq!(std::fs::read(&legacy).unwrap(), before, "the legacy file must not have been migrated in place");
 }
 
 /// The guard rail on the one irreversible mistake available here.
