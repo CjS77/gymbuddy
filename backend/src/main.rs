@@ -1,10 +1,10 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
@@ -12,6 +12,7 @@ use corre_core::config::CorreConfig;
 use gymbuddy_backend::assistant::AssistantHandler;
 use gymbuddy_backend::config::GymConfig;
 use gymbuddy_backend::db::Database;
+use gymbuddy_backend::dump;
 use gymbuddy_backend::github::{GithubIssueReporter, IssueReporter};
 use gymbuddy_backend::render::{Telegram, to_plain};
 use gymbuddy_backend::telegram::chunk::split_for_telegram;
@@ -26,8 +27,57 @@ use gymbuddy_timer_core::{Cue, run_timer};
 #[command(name = "gymbuddy", about = "You friendly AI personal trainer")]
 struct Cli {
     /// Path to corre.toml config file
-    #[arg(short, long, default_value_os_t = default_config_path())]
+    #[arg(short, long, default_value_os_t = default_config_path(), global = true)]
     config: PathBuf,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Subcommands are additive: omitting one runs [`Command::Serve`], so the deployment invocation
+/// (`gymbuddy --config …`) is unchanged.
+#[derive(Subcommand)]
+enum Command {
+    /// Run the bot. The default when no subcommand is given.
+    Serve,
+
+    /// Export a database to a JSON dump — the backup tool, and the first half of a migration.
+    ///
+    /// Version-aware: reads either schema generation and emits one format. The database is opened
+    /// read-only and is never written to.
+    Export {
+        /// Database to read. Not taken from the config: exporting a backup copy is the common case.
+        #[arg(long)]
+        db: PathBuf,
+        /// File to write the dump to. Overwritten if it exists.
+        #[arg(long)]
+        out: PathBuf,
+    },
+
+    /// Load a dump into a fresh schema v2 database. Refuses a database that already holds data.
+    Import {
+        /// Database to write. Must be empty.
+        #[arg(long)]
+        db: PathBuf,
+        /// Dump to read.
+        #[arg(long = "in")]
+        input: PathBuf,
+    },
+
+    /// Migrate a legacy database to schema v2: export, build v2, import, then verify.
+    ///
+    /// Writes a new file and never touches the old one, which is therefore its own rollback.
+    Migrate {
+        /// Legacy database to read. Never written to.
+        #[arg(long)]
+        db: PathBuf,
+        /// Schema v2 database to create.
+        #[arg(long)]
+        out: PathBuf,
+        /// Re-export the result and compare it against the source dump. On by default.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        verify: bool,
+    },
 }
 
 fn default_data_dir() -> PathBuf {
@@ -40,7 +90,51 @@ fn default_config_path() -> PathBuf {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let (telegram, handler, allowed_ids, voice_pipeline, gym_config) = setup().await?;
+    let cli = Cli::parse();
+    init_observability();
+    match cli.command.unwrap_or(Command::Serve) {
+        Command::Serve => serve(&cli.config).await,
+        Command::Export { db, out } => run_export(&db, &out),
+        Command::Import { .. } => anyhow::bail!("`gymbuddy import` is not implemented yet — it lands with the schema v2 importer"),
+        Command::Migrate { .. } => anyhow::bail!("`gymbuddy migrate` is not implemented yet — it lands with the schema v2 importer"),
+    }
+}
+
+/// Load `.env` from the data dir (best-effort) and start tracing.
+///
+/// Shared by every subcommand, so the one-shot data tools report through the same filter the
+/// server does — `RUST_LOG=debug gymbuddy export …` works as expected.
+fn init_observability() {
+    let data_dir = default_data_dir();
+    let _ = dotenvy::from_filename(data_dir.join(".env")).ok();
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_writer(std::io::stderr)
+        .init();
+    tracing::debug!("Loaded environment from {}", data_dir.display());
+}
+
+/// `gymbuddy export --db <path> --out dump.json`.
+fn run_export(db: &Path, out: &Path) -> anyhow::Result<()> {
+    tracing::info!(db = %db.display(), "Exporting (read-only)");
+    let dump = dump::export_path(db)?;
+    let json = dump::to_json(&dump)?;
+    std::fs::write(out, &json).with_context(|| format!("writing dump to {}", out.display()))?;
+
+    let sessions: usize = dump.users.iter().map(|user| user.sessions.len()).sum();
+    tracing::info!(
+        out = %out.display(),
+        source_schema = dump.source_schema.generation,
+        users = dump.users.len(),
+        sessions,
+        bytes = json.len(),
+        "Export complete"
+    );
+    Ok(())
+}
+
+async fn serve(config_path: &Path) -> anyhow::Result<()> {
+    let (telegram, handler, allowed_ids, voice_pipeline, gym_config) = setup(config_path).await?;
     let handler = Arc::new(handler);
 
     anyhow::ensure!(
@@ -73,39 +167,26 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn setup()
--> anyhow::Result<(Option<TelegramClient>, AssistantHandler, Vec<i64>, Option<VoicePipeline>, GymConfig)> {
-    // 1. Load .env from data dir (best-effort, same as corre-news)
-    let default_data_dir = default_data_dir();
-    tracing::info!("Loading environment from {}", default_data_dir.display());
-    let _ = dotenvy::from_filename(default_data_dir.join(".env")).ok();
-
-    // 2. Init tracing
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with_writer(std::io::stderr)
-        .init();
-
-    // 3. Parse CLI args
-    let cli = Cli::parse();
-
-    // 4. Load config
-    tracing::info!(path = %cli.config.display(), "Loading config");
-    let config = CorreConfig::load(&cli.config).context("loading config")?;
+async fn setup(
+    config_path: &Path,
+) -> anyhow::Result<(Option<TelegramClient>, AssistantHandler, Vec<i64>, Option<VoicePipeline>, GymConfig)> {
+    // 1. Load config
+    tracing::info!(path = %config_path.display(), "Loading config");
+    let config = CorreConfig::load(config_path).context("loading config")?;
     let data_dir = config.data_dir();
     // corre 0.22 dropped the hardcoded `[gym]` table from `CorreConfig` when it
     // removed the corre-gym app. This repo is that app now, so it reads its own
     // table out of the same file rather than expecting the host to surface it.
-    let raw_config: toml::Value = std::fs::read_to_string(&cli.config)
-        .with_context(|| format!("reading {}", cli.config.display()))?
+    let raw_config: toml::Value = std::fs::read_to_string(config_path)
+        .with_context(|| format!("reading {}", config_path.display()))?
         .parse()
-        .with_context(|| format!("parsing {} as TOML", cli.config.display()))?;
+        .with_context(|| format!("parsing {} as TOML", config_path.display()))?;
     tracing::debug!(raw_gym = ?raw_config.get("gym"), "Raw [gym] table from config");
     let mut gym_config = GymConfig::from_toml_table(raw_config.get("gym"))?;
     gym_config.resolve_secrets()?;
     gym_config.resolve_endpoints()?;
 
-    // 5. Build LLM provider (with optional [gym.llm] overrides)
+    // 2. Build LLM provider (with optional [gym.llm] overrides)
     tracing::debug!(gym_llm = ?gym_config.llm, "Gym LLM override");
     let effective_llm = match gym_config.llm.as_ref() {
         Some(overrides) => config.llm.with_overrides(overrides),
@@ -120,14 +201,14 @@ async fn setup()
         raw_llm
     };
 
-    // 6. Open database
+    // 3. Open database
     let db_path = data_dir.join(&gym_config.db_path);
     tracing::info!("Loading database from {}", db_path.display());
     let db = Database::open(&db_path)?;
     let db = Arc::new(Mutex::new(db));
     tracing::info!("Database ready!");
 
-    // 7. Create Telegram client only when a token is configured (a confide-only
+    // 4. Create Telegram client only when a token is configured (a confide-only
     //    server runs with no Telegram token); verify the connection if present.
     let telegram = match gym_config.telegram_bot_token.as_deref() {
         Some(token) => {
@@ -144,7 +225,7 @@ async fn setup()
 
     let allowed_ids = gym_config.telegram_allowed_ids.clone();
 
-    // 8. Optional feedback reporter (gated by [gym.github] config + per-user beta flag)
+    // 5. Optional feedback reporter (gated by [gym.github] config + per-user beta flag)
     let issue_reporter: Option<Arc<dyn IssueReporter>> = match &gym_config.github {
         Some(github_cfg) => {
             let reporter = GithubIssueReporter::new(github_cfg).context("constructing GitHub issue reporter")?;
@@ -154,10 +235,10 @@ async fn setup()
         None => None,
     };
 
-    // 9. Create handler
+    // 6. Create handler
     let handler = AssistantHandler::new_with_reporter(db.clone(), llm, gym_config.clone(), issue_reporter).await?;
 
-    // 10. Voice pipeline (optional)
+    // 7. Voice pipeline (optional)
     let voice_pipeline = match &gym_config.voice {
         Some(voice_config) if voice_config.stt_enabled => {
             voice_config.validate()?;
