@@ -38,7 +38,10 @@ fn invariant_closed_sessions_have_no_open_entries() {
 #[test]
 fn exercise_time_series_shows_progression() {
     let f = build_fixture();
-    let points = f.db.exercise_time_series(f.alice_id, f.bench_press_id, Some("2025-01-01"), Some("2026-06-30"), false).unwrap();
+    let points = f
+        .db
+        .exercise_time_series(f.alice_id, f.bench_press_id, GoalDirection::Increase, Some("2025-01-01"), Some("2026-06-30"), false)
+        .unwrap();
     assert!(points.len() >= 10, "expected ≥10 bench data points, got {}", points.len());
     let first = points.first().unwrap().value;
     let last = points.last().unwrap().value;
@@ -48,14 +51,20 @@ fn exercise_time_series_shows_progression() {
 #[test]
 fn exercise_time_series_time_based() {
     let f = build_fixture();
-    let points = f.db.exercise_time_series(f.alice_id, f.plank_id, Some("2025-01-01"), Some("2026-06-30"), false).unwrap();
+    let points = f
+        .db
+        .exercise_time_series(f.alice_id, f.plank_id, GoalDirection::Increase, Some("2025-01-01"), Some("2026-06-30"), false)
+        .unwrap();
     assert!(points.len() >= 20, "got {}", points.len());
 }
 
 #[test]
 fn exercise_time_series_distance_based() {
     let f = build_fixture();
-    let points = f.db.exercise_time_series(f.alice_id, f.running_id, Some("2025-01-01"), Some("2026-06-30"), false).unwrap();
+    let points = f
+        .db
+        .exercise_time_series(f.alice_id, f.running_id, GoalDirection::Increase, Some("2025-01-01"), Some("2026-06-30"), false)
+        .unwrap();
     assert!(points.len() >= 20, "got {}", points.len());
 }
 

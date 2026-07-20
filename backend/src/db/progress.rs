@@ -20,14 +20,30 @@ fn goal_percentage(direction: GoalDirection, current: Option<f64>, target: f64) 
     }
 }
 
+/// The SQL aggregate that picks the best value for `direction`: the highest for an
+/// increase goal, the lowest for a decrease goal (a lighter bodyweight, a faster
+/// time). Shared by the per-day series and by the single value a goal is judged
+/// against, so a chart and its verdict can never disagree on which end is "best".
+fn best_aggregate(direction: GoalDirection) -> &'static str {
+    match direction {
+        GoalDirection::Increase => "MAX",
+        GoalDirection::Decrease => "MIN",
+    }
+}
+
 impl Database {
     /// Time series of best-set value per day for a single exercise_type.
     /// When `include_descendants` is true, sets logged against descendants of
     /// `exercise_type_id` are also included (useful for non-leaf nodes).
+    ///
+    /// `direction` decides what "best" means on a day with several sets — see
+    /// [`best_aggregate`]. Charting a decrease goal with MAX would plot each day's
+    /// *worst* set and draw progress as regression, so the caller has to say.
     pub fn exercise_time_series(
         &self,
         user_id: i64,
         exercise_type_id: i64,
+        direction: GoalDirection,
         from: Option<&str>,
         to: Option<&str>,
         include_descendants: bool,
@@ -36,29 +52,34 @@ impl Database {
         let default_to = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let from = from.unwrap_or(&default_from);
         let to = to.unwrap_or(&default_to);
+        let agg = best_aggregate(direction);
 
         let sql = if include_descendants {
-            "WITH RECURSIVE tree(id) AS ( \
-                 SELECT id FROM exercise_types WHERE id = ?2 \
-                 UNION ALL \
-                 SELECT et.id FROM exercise_types et JOIN tree t ON et.parent_id = t.id \
-             ) \
-             SELECT date(s.logged_at) AS d, MAX(s.value) AS value \
-             FROM sets s \
-             JOIN exercise_entries ee ON s.exercise_entry_id = ee.id \
-             WHERE ee.user_id = ?1 AND s.exercise_type_id IN (SELECT id FROM tree) \
-               AND s.logged_at >= ?3 AND s.logged_at <= ?4 \
-             GROUP BY date(s.logged_at) ORDER BY date(s.logged_at)"
+            format!(
+                "WITH RECURSIVE tree(id) AS ( \
+                     SELECT id FROM exercise_types WHERE id = ?2 \
+                     UNION ALL \
+                     SELECT et.id FROM exercise_types et JOIN tree t ON et.parent_id = t.id \
+                 ) \
+                 SELECT date(s.logged_at) AS d, {agg}(s.value) AS value \
+                 FROM sets s \
+                 JOIN exercise_entries ee ON s.exercise_entry_id = ee.id \
+                 WHERE ee.user_id = ?1 AND s.exercise_type_id IN (SELECT id FROM tree) \
+                   AND s.logged_at >= ?3 AND s.logged_at <= ?4 \
+                 GROUP BY date(s.logged_at) ORDER BY date(s.logged_at)"
+            )
         } else {
-            "SELECT date(s.logged_at) AS d, MAX(s.value) AS value \
-             FROM sets s \
-             JOIN exercise_entries ee ON s.exercise_entry_id = ee.id \
-             WHERE ee.user_id = ?1 AND s.exercise_type_id = ?2 \
-               AND s.logged_at >= ?3 AND s.logged_at <= ?4 \
-             GROUP BY date(s.logged_at) ORDER BY date(s.logged_at)"
+            format!(
+                "SELECT date(s.logged_at) AS d, {agg}(s.value) AS value \
+                 FROM sets s \
+                 JOIN exercise_entries ee ON s.exercise_entry_id = ee.id \
+                 WHERE ee.user_id = ?1 AND s.exercise_type_id = ?2 \
+                   AND s.logged_at >= ?3 AND s.logged_at <= ?4 \
+                 GROUP BY date(s.logged_at) ORDER BY date(s.logged_at)"
+            )
         };
 
-        let mut stmt = self.conn().prepare(sql)?;
+        let mut stmt = self.conn().prepare(&sql)?;
         let rows = stmt
             .query_map(params![user_id, exercise_type_id, from, to], |row| Ok(TimeSeriesPoint { date: row.get(0)?, value: row.get(1)? }))?;
         rows.collect::<Result<Vec<_>, _>>().context("Failed to query exercise_type time series")
@@ -101,7 +122,7 @@ impl Database {
         exercise_info
             .into_iter()
             .map(|(et_id, et_name, mt_id)| {
-                let points = self.exercise_time_series(user_id, et_id, Some(from_str), Some(to_str), false)?;
+                let points = self.exercise_time_series(user_id, et_id, GoalDirection::Increase, Some(from_str), Some(to_str), false)?;
                 let mt = mt_id.map(MeasurementType::from_id).unwrap_or(MeasurementType::WeightReps);
                 Ok(TimeSeries { exercise_type_id: et_id, exercise_name: et_name, measurement_type: mt, points })
             })
@@ -131,7 +152,7 @@ impl Database {
         exercise_info
             .into_iter()
             .map(|(et_id, et_name, mt_id)| {
-                let points = self.exercise_time_series(user_id, et_id, Some(from_str), Some(to_str), true)?;
+                let points = self.exercise_time_series(user_id, et_id, GoalDirection::Increase, Some(from_str), Some(to_str), true)?;
                 let mt = mt_id.map(MeasurementType::from_id).unwrap_or(MeasurementType::WeightReps);
                 Ok(TimeSeries { exercise_type_id: et_id, exercise_name: et_name, measurement_type: mt, points })
             })
@@ -260,10 +281,7 @@ impl Database {
         from: &str,
         to: &str,
     ) -> anyhow::Result<Option<f64>> {
-        let agg = match direction {
-            GoalDirection::Increase => "MAX",
-            GoalDirection::Decrease => "MIN",
-        };
+        let agg = best_aggregate(direction);
         let sql = format!(
             "WITH RECURSIVE tree(id) AS ( \
                  SELECT id FROM exercise_types WHERE id = ?2 \
@@ -313,7 +331,8 @@ mod tests {
             log_weight_set(&db, user_id, bench.id, &format!("2025-06-{day:02} 10:00:00"), weight);
         }
 
-        let points = db.exercise_time_series(user_id, bench.id, Some("2025-06-01"), Some("2025-06-30"), false).unwrap();
+        let points =
+            db.exercise_time_series(user_id, bench.id, GoalDirection::Increase, Some("2025-06-01"), Some("2025-06-30"), false).unwrap();
         assert_eq!(points.len(), 3);
         assert!(points[0].value < points[2].value);
     }
@@ -328,9 +347,35 @@ mod tests {
         s.logged_at = "2025-06-01 10:00:00".into();
         db.insert_set(&s).unwrap();
 
-        let points = db.exercise_time_series(user_id, plank.id, Some("2025-06-01"), Some("2025-06-30"), false).unwrap();
+        let points =
+            db.exercise_time_series(user_id, plank.id, GoalDirection::Increase, Some("2025-06-01"), Some("2025-06-30"), false).unwrap();
         assert_eq!(points.len(), 1);
         assert_eq!(points[0].value, 120.0);
+    }
+
+    /// A day with several sets has two candidate readings, and which one is "that
+    /// day's result" depends on the goal: the heaviest lift, but the *fastest* time.
+    /// Taking MAX for a decrease goal would chart the day's worst effort and draw the
+    /// user's progress as regression.
+    #[test]
+    fn daily_reading_follows_the_goal_direction() {
+        let db = test_db();
+        let user_id = db.insert_user(&new_user("Tester", None, "UTC")).unwrap();
+        let plank = db.get_exercise_type_by_name("Plank").unwrap().unwrap();
+
+        for secs in [95.0, 70.0, 110.0] {
+            let entry_id = db.insert_entry(&new_exercise_entry(user_id, None, None)).unwrap();
+            let mut s = new_exercise_set(entry_id, plank.id, MeasurementType::TimeBased, secs);
+            s.logged_at = "2025-06-01 10:00:00".into();
+            db.insert_set(&s).unwrap();
+        }
+
+        let window = (Some("2025-06-01"), Some("2025-06-30"));
+        let up = db.exercise_time_series(user_id, plank.id, GoalDirection::Increase, window.0, window.1, false).unwrap();
+        assert_eq!(up[0].value, 110.0, "an increase goal reads the day's highest value");
+
+        let down = db.exercise_time_series(user_id, plank.id, GoalDirection::Decrease, window.0, window.1, false).unwrap();
+        assert_eq!(down[0].value, 70.0, "a decrease goal reads the day's lowest value");
     }
 
     #[test]
