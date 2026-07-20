@@ -871,3 +871,48 @@ fn a_v1_database_with_uncanonical_metric_spellings_migrates_and_verifies() {
     assert_eq!(shared, 1, "`weight` and `Body Weight` must resolve to the same metric row");
     assert_eq!(user(&reexported, "Dana").goals[0].metric.as_deref(), Some("bodyweight_kg"));
 }
+
+/// The v2-only fields a v1 source can never exercise.
+///
+/// `goals.achieved_at`, `sessions.effort_source` and the whole `session_reviews` table do not exist
+/// in schema v1, so every round trip driven off the fixture leaves them empty on both sides — the
+/// importer's handling of them is written but never proven, and an empty collection compares equal
+/// to an empty collection all day. This populates them on a v1-derived dump and re-imports, which
+/// is also the shape a *restore* takes once v2 has been running for a while.
+#[test]
+fn v2_only_fields_survive_an_import() {
+    let mut dump = export(&seeded_v1_db()).unwrap();
+    let (session_id, roster_id) = {
+        let alice = alice(&dump);
+        (alice.sessions[0].id, roster(alice, "Push Day").id)
+    };
+    let alice = dump.users.iter_mut().find(|user| user.name == "Alice").unwrap();
+    alice.goals[0].achieved_at = Some("2026-03-01 08:00:00".to_string());
+    alice.sessions[0].effort_source = Some("confirmed".to_string());
+    alice.session_reviews = vec![model::SessionReview {
+        session_id,
+        roster_id: Some(roster_id),
+        kind: "report".to_string(),
+        body: r#"{"volume_kg":1420,"note":"quotes \" and a backslash \\ inside the snapshot"}"#.to_string(),
+        created_at: "2026-02-01 18:20:00".to_string(),
+    }];
+
+    let target = Database::open_in_memory().unwrap();
+    target.import_dump(&dump).expect("importing v2-only fields");
+    let reexported = export(target.test_conn()).unwrap();
+
+    let differences = compare::compare(&dump, &reexported);
+    assert!(differences.is_empty(), "v2-only fields did not survive:\n{}", compare::describe(&differences).unwrap_or_default());
+
+    // Named assertions too: the compare would also pass if both sides had dropped the field.
+    let alice = user(&reexported, "Alice");
+    assert_eq!(alice.goals[0].achieved_at.as_deref(), Some("2026-03-01 08:00:00"));
+    assert_eq!(alice.sessions[0].effort_source.as_deref(), Some("confirmed"));
+    assert_eq!(alice.session_reviews.len(), 1);
+    let review = &alice.session_reviews[0];
+    assert_eq!(review.kind, "report");
+    assert!(review.body.contains("1420"), "the review body is opaque and must be stored verbatim");
+    // The review's references were remapped, not carried over as source ids.
+    assert_eq!(review.session_id, alice.sessions[0].id);
+    assert_eq!(review.roster_id, Some(roster(alice, "Push Day").id));
+}
