@@ -10,6 +10,14 @@ use crate::db::{InterviewState, User};
 use super::AssistantHandler;
 use gymbuddy_proto::View;
 
+/// What the user is asked once their philosophy lands: the next thing worth having
+/// is a goal, and stating one in ordinary chat is enough — `set_goal` picks it up,
+/// so no second interview is needed. `/programme` is named but not pressed; it only
+/// pays off once there is a goal for it to serve.
+const PHILOSOPHY_SAVED_FOLLOW_UP: &str = "What's one goal you want to aim at — a lift number, a bodyweight figure, or a \
+weekly training habit? Just tell me and I'll set it up. After that, /nextworkout designs today's session and /programme \
+builds the multi-week programme behind it.";
+
 impl AssistantHandler {
     /// Enter the multi-turn `/philosophy` interview and return the opening question.
     /// Turn 0 is a fixed prompt (no LLM call); subsequent free-text turns are routed
@@ -102,9 +110,9 @@ impl AssistantHandler {
             db.clear_interview_state(user.id, platform)?;
             let message = crate::text::strip_markdown(&parsed.message);
             let confirm = if message.trim().is_empty() {
-                "Saved your training philosophy. Try /nextworkout to put it to work.".to_string()
+                format!("Saved your training philosophy.\n\n{PHILOSOPHY_SAVED_FOLLOW_UP}")
             } else {
-                format!("{message}\n\n(Saved -- try /nextworkout to put it to work.)")
+                format!("{message}\n\n(Saved.)\n\n{PHILOSOPHY_SAVED_FOLLOW_UP}")
             };
             return Ok(View::message(confirm));
         }
@@ -145,6 +153,10 @@ mod tests {
         );
         let done = handler.handle_text_message(&msg, "squat rack to 120kg and dumbbells to 24kg").await.unwrap();
         assert!(shown(&done).contains("/nextworkout"), "confirmation should point at /nextworkout");
+        // Saving the philosophy is the moment to ask for the next missing piece: a
+        // goal, stated in ordinary chat, plus the programme that would serve it.
+        assert!(shown(&done).to_lowercase().contains("goal"), "confirmation should ask about a first goal: {}", shown(&done));
+        assert!(shown(&done).contains("/programme"), "confirmation should mention /programme: {}", shown(&done));
 
         let db = handler.db.lock().await;
         assert!(db.get_interview_state(user.id, "telegram").unwrap().is_none(), "mode should be cleared");

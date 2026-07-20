@@ -20,6 +20,7 @@ mod dispatch;
 mod execution;
 mod interview;
 mod llm;
+mod onboarding;
 #[cfg(test)]
 mod test_support;
 
@@ -78,7 +79,12 @@ impl AssistantHandler {
     pub async fn handle_text_message(&self, message: &TgMessage, text: &str) -> anyhow::Result<Reply> {
         let (user, is_new) = self.ensure_user(message).await?;
         if is_new {
-            return Ok(View::notice(self.welcome_message(&user)).into());
+            // Stored as the opening turn, not just returned: the welcome ends with a
+            // question, and `maybe_handle_onboarding_reply` recognises the answer by
+            // finding that question in the history.
+            let welcome = Self::welcome_message(&user);
+            self.store_conversation_on_platform(user.id, "telegram", text, &welcome).await?;
+            return Ok(View::notice(welcome).into());
         }
         self.handle_message_for_user(&user, text, "telegram").await
     }
@@ -92,6 +98,13 @@ impl AssistantHandler {
         // interviewer prompt. Slash commands above (including `/cancel`) still
         // work; this returns `None` when the user is not interviewing.
         if let Some(reply) = self.maybe_handle_interview_mode(user, text, platform).await? {
+            return Ok(reply.into());
+        }
+
+        // "Yes" to the welcome's ask opens the interview instead of reaching the LLM.
+        // Sits after the interview check so an affirmative *inside* an interview stays
+        // the interviewer's to interpret.
+        if let Some(reply) = self.maybe_handle_onboarding_reply(user, text, platform).await? {
             return Ok(reply.into());
         }
 
@@ -215,22 +228,6 @@ impl AssistantHandler {
         let user = db.get_user(user_id)?.context("user disappeared after insert")?;
         tracing::info!("Registered new user: {} (pubkey: {pubkey})", user.name);
         Ok(user)
-    }
-
-    fn welcome_message(&self, user: &User) -> String {
-        format!(
-            "Welcome, {}! I'm your personal gym trainer assistant.\n\n\
-             Here's what I can do:\n\
-             - Track your exercises (just tell me what you did)\n\
-             - Manage workout sessions\n\
-             - Track injuries and health issues\n\
-             - Set and monitor exercise goals\n\
-             - Show your workout history\n\n\
-             Try telling me something like:\n\
-             \"I just did 3 sets of bench press at 80kg, 8 reps\"\n\n\
-             Type /help for a list of commands.",
-            user.name
-        )
     }
 
     /// Resolve an exercise type's display name from the in-memory catalogue, falling

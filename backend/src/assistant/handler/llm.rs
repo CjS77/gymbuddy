@@ -146,12 +146,15 @@ mod tests {
 
         let db = handler.db.lock().await;
         let user = db.get_user_by_telegram_id("12345").unwrap().unwrap();
+        // The onboarding welcome is an ordinary turn and stays in context; the
+        // failed one must not join it.
         let context_msgs = db.get_recent_messages_for_platform(user.id, "telegram", 100).unwrap();
-        assert_eq!(context_msgs.len(), 0);
+        assert!(!context_msgs.iter().any(|m| m.content.contains("some bad request")), "the failed turn must be out of context");
 
         // Counts every stored message, excluded ones included — the point of the
         // assertion is that the turn was persisted, not that it reaches the LLM.
-        assert_eq!(db.count_messages_for_user(user.id).unwrap(), 2);
+        // Two for the welcome, two for the excluded failure.
+        assert_eq!(db.count_messages_for_user(user.id).unwrap(), 4);
     }
 
     #[tokio::test]
@@ -164,8 +167,11 @@ mod tests {
 
         let db = handler.db.lock().await;
         let user = db.get_user_by_telegram_id("12345").unwrap().unwrap();
+        // Only the onboarding welcome survives in context — neither the off-topic
+        // message nor the refusal that answered it.
         let context_msgs = db.get_recent_messages_for_platform(user.id, "telegram", 100).unwrap();
-        assert_eq!(context_msgs.len(), 0);
+        assert!(!context_msgs.iter().any(|m| m.content.contains("off topic stuff")));
+        assert!(!context_msgs.iter().any(|m| m.content.contains("I cannot provide")));
     }
 
     #[tokio::test]

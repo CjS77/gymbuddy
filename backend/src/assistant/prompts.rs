@@ -19,6 +19,13 @@ pub struct PromptContext {
     pub recent_sets: Vec<ExerciseSet>,
     pub exercise_types: Vec<ExerciseTypeWithAncestry>,
     pub active_goals: Vec<GoalProgress>,
+    /// Whether a training philosophy is on file. With `active_goals` and
+    /// `has_programme`, resolves the SETUP section — read from the database rather
+    /// than inferred by the model, so the nudge cannot fire at someone who is
+    /// already set up.
+    pub has_philosophy: bool,
+    /// Whether a programme is active for this user.
+    pub has_programme: bool,
     /// Hours since the user's last logged set (or session start, if no sets yet).
     /// Only populated when an active session exists; drives the SESSION CONTINUITY
     /// rule (auto-new ≥12h, ask <12h).
@@ -86,6 +93,7 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
     let health_section = format_health_entries(&ctx.health_entries);
     let history_section = format_recent_history(&ctx.recent_summaries, &ctx.recent_sets, &ctx.exercise_types);
     let goals_section = format_active_goals(&ctx.active_goals);
+    let setup_section = format_setup(ctx.has_philosophy, !ctx.active_goals.is_empty(), ctx.has_programme);
     let exercise_list = format_exercise_list(&ctx.exercise_types);
 
     format!(
@@ -369,6 +377,7 @@ re-labels the whole block of sets; changing `new_value`/`new_reps`/`new_difficul
 affects the single most recent set. If the user wants to change the exercise to one \
 that is measured differently (e.g. a timed exercise), ask for the new value first.\n\
 \n\
+{setup_section}\
 CURRENT STATE:\n\
 User: {user_name}\n\
 Time: {current_time} ({timezone})\n\
@@ -687,6 +696,35 @@ loads conservative)\n"
     }
 }
 
+/// The SETUP backstop: one nudge toward whatever the user is missing, in the order
+/// each thing becomes useful — a philosophy shapes every design, goals point the
+/// designs somewhere, and a programme joins them up.
+///
+/// A backstop rather than the mechanism: the welcome asks outright, and this only
+/// catches the user who declined or never answered. Resolved host-side from stored
+/// state, so it says nothing at all once all three exist — the model is never left
+/// to guess whether someone is set up.
+fn format_setup(has_philosophy: bool, has_goals: bool, has_programme: bool) -> String {
+    let nudge = match (has_philosophy, has_goals, has_programme) {
+        (false, _, _) => {
+            "The user has NO training philosophy on file. Somewhere in your reply, invite them to \
+run /philosophy — a short interview about how they train, which is what lets designed sessions \
+fit them. Mention it at most once per conversation, and never withhold logging over it."
+        }
+        (true, false, _) => {
+            "The user has a philosophy but NO goals. Invite them to name one target — a lift \
+number, a bodyweight figure, or a weekly training habit — and emit set_goal once they state it. \
+Mention it at most once per conversation."
+        }
+        (true, true, false) => {
+            "The user has a philosophy and goals but NO programme. Mention once, briefly, that \
+/programme builds a multi-week programme their sessions then build on. Do not push it."
+        }
+        (true, true, true) => return String::new(),
+    };
+    format!("SETUP:\n{nudge}\n\n")
+}
+
 /// Lower bound of the "ask before logging" window. Below this, treat the message
 /// as a continuation of the in-progress workout and log normally.
 pub const SESSION_CONTINUITY_ASK_HOURS: f64 = 0.5;
@@ -997,7 +1035,43 @@ mod tests {
                 make_exercise_type(2, "Running", "run,jogging", "Cardio", MeasurementType::DistanceBased),
             ],
             active_goals: vec![],
+            has_philosophy: false,
+            has_programme: false,
             last_activity_age_hours: None,
+        }
+    }
+
+    /// A user with everything already in place, so SETUP has nothing to say.
+    fn set_up_context() -> PromptContext {
+        let mut ctx = base_context();
+        ctx.has_philosophy = true;
+        ctx.has_programme = true;
+        ctx.active_goals = vec![make_goal_progress()];
+        ctx
+    }
+
+    fn make_goal_progress() -> GoalProgress {
+        GoalProgress {
+            goal: Goal {
+                id: 1,
+                user_id: 1,
+                kind: GoalKind::Strength,
+                exercise_type_id: Some(1),
+                metric: None,
+                target_value: 100.0,
+                direction: GoalDirection::Increase,
+                priority: 0,
+                start_date: "2026-01-01".to_string(),
+                target_date: None,
+                achieved: false,
+                notes: None,
+                created_at: "2026-01-01".to_string(),
+                updated_at: "2026-01-01".to_string(),
+            },
+            exercise_name: "Bench Press".to_string(),
+            status: GoalStatus::Active,
+            current_value: Some(80.0),
+            percentage: 80.0,
         }
     }
 
@@ -1160,6 +1234,42 @@ mod tests {
     fn format_no_goals() {
         let text = format_active_goals(&[]);
         assert!(text.contains("ACTIVE GOALS: None"));
+    }
+
+    // ─── SETUP backstop ───────────────────────────────────────────────────────
+
+    /// One nudge at a time, in the order each thing becomes useful — never two, so
+    /// the reply cannot turn into a checklist.
+    #[test]
+    fn setup_nudges_the_first_missing_thing_only() {
+        let no_philosophy = format_setup(false, false, false);
+        assert!(no_philosophy.contains("/philosophy"));
+        assert!(!no_philosophy.contains("/programme"), "must not stack nudges: {no_philosophy}");
+
+        let no_goals = format_setup(true, false, false);
+        assert!(no_goals.contains("set_goal"));
+        assert!(!no_goals.contains("/philosophy"));
+        assert!(!no_goals.contains("/programme"));
+
+        let no_programme = format_setup(true, true, false);
+        assert!(no_programme.contains("/programme"));
+        assert!(!no_programme.contains("/philosophy"));
+    }
+
+    /// A philosophy on file is enough to stop the `/philosophy` nudge whatever else
+    /// is missing — the regression that would nag a set-up user every turn.
+    #[test]
+    fn setup_is_silent_once_everything_is_in_place() {
+        assert_eq!(format_setup(true, true, true), "");
+        let prompt = build_system_prompt(&set_up_context());
+        assert!(!prompt.contains("SETUP:"), "a fully set-up user must see no SETUP section");
+    }
+
+    #[test]
+    fn setup_section_reaches_the_system_prompt() {
+        let prompt = build_system_prompt(&base_context());
+        assert!(prompt.contains("SETUP:"));
+        assert!(prompt.contains("/philosophy"));
     }
 
     #[test]

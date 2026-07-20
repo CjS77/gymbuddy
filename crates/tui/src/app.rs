@@ -103,6 +103,10 @@ pub struct App {
     /// Mirror of the server's per-session rest-timer toggle, shown in the sidebar.
     /// Optimistic default until the first `/timers` reply confirms it.
     pub timers_enabled: bool,
+    /// Set while a `Register` is in flight, so the `Welcome` that answers it can be
+    /// told apart from the one that answers `Hello` on a reconnect. Only the former
+    /// is a first run, and only a first run gets the onboarding ask.
+    registering: bool,
     default_name: Option<String>,
     default_timezone: Option<String>,
 }
@@ -120,6 +124,7 @@ impl App {
             should_quit: false,
             scroll_back: 0,
             timers_enabled: true,
+            registering: false,
             default_name,
             default_timezone,
         }
@@ -237,9 +242,7 @@ impl App {
                 }
                 // Skip the timezone prompt when a default was supplied.
                 if let Some(tz) = self.default_timezone.clone() {
-                    self.mode = Mode::Connecting;
-                    self.push(Speaker::System, format!("Registering as {text} ({tz})…"));
-                    return Action::Send(ClientRequest::Register { name: text, timezone: tz });
+                    return Action::Send(self.register(text, tz));
                 }
                 self.push(Speaker::System, "Enter your timezone (e.g. Europe/London):");
                 self.mode = Mode::AskTimezone { name: text };
@@ -247,9 +250,7 @@ impl App {
             }
             Mode::AskTimezone { name } => {
                 let timezone = if text.is_empty() { "UTC".to_string() } else { text };
-                self.mode = Mode::Connecting;
-                self.push(Speaker::System, format!("Registering as {name} ({timezone})…"));
-                Action::Send(ClientRequest::Register { name, timezone })
+                Action::Send(self.register(name, timezone))
             }
             Mode::Connecting => {
                 self.mode = Mode::Connecting;
@@ -264,6 +265,12 @@ impl App {
             ServerResponse::Welcome { name } => {
                 self.mode = Mode::Chat;
                 self.push(Speaker::System, format!("Connected as {name}. Type a message; /help for commands."));
+                // A brand-new user is asked, not merely nudged. The server recorded
+                // the same line against this user when it registered them, so a plain
+                // "yes" here goes straight into the philosophy interview.
+                if std::mem::take(&mut self.registering) {
+                    self.push(Speaker::System, gymbuddy_proto::ONBOARDING_ASK);
+                }
                 // Ask what this user may run, so Tab can complete it. Asked once a
                 // session; a client that cared about a mid-session grant could
                 // re-issue it.
@@ -293,14 +300,21 @@ impl App {
         }
     }
 
+    /// Send a `Register`, announcing it and remembering that the `Welcome` which
+    /// answers it is a first run. The single place registration is initiated, so the
+    /// three entry points into it cannot disagree about that.
+    fn register(&mut self, name: String, timezone: String) -> ClientRequest {
+        self.mode = Mode::Connecting;
+        self.registering = true;
+        self.push(Speaker::System, format!("Registering as {name} ({timezone})…"));
+        ClientRequest::Register { name, timezone }
+    }
+
     /// Start registration — auto-register if both name and timezone were preset,
     /// otherwise prompt for the name.
     fn begin_registration(&mut self) -> Option<ClientRequest> {
         match (self.default_name.clone(), self.default_timezone.clone()) {
-            (Some(name), Some(timezone)) => {
-                self.push(Speaker::System, format!("Registering as {name} ({timezone})…"));
-                Some(ClientRequest::Register { name, timezone })
-            }
+            (Some(name), Some(timezone)) => Some(self.register(name, timezone)),
             _ => {
                 self.input = Input::new(self.default_name.clone().unwrap_or_default());
                 self.push(Speaker::System, "This key isn't registered yet. Enter your name:");
@@ -517,6 +531,51 @@ mod tests {
         app.on_response(ServerResponse::Welcome { name: "Alice".into() });
         submit(&mut app, "squats 100kg");
         assert_eq!(app.history.entries(), ["squats 100kg"]);
+    }
+
+    fn system_lines(app: &App) -> Vec<&str> {
+        app.transcript
+            .iter()
+            .filter(|e| e.speaker == Speaker::System)
+            .filter_map(|e| match &e.body {
+                EntryBody::Text(t) => Some(t.as_str()),
+                EntryBody::View(_) => None,
+            })
+            .collect()
+    }
+
+    /// A first run is asked outright whether to set up. The server recorded the
+    /// same line against the new user, so answering "yes" here reaches the
+    /// philosophy interview.
+    #[test]
+    fn registration_welcome_ends_with_the_onboarding_ask() {
+        let mut app = App::new("pk".into(), None, None);
+        app.begin_registration();
+        submit(&mut app, "Alice");
+        submit(&mut app, "Europe/London");
+        app.on_response(ServerResponse::Welcome { name: "Alice".into() });
+        assert_eq!(system_lines(&app).last(), Some(&gymbuddy_proto::ONBOARDING_ASK));
+    }
+
+    /// …but a reconnect is not a first run. `Hello` is answered with the same
+    /// `Welcome`, and asking a returning user to set up every time they connect is
+    /// the bug this flag exists to prevent.
+    #[test]
+    fn reconnecting_does_not_repeat_the_onboarding_ask() {
+        let mut app = App::new("pk".into(), None, None);
+        app.on_response(ServerResponse::Welcome { name: "Alice".into() });
+        assert!(!system_lines(&app).iter().any(|l| *l == gymbuddy_proto::ONBOARDING_ASK));
+    }
+
+    /// The ask belongs to the registration it answered, not to the connection.
+    #[test]
+    fn the_onboarding_ask_is_shown_once_per_registration() {
+        let mut app = App::new("pk".into(), Some("Alice".into()), Some("UTC".into()));
+        app.begin_registration();
+        app.on_response(ServerResponse::Welcome { name: "Alice".into() });
+        app.on_response(ServerResponse::Welcome { name: "Alice".into() });
+        let asks = system_lines(&app).iter().filter(|l| **l == gymbuddy_proto::ONBOARDING_ASK).count();
+        assert_eq!(asks, 1);
     }
 
     /// Advertise a command set as the server would.

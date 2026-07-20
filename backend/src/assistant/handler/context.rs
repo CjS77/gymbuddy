@@ -64,6 +64,11 @@ impl AssistantHandler {
         let recent_sets: Vec<_> = recent_sets.into_iter().filter(|s| !session_set_ids.contains(&s.id)).take(10).collect();
         let active_goals = db.goal_progress_report(user.id, None, None)?;
 
+        // Onboarding state behind the SETUP section. Presence only — the philosophy
+        // text itself is the designer's input, not this prompt's.
+        let has_philosophy = db.latest_philosophy(user.id)?.is_some();
+        let has_programme = db.active_programme_for_user(user.id)?.is_some();
+
         let ctx = PromptContext {
             user_name: user.name.clone(),
             timezone: user.timezone.clone(),
@@ -78,6 +83,8 @@ impl AssistantHandler {
             recent_sets,
             exercise_types: self.catalogue.clone(),
             active_goals,
+            has_philosophy,
+            has_programme,
             last_activity_age_hours,
         };
 

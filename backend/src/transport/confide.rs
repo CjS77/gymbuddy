@@ -114,7 +114,16 @@ async fn dispatch(handler: &AssistantHandler, pubkey: &str, req: ClientRequest) 
             Err(e) => error_response(e),
         },
         ClientRequest::Register { name, timezone } => match handler.register_user(pubkey, &name, &timezone).await {
-            Ok(user) => ServerResponse::Welcome { name: user.name },
+            Ok(user) => {
+                // `Welcome` carries only a name, so the client appends
+                // `ONBOARDING_ASK` to its own greeting. Recording the ask here is
+                // what lets the server recognise the answer to it — a failure costs
+                // the user the shortcut into the interview, not the registration.
+                if let Err(e) = handler.record_onboarding_ask(&user, "confide").await {
+                    tracing::warn!("could not record the onboarding ask for {pubkey}: {e:#}");
+                }
+                ServerResponse::Welcome { name: user.name }
+            }
             Err(e) => error_response(e),
         },
         ClientRequest::Chat { text } => match handler.ensure_user_by_pubkey(pubkey).await {

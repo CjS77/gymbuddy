@@ -17,6 +17,16 @@ pub use view::{
 /// knows the payload is a GymBuddy v1 envelope.
 pub const KIND: &str = "gymbuddy/v1";
 
+/// The closing line of every new-user welcome, on every transport.
+///
+/// It lives here because the two surfaces that must say it are in different
+/// crates: the server writes it into the Telegram welcome, and a confide client
+/// appends it to its own post-registration greeting ([`ServerResponse::Welcome`]
+/// carries only a name — extending that variant would break the wire). The server
+/// matches an incoming affirmative against the *stored* copy of this line, so the
+/// two must be the same string, not two hand-kept ones.
+pub const ONBOARDING_ASK: &str = "Want to set up your training philosophy and goals now? (You can also just start logging.)";
+
 /// A request sent from a client to the server.
 ///
 /// Chat is sequential, so no request id is carried yet; later structured queries

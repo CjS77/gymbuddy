@@ -307,7 +307,7 @@ mod tests {
         let db = handler.db.lock().await;
         let user = db.get_user_by_telegram_id("12345").unwrap().unwrap();
         let msgs = db.get_recent_messages_for_platform(user.id, "telegram", 100).unwrap();
-        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs.len(), 4, "the onboarding welcome is a turn too, so two turns are stored");
         drop(db);
 
         let reply = handler.handle_text_message(&msg, "/clear").await.unwrap();
