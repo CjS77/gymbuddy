@@ -177,41 +177,10 @@ impl AssistantHandler {
         draft.target_end_date = Some(shape.target_end_date());
         let programme_id = db.create_programme(&draft).context("creating the draft programme")?;
 
-        let blocks = shape.blocks(proposal);
-        blocks
-            .iter()
-            .try_for_each(|b| db.add_programme_block(&{
-                let mut block = new_programme_block(programme_id, b.start_week as i32, b.end_week as i32, &b.focus);
-                block.notes = None;
-                block
-            }).map(|_| ()))
-            .context("adding programme blocks")?;
+        write_blocks_and_grid(&db, programme_id, &shape.blocks(proposal), shape)?;
+        let (goal_labels, goal_notes) = link_goals(&db, user.id, programme_id, &proposal.goal_ids)?;
 
-        // Expand the repeating week across every week of the programme. This is the grid
-        // `next_design_slot` walks, so it is what makes `/nextworkout` programme-aware.
-        (1..=shape.weeks)
-            .flat_map(|week| shape.week_template.iter().map(move |day| (week, day)))
-            .try_for_each(|(week, day)| {
-                db.add_programme_slot(&new_programme_slot(programme_id, week as i32, day.day_idx as i32, &day.focus)).map(|_| ())
-            })
-            .context("expanding the programme slot grid")?;
-
-        // Only the user's OWN goals may be linked: `goal_ids` is model output, and an id
-        // that is not theirs would silently attach a stranger's goal to their programme.
-        let owned = db.goal_progress_report(user.id, None, None)?;
-        let (linked, unknown): (Vec<i64>, Vec<i64>) =
-            proposal.goal_ids.iter().partition(|id| owned.iter().any(|gp| gp.goal.id == **id));
-        linked.iter().try_for_each(|id| db.add_programme_goal(programme_id, *id)).context("linking programme goals")?;
-        let goal_labels = linked_goal_labels(&db, user.id, programme_id)?;
-
-        let mut notes = shape.notes.clone();
-        if !unknown.is_empty() {
-            notes.push(format!("Ignored {} goal reference(s) I couldn't match to your goals.", unknown.len()));
-        }
-        if goal_labels.is_empty() {
-            notes.push("No goal is linked to this programme yet -- tell me which one it serves and I'll attach it.".to_string());
-        }
-
+        let notes = shape.notes.iter().cloned().chain(goal_notes).collect();
         let programme = db.get_programme(programme_id)?.context("draft programme disappeared after insert")?;
         let view = stored_programme_view(&db, &programme, goal_labels, notes, false)?;
         Ok((programme_id, view))
@@ -347,6 +316,47 @@ impl ProgrammeShape {
             })
             .collect()
     }
+}
+
+/// Write a programme's mesocycle blocks and expand its repeating week across every
+/// week into the slot grid. The grid is what [`Database::next_design_slot`] walks, so
+/// this is the step that actually makes `/nextworkout` programme-aware.
+fn write_blocks_and_grid(db: &Database, programme_id: i64, blocks: &[ProgrammeBlockView], shape: &ProgrammeShape) -> anyhow::Result<()> {
+    blocks
+        .iter()
+        .try_for_each(|b| {
+            db.add_programme_block(&new_programme_block(programme_id, b.start_week as i32, b.end_week as i32, &b.focus)).map(|_| ())
+        })
+        .context("adding programme blocks")?;
+
+    (1..=shape.weeks)
+        .flat_map(|week| shape.week_template.iter().map(move |day| (week, day)))
+        .try_for_each(|(week, day)| {
+            db.add_programme_slot(&new_programme_slot(programme_id, week as i32, day.day_idx as i32, &day.focus)).map(|_| ())
+        })
+        .context("expanding the programme slot grid")
+}
+
+/// Link the goals a proposal claims to serve, and report what was linked plus any
+/// caveat the user should see.
+///
+/// `goal_ids` is model output, so it is filtered against the user's own goals: an id
+/// that is not theirs would otherwise silently attach a stranger's goal to their
+/// programme. An unmatched id is dropped with a note rather than failing the design.
+fn link_goals(db: &Database, user_id: i64, programme_id: i64, goal_ids: &[i64]) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    let owned = db.goal_progress_report(user_id, None, None)?;
+    let (linked, unknown): (Vec<i64>, Vec<i64>) = goal_ids.iter().partition(|id| owned.iter().any(|gp| gp.goal.id == **id));
+    linked.iter().try_for_each(|id| db.add_programme_goal(programme_id, *id)).context("linking programme goals")?;
+
+    let labels = linked_goal_labels(db, user_id, programme_id)?;
+    let mut notes = Vec::new();
+    if !unknown.is_empty() {
+        notes.push(format!("Ignored {} goal reference(s) I couldn't match to your goals.", unknown.len()));
+    }
+    if labels.is_empty() {
+        notes.push("No goal is linked to this programme yet -- tell me which one it serves and I'll attach it.".to_string());
+    }
+    Ok((labels, notes))
 }
 
 /// The view of a stored programme, read back from the grid it was expanded into.
