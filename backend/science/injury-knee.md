@@ -6,6 +6,7 @@ sources:
   - "Collins NJ, Barton CJ, van Middelkoop M, et al. 2018 Consensus statement on exercise therapy and physical interventions for patellofemoral pain. Br J Sports Med. 2018;52(18):1170-1178."
   - "Willy RW, Hoglund LT, Barton CJ, et al. Patellofemoral Pain: Clinical Practice Guidelines. J Orthop Sports Phys Ther. 2019;49(9):CPG1-CPG95."
   - "Malliaras P, Cook J, Purdam C, Rio E. Patellar tendinopathy: clinical diagnosis, load management, and advice for challenging case presentations. J Orthop Sports Phys Ther. 2015;45(11):887-98."
+  - "Alentorn-Geli E, Samuelsson K, Musahl V, Green CL, Bhandari M, Karlsson J. The association of recreational and competitive running with hip and knee osteoarthritis: a systematic review and meta-analysis. J Orthop Sports Phys Ther. 2017;47(6):373-390."
   - "American College of Sports Medicine. ACSM's Guidelines for Exercise Testing and Prescription, 11th ed. Wolters Kluwer, 2021."
 ---
 

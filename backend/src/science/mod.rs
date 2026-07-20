@@ -5,8 +5,8 @@
 //! than retrieving it live is that a person who can judge it reads it once; a change to the science is a
 //! diff with the reasoning in the commit message.
 //!
-//! This module owns the corpus and its parsing only. Building a search index over it is [`crate::science`]'s
-//! consumer, not its job.
+//! This module owns the corpus and its parsing only. Building a search index over the chunks, and injecting
+//! retrieved chunks into a prompt, both belong to its consumers.
 //!
 //! # Document format
 //!
