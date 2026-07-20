@@ -12,10 +12,10 @@ use anyhow::Context as _;
 use rusqlite::params;
 
 use super::database::Database;
-use super::models::{InterviewState, WorkoutPhilosophy};
+use super::models::{InterviewState, Philosophy};
 
-fn row_to_philosophy(row: &rusqlite::Row) -> rusqlite::Result<WorkoutPhilosophy> {
-    Ok(WorkoutPhilosophy {
+fn row_to_philosophy(row: &rusqlite::Row) -> rusqlite::Result<Philosophy> {
+    Ok(Philosophy {
         id: row.get(0)?,
         user_id: row.get(1)?,
         content: row.get(2)?,
@@ -50,7 +50,7 @@ impl Database {
     }
 
     /// The user's current philosophy: the most recently inserted entry.
-    pub fn latest_philosophy(&self, user_id: i64) -> anyhow::Result<Option<WorkoutPhilosophy>> {
+    pub fn latest_philosophy(&self, user_id: i64) -> anyhow::Result<Option<Philosophy>> {
         let sql = format!("{SELECT_PHILOSOPHY} WHERE user_id = ?1 ORDER BY created_at DESC, id DESC LIMIT 1");
         let mut stmt = self.conn().prepare(&sql)?;
         let mut rows = stmt.query_map(params![user_id], row_to_philosophy)?;

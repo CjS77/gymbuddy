@@ -4,7 +4,7 @@
 
 use chrono::Utc;
 
-use crate::assistant::prompts::{EntryView, PromptContext, PromptRosterExercise, RosterProgress, build_system_prompt};
+use crate::assistant::prompts::{PromptContext, PromptEntry, PromptRosterExercise, RosterProgress, build_system_prompt};
 use crate::db::{Database, ExerciseSet, ExerciseTypeWithAncestry, Session, User};
 
 use super::continuity::compute_last_activity_age_hours;
@@ -16,7 +16,7 @@ impl AssistantHandler {
         let db = self.db.lock().await;
         let active_session = db.get_active_session(user.id)?;
         let mut session_sets: Vec<(ExerciseSet, String)> = Vec::new();
-        let mut session_entries: Vec<EntryView> = Vec::new();
+        let mut session_entries: Vec<PromptEntry> = Vec::new();
 
         if let Some(session) = &active_session {
             let entries = db.list_entries_for_session(session.id)?;
@@ -25,7 +25,7 @@ impl AssistantHandler {
                 let exercise_type_id = sets.first().map(|s| s.exercise_type_id);
                 let exercise_name = exercise_type_id.map_or_else(|| "unknown".to_string(), |id| self.exercise_name(id));
                 let summary_parts: Vec<String> = sets.iter().map(format_set_short).collect();
-                session_entries.push(EntryView {
+                session_entries.push(PromptEntry {
                     id: entry.id,
                     exercise_name: exercise_name.clone(),
                     set_count: sets.len(),
@@ -146,7 +146,7 @@ impl AssistantHandler {
     }
 }
 
-/// Build EntryView rows for any open exercise_entry the user has, so the prompt
+/// Build PromptEntry rows for any open exercise_entry the user has, so the prompt
 /// (and LLM-driven cleanup logic) can see them. When `active_session_id` is given,
 /// only entries inside that session are reported (the caller's contract: leaks are
 /// what blocks a *new* session, not what's normal in the current one).
@@ -155,7 +155,7 @@ fn build_leaked_view(
     catalogue: &[ExerciseTypeWithAncestry],
     user_id: i64,
     active_session_id: Option<i64>,
-) -> anyhow::Result<Vec<EntryView>> {
+) -> anyhow::Result<Vec<PromptEntry>> {
     let all_open = db.list_open_entries_for_user(user_id)?;
     let filtered: Vec<_> = all_open
         .into_iter()
@@ -172,7 +172,7 @@ fn build_leaked_view(
             .and_then(|s| catalogue.iter().find(|e| e.exercise_type.id == s.exercise_type_id))
             .map(|e| e.exercise_type.name.clone())
             .unwrap_or_else(|| "unknown".to_string());
-        views.push(EntryView {
+        views.push(PromptEntry {
             id: entry.id,
             exercise_name,
             set_count: sets.len(),

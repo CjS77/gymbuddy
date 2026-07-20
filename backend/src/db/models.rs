@@ -868,7 +868,7 @@ pub fn new_conversation_message(user_id: i64, platform: &str, role: Conversation
 /// One append-only entry in a user's distilled training philosophy. The most
 /// recent row is the active philosophy; equipment lives as free text in `content`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkoutPhilosophy {
+pub struct Philosophy {
     pub id: i64,
     pub user_id: i64,
     pub content: String,
@@ -1029,7 +1029,7 @@ pub struct SkippedExercise {
 /// An exercise the session performed that the roster never prescribed
 /// (performed-not-rostered) — an improvised addition, not an error.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UnplannedExercise {
+pub struct UnrosteredExercise {
     pub exercise_type_id: i64,
     pub exercise_name: String,
     pub measurement_type: MeasurementType,
@@ -1049,7 +1049,7 @@ pub struct RosterVsActual {
     /// Prescribed but not performed, in roster order.
     pub skipped: Vec<SkippedExercise>,
     /// Performed but not prescribed, in the order first logged.
-    pub unplanned: Vec<UnplannedExercise>,
+    pub unrostered: Vec<UnrosteredExercise>,
 }
 
 // ── Programmes ─────────────────────────────────────────────────────────────────

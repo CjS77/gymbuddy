@@ -14,8 +14,8 @@ use crate::assistant::parser::parse_assistant_response;
 use crate::assistant::prompts::{build_designer_prompt, estimate_tokens, format_muscle_recovery, format_session_outcome, goals_by_priority};
 use crate::config::DesignerHistoryConfig;
 use crate::db::{
-    Database, EntryWithSets, ExerciseSet, GoalKind, GoalProgress, HealthEntry, MeasurementType, RosterExercise, Session, SessionWithSets,
-    TrainingMode, User, WorkoutPhilosophy,
+    Database, EntryWithSets, ExerciseSet, GoalKind, GoalProgress, HealthEntry, MeasurementType, Philosophy, RosterExercise, Session,
+    SessionWithSets, TrainingMode, User,
 };
 use crate::science::{ScienceQuery, normalise_body_part, prescription_doc};
 
@@ -109,7 +109,7 @@ impl AssistantHandler {
     async fn persist_and_view_roster(
         &self,
         user: &User,
-        philosophy: &WorkoutPhilosophy,
+        philosophy: &Philosophy,
         mode: &TrainingMode,
         title: String,
         rationale: Option<String>,
@@ -453,7 +453,7 @@ mod tests {
 
     #[tokio::test]
     async fn nextworkout_drops_unresolved_exercise_with_note() {
-        let design = r#"{"message": "Plan ready.", "actions": [
+        let design = r#"{"message": "Roster ready.", "actions": [
             {"type": "propose_session_roster", "title": "Mixed", "exercises": [
                 {"exercise": "Bench Press", "target_sets": 3, "target_reps": 8, "target_weight_kg": 60.0},
                 {"exercise": "Jetpack Flips", "target_sets": 3, "target_reps": 8}
@@ -485,14 +485,14 @@ mod tests {
 
     /// Give `user_id` an active programme ("12-week hypertrophy") with a two-slot
     /// week-1 grid, returning the slot ids in (week, day) order.
-    async fn activate_program_with_slots(handler: &AssistantHandler, user_id: i64) -> Vec<i64> {
+    async fn activate_programme_with_slots(handler: &AssistantHandler, user_id: i64) -> Vec<i64> {
         let db = handler.db.lock().await;
-        let program = crate::db::new_programme(user_id, "12-week hypertrophy", 2, "upper/lower", "double progression");
-        let program_id = db.create_programme(&program).unwrap();
-        db.activate_programme(program_id).unwrap();
+        let programme = crate::db::new_programme(user_id, "12-week hypertrophy", 2, "upper/lower", "double progression");
+        let programme_id = db.create_programme(&programme).unwrap();
+        db.activate_programme(programme_id).unwrap();
         [(1, 1, "upper"), (1, 2, "lower")]
             .iter()
-            .map(|(w, d, focus)| db.add_programme_slot(&crate::db::new_programme_slot(program_id, *w, *d, focus)).unwrap())
+            .map(|(w, d, focus)| db.add_programme_slot(&crate::db::new_programme_slot(programme_id, *w, *d, focus)).unwrap())
             .collect()
     }
 
@@ -508,7 +508,7 @@ mod tests {
         {
             handler.db.lock().await.insert_philosophy(user.id, "5x5, dumbbells to 24kg", "interview").unwrap();
         }
-        let slots = activate_program_with_slots(&handler, user.id).await;
+        let slots = activate_programme_with_slots(&handler, user.id).await;
 
         let reply = handler.handle_text_message(&msg, "/nextworkout").await.unwrap();
         let text = shown(&reply);
@@ -534,7 +534,7 @@ mod tests {
         {
             handler.db.lock().await.insert_philosophy(user.id, "5x5, dumbbells to 24kg", "interview").unwrap();
         }
-        let slots = activate_program_with_slots(&handler, user.id).await;
+        let slots = activate_programme_with_slots(&handler, user.id).await;
 
         let reply = handler.handle_text_message(&msg, "/nextworkout adhoc dumbbells only").await.unwrap();
         let text = shown(&reply);
@@ -693,7 +693,7 @@ mod tests {
         llm.set_response(r#"{"message": "Done!", "actions": [{"type": "end_session"}]}"#);
         let _ = handler.handle_text_message(&msg, "done").await.unwrap();
         llm.set_response(
-            r#"{"message": "New plan.", "actions": [{"type": "propose_session_roster", "title": "Pull", "exercises": [
+            r#"{"message": "New roster.", "actions": [{"type": "propose_session_roster", "title": "Pull", "exercises": [
                 {"exercise": "Bench Press", "target_sets": 3, "target_reps": 6, "target_weight_kg": 60.0}
             ]}]}"#,
         );

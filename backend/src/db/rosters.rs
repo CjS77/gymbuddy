@@ -19,7 +19,7 @@ use rusqlite::params;
 use super::database::Database;
 use super::models::{
     ExerciseDelta, ExerciseSet, LifecycleStatus, MeasurementType, PerformedRollup, RosterExercise, RosterVsActual, SessionRoster,
-    SkippedExercise, SlotStatus, UnplannedExercise,
+    SkippedExercise, SlotStatus, UnrosteredExercise,
 };
 
 /// A session's logged sets grouped by `exercise_type_id`, for rolling performance
@@ -225,17 +225,17 @@ impl Database {
             .filter(|re| !performed.contains_key(&re.exercise_type_id))
             .map(|re| self.skipped_exercise(re))
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let unplanned = performed_order
+        let unrostered = performed_order
             .iter()
             .filter(|type_id| !prescribed_ids.contains(type_id))
-            .map(|&type_id| self.unplanned_exercise(type_id, &performed[&type_id]))
+            .map(|&type_id| self.unrostered_exercise(type_id, &performed[&type_id]))
             .collect::<anyhow::Result<Vec<_>>>()?;
 
-        Ok(RosterVsActual { roster_id, session_id, matched, skipped, unplanned })
+        Ok(RosterVsActual { roster_id, session_id, matched, skipped, unrostered })
     }
 
     /// Every set logged in `session_id`, grouped by `exercise_type_id`, plus the
-    /// exercise_type ids in the order they were first logged (so the unplanned list
+    /// exercise_type ids in the order they were first logged (so the unrostered list
     /// keeps a stable, session-chronological order).
     fn performed_by_exercise(&self, session_id: i64) -> anyhow::Result<(PerformedSets, Vec<i64>)> {
         let sets = self
@@ -277,9 +277,9 @@ impl Database {
         Ok(SkippedExercise { exercise_name: self.exercise_name(re.exercise_type_id)?, prescribed: re.clone() })
     }
 
-    fn unplanned_exercise(&self, exercise_type_id: i64, sets: &[ExerciseSet]) -> anyhow::Result<UnplannedExercise> {
+    fn unrostered_exercise(&self, exercise_type_id: i64, sets: &[ExerciseSet]) -> anyhow::Result<UnrosteredExercise> {
         let measurement_type = sets.first().map(|s| s.measurement_type).unwrap_or(MeasurementType::WeightReps);
-        Ok(UnplannedExercise {
+        Ok(UnrosteredExercise {
             exercise_type_id,
             exercise_name: self.exercise_name(exercise_type_id)?,
             measurement_type,
@@ -435,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn roster_vs_actual_matches_skips_and_flags_unplanned() {
+    fn roster_vs_actual_matches_skips_and_flags_unrostered() {
         let (db, user_id) = test_db();
         let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
         let squat = db.get_exercise_type_by_name("Squat").unwrap().unwrap();
@@ -473,7 +473,7 @@ mod tests {
         // Bench: 4 sets @ 6 reps @ 70kg — beat the prescription on sets and weight, met reps.
         log_sets(&db, user_id, session.id, bench.id, 4, 6, 70.0);
         // Squat: prescribed but never performed → skipped.
-        // Deadlift: performed but never prescribed → unplanned.
+        // Deadlift: performed but never prescribed → unrostered.
         log_sets(&db, user_id, session.id, deadlift.id, 2, 5, 120.0);
 
         let cmp = db.roster_vs_actual(roster_id).unwrap();
@@ -492,10 +492,10 @@ mod tests {
         assert_eq!(cmp.skipped[0].exercise_name, "Squat");
         assert_eq!(cmp.skipped[0].prescribed.target_weight_kg, Some(100.0));
 
-        assert_eq!(cmp.unplanned.len(), 1);
-        assert_eq!(cmp.unplanned[0].exercise_name, "Deadlift");
-        assert_eq!(cmp.unplanned[0].performed.performed_sets, 2);
-        assert_eq!(cmp.unplanned[0].performed.avg_weight_kg, Some(120.0));
+        assert_eq!(cmp.unrostered.len(), 1);
+        assert_eq!(cmp.unrostered[0].exercise_name, "Deadlift");
+        assert_eq!(cmp.unrostered[0].performed.performed_sets, 2);
+        assert_eq!(cmp.unrostered[0].performed.avg_weight_kg, Some(120.0));
     }
 
     #[test]
@@ -527,7 +527,7 @@ mod tests {
 
         let cmp = db.roster_vs_actual(roster_id).unwrap();
         assert!(cmp.skipped.is_empty());
-        assert!(cmp.unplanned.is_empty());
+        assert!(cmp.unrostered.is_empty());
         let delta = &cmp.matched[0];
         assert_eq!(delta.sets_delta, Some(-2)); // 2 − 4, missed
         assert_eq!(delta.reps_delta, Some(-2.0)); // 6 − 8, missed

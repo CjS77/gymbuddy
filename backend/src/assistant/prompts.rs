@@ -11,8 +11,8 @@ pub struct PromptContext {
     pub current_time: String,
     pub active_session: Option<Session>,
     pub session_sets: Vec<(ExerciseSet, String)>, // (set, exercise_type name) — flat view, kept for backward compat
-    pub session_entries: Vec<EntryView>,          // closed + open entries in the active session, in insertion order
-    pub leaked_open_entries: Vec<EntryView>,      // open entries belonging to ENDED prior sessions or the active session
+    pub session_entries: Vec<PromptEntry>,        // closed + open entries in the active session, in insertion order
+    pub leaked_open_entries: Vec<PromptEntry>,    // open entries belonging to ENDED prior sessions or the active session
     pub active_roster: Option<RosterProgress>,    // a `/nextworkout` design that is ready or under guided execution
     pub health_entries: Vec<HealthEntry>,
     pub recent_summaries: Vec<SessionSummary>,
@@ -30,7 +30,7 @@ pub struct PromptContext {
 pub const SESSION_CONTINUITY_HOURS: f64 = 12.0;
 
 #[derive(Debug, Clone)]
-pub struct EntryView {
+pub struct PromptEntry {
     pub id: i64,
     pub exercise_name: String,
     pub set_count: usize,
@@ -419,7 +419,7 @@ philosophy. Cover these four areas (ask about whatever is still missing, one or 
 at a time — do not interrogate):\n\
 1. How often they want to train (sessions per week; any other sports/activities).\n\
 2. The main thrust of their training (hypertrophy, strength, cardio, fitness, flexibility, core, ...).\n\
-3. Preferred programs or styles (e.g. 5x5, push/pull/legs, high-rep, circuits) — optional.\n\
+3. Preferred programmes or styles (e.g. 5x5, push/pull/legs, high-rep, circuits) — optional.\n\
 4. Equipment available, WITH limits (e.g. \"squat rack up to 120kg, bench, dumbbells up to 24kg, \
 kettlebells\"). Capture this verbatim as free text — it constrains future workouts.\n\
 \n\
@@ -438,9 +438,9 @@ THE ONLY ACTION available to you is:\n\
 - {{\"type\": \"save_philosophy\", \"content\": \"<the distilled philosophy>\"}}\n\
 \n\
 WHEN TO SAVE: Emit save_philosophy ONLY once you have a clear picture of the four areas above \
-(equipment is required; programs are optional). When you do, set `content` to a SINGLE compact, \
+(equipment is required; programmes are optional). When you do, set `content` to a SINGLE compact, \
 information-dense paragraph — not a transcript — capturing goal, weekly frequency, preferred \
-programs, equipment with limits, and any relevant injuries or preferences. Example content:\n\
+programmes, equipment with limits, and any relevant injuries or preferences. Example content:\n\
   \"goal=hypertrophy. Likes 5x5. Home gym: squat rack up to 120kg, bench, kettlebells, dumbbells \
 up to 24kg. Weights 3x/week, racket sports 2x/week. Minor lower-back niggle — cautious on heavy spinal load.\"\n\
 In the SAME response, your `message` should briefly confirm what you saved. Until you are ready \
@@ -491,7 +491,7 @@ SELECTION PRIORITY — rank candidate exercises by these criteria, in DECREASING
 2. Exercises the user has done before (they appear in RECENT HISTORY).\n\
 3. Muscle groups with the longest rest period (MUSCLE RECOVERY lists them longest-rested first; \
 treat a group shown as never trained, or not trained in a long time, as a strong candidate).\n\
-4. Fit with the TRAINING PHILOSOPHY: its goal, preferred programs/rotation, weekly frequency.\n\
+4. Fit with the TRAINING PHILOSOPHY: its goal, preferred programmes/rotation, weekly frequency.\n\
 5. Working around ACTIVE HEALTH ISSUES.\n\
 6. Temporary, single-session requests in the user's message (\"something lighter today\").\n\
 This is a decreasing priority order, not a filter: a lower item never vetoes a higher one — it \
@@ -732,7 +732,7 @@ fn format_session_continuity(age_hours: Option<f64>) -> String {
     }
 }
 
-fn format_session_entries(entries: &[EntryView]) -> String {
+fn format_session_entries(entries: &[PromptEntry]) -> String {
     if entries.is_empty() {
         return "EXERCISE ENTRIES (this session): None\n".to_string();
     }
@@ -751,7 +751,7 @@ fn format_session_entries(entries: &[EntryView]) -> String {
     s
 }
 
-fn format_leaked_entries(entries: &[EntryView]) -> String {
+fn format_leaked_entries(entries: &[PromptEntry]) -> String {
     if entries.is_empty() {
         return String::new();
     }
@@ -1022,7 +1022,7 @@ mod tests {
             cut_short: false,
             cut_short_reason: None,
         });
-        ctx.session_entries = vec![EntryView {
+        ctx.session_entries = vec![PromptEntry {
             id: 7,
             exercise_name: "Bench Press".to_string(),
             set_count: 1,
@@ -1041,7 +1041,7 @@ mod tests {
     fn prompt_surfaces_leaked_open_entries() {
         let mut ctx = base_context();
         ctx.leaked_open_entries =
-            vec![EntryView { id: 3, exercise_name: "Squat".to_string(), set_count: 2, sets_summary: "".to_string(), is_open: true }];
+            vec![PromptEntry { id: 3, exercise_name: "Squat".to_string(), set_count: 2, sets_summary: "".to_string(), is_open: true }];
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("LEAKED OPEN ENTRIES"));
         assert!(prompt.contains("[id=3] Squat"));

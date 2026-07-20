@@ -139,18 +139,22 @@ pub enum AssistantAction {
         #[serde(default, alias = "difficulty")]
         new_difficulty: Option<Difficulty>,
     },
-    /// Look up the user's most recent `exercise_entry` for a named exercise and
+    /// Look up the user's most recent `ExerciseEntry` for a named exercise and
     /// report its sets. Free-text `exercise` is resolved through
     /// `find_exercise_type`; when nothing is logged against the exact type the
     /// handler falls back to a descendants-inclusive query so coarse names like
     /// "chest" still surface a logged variation.
+    ///
+    /// The `exercise_entry` alias is a wire contract, not a stale spelling: replayed
+    /// conversation history holds envelopes keyed that way, so it must keep the
+    /// singular v1 form even though the table is now `exercise_entries`.
     GetLastExercise {
         #[serde(alias = "exercise_entry", alias = "name")]
         exercise: String,
     },
     /// Emitted by the `/philosophy` interview prompt once enough has been gathered.
-    /// `content` is the fully distilled training philosophy (goals, programs,
-    /// schedule, and equipment captured as free text). The host appends it to the
+    /// `content` is the fully distilled training philosophy (goals, programmes,
+    /// frequency, and equipment captured as free text). The host appends it to the
     /// append-only philosophy log and exits the interview.
     SavePhilosophy {
         #[serde(alias = "philosophy")]
