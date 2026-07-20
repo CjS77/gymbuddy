@@ -41,9 +41,9 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 }
 
 fn draw_transcript(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let lines: Vec<Line> = app.transcript.iter().flat_map(entry_to_lines).collect();
-
     let inner_width = area.width.saturating_sub(2);
+    let lines: Vec<Line> = app.transcript.iter().flat_map(|entry| entry_to_lines(entry, inner_width)).collect();
+
     let viewport = area.height.saturating_sub(2) as usize;
     let total = wrapped_line_count(&lines, inner_width);
     let max_top = total.saturating_sub(viewport) as u16;
@@ -84,9 +84,12 @@ fn draw_status(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
 /// Convert a transcript entry into one or more lines, prefixing the first with
 /// the speaker tag. Assistant entries are rendered from their domain [`View`]
-/// (colours, bullets, aligned columns); the user's own lines and system notices
-/// are flat text.
-fn entry_to_lines(entry: &Entry) -> Vec<Line<'static>> {
+/// (colours, bullets, aligned columns, charts); the user's own lines and system
+/// notices are flat text.
+///
+/// `width` is the transcript's inner width, which the charts of a progress view size
+/// themselves to.
+fn entry_to_lines(entry: &Entry, width: u16) -> Vec<Line<'static>> {
     let (prefix, style) = match entry.speaker {
         Speaker::You => ("you ▸ ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Speaker::Buddy => ("buddy ▸ ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
@@ -95,7 +98,7 @@ fn entry_to_lines(entry: &Entry) -> Vec<Line<'static>> {
 
     let mut lines: Vec<Line<'static>> = match &entry.body {
         EntryBody::Text(text) => text.split('\n').map(|raw| Line::from(Span::raw(raw.to_string()))).collect(),
-        EntryBody::View(view) => render_view(view),
+        EntryBody::View(view) => render_view(view, width),
     };
 
     match lines.first_mut() {

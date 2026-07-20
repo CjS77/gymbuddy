@@ -3,13 +3,23 @@
 //! the IRC-style transcript has more room than a Telegram bubble): coloured
 //! headings, bullets, and space-aligned columns (no bordered `Table` widget,
 //! which clashes with the flowing transcript).
+//!
+//! Everything leaves here as `Line`s, including the progress charts: a `Chart` or
+//! `BarChart` is drawn into an off-screen buffer and lifted back out (see
+//! [`plot_lines`]). That is what lets a widget that wants a fixed `Rect` live in a
+//! transcript that is a flat, scrollable run of text — and keeps every widget type on
+//! this side of the wall, where `app.rs` never has to know about them ([T1.1]).
 
 use gymbuddy_proto::{
     CatalogView, ExerciseLog, HistoryView, PROGRAMME_LOCK_IN_ASK, ProgrammeView, ProgressView, SeriesShape, SeriesView, SessionRosterView,
     SetLine, StatusView, TrainingModeView, View,
 };
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
+use ratatui::widgets::{Axis, Bar, BarChart, Chart, Dataset, GraphType, Widget};
 
 const ACCENT: Color = Color::Cyan;
 const SUCCESS: Color = Color::Green;
@@ -19,7 +29,12 @@ const MUTED: Color = Color::DarkGray;
 
 /// Render a view into transcript lines (without the speaker prefix, which the
 /// transcript adds).
-pub fn render_view(view: &View) -> Vec<Line<'static>> {
+///
+/// `width` is the room the transcript has for a line. Only the charts of
+/// [`View::Progress`] use it, and they need it: a `Chart` is drawn into a fixed area,
+/// and one drawn wider than the transcript would be folded by the `Paragraph`'s wrap
+/// into something worse than no chart at all.
+pub fn render_view(view: &View, width: u16) -> Vec<Line<'static>> {
     match view {
         View::Message { text, notes, failures } => render_message(text, notes, failures),
         View::Notice { text } => plain_lines(text),
@@ -29,7 +44,7 @@ pub fn render_view(view: &View) -> Vec<Line<'static>> {
         View::SessionRoster(roster) => render_session_roster(roster, None),
         View::ProgrammeSessionRoster { roster, mode } => render_session_roster(roster, Some(mode)),
         View::Programme(programme) => render_programme(programme),
-        View::Progress(progress) => render_progress(progress),
+        View::Progress(progress) => render_progress(progress, width),
         View::Timers { enabled } => vec![Line::from(Span::styled(
             format!("Rest timers {}", if *enabled { "on" } else { "off" }),
             Style::default().fg(if *enabled { SUCCESS } else { MUTED }).add_modifier(Modifier::BOLD),
@@ -221,18 +236,29 @@ fn render_programme(p: &ProgrammeView) -> Vec<Line<'static>> {
     lines
 }
 
-/// How wide a [`SeriesShape::Breakdown`] bar may grow. The transcript has more room
-/// than a Telegram bubble, but still shares the line with a label and a value.
-const BAR_WIDTH: usize = 20;
+/// Charts are indented to sit under the series title, like every other detail line.
+const INDENT: &str = "  ";
 
-/// Render progress ([C6.2]) as sparklines and text.
+/// Rows a trend [`Chart`] occupies: the plot, plus the x-axis and its labels.
+const CHART_HEIGHT: u16 = 9;
+
+/// Below this the y-axis labels and the two date labels leave no plot worth drawing,
+/// and the sparkline says more per column than a squeezed chart does.
+const MIN_CHART_WIDTH: u16 = 32;
+
+/// The integer domain [`Bar`] values are scaled into. `Bar` counts in `u64` and a
+/// reading is an `f64`, so bar *lengths* are scaled integers while the number itself
+/// is carried verbatim by [`Bar::text_value`] — the bar is the comparison, the text is
+/// the reading, and neither is rounded into the other.
+const BAR_TICKS: u64 = 10_000;
+
+/// Render progress ([C6.2]) as ratatui charts and text ([T2.2]).
 ///
-/// Real ratatui `Chart`/`Sparkline` widgets are [T2.2]; this shows the same series
-/// those charts will be drawn from, with one rendering per *shape* rather than per
-/// metric — a new Core metric of a known shape needs nothing here.
-fn render_progress(p: &ProgressView) -> Vec<Line<'static>> {
+/// One rendering per *shape* rather than per metric — a new Core metric of a known
+/// shape needs nothing here.
+fn render_progress(p: &ProgressView, width: u16) -> Vec<Line<'static>> {
     let mut lines = vec![heading(p.summary_line())];
-    lines.extend(p.series.iter().flat_map(|s| std::iter::once(Line::from("")).chain(render_series(s))));
+    lines.extend(p.series.iter().flat_map(|s| std::iter::once(Line::from("")).chain(render_series(s, width))));
 
     if !p.notes.is_empty() {
         lines.push(Line::from(""));
@@ -245,22 +271,21 @@ fn render_progress(p: &ProgressView) -> Vec<Line<'static>> {
 }
 
 /// One series: its title, then whatever its shape calls for.
-fn render_series(s: &SeriesView) -> Vec<Line<'static>> {
+fn render_series(s: &SeriesView, width: u16) -> Vec<Line<'static>> {
     let mut lines = vec![bold(&s.title)];
     match s.shape {
-        SeriesShape::Breakdown => lines.extend(render_bars(s)),
-        SeriesShape::Trend | SeriesShape::Trajectory { .. } => lines.extend(render_trend(s)),
+        SeriesShape::Breakdown => lines.extend(render_bars(s, width)),
+        SeriesShape::Trend | SeriesShape::Trajectory { .. } => lines.extend(render_trend(s, width)),
     }
     lines
 }
 
-/// A time-ordered series as a sparkline plus its movement and target.
+/// A time-ordered series as a plot plus its movement and target.
 ///
-/// The sparkline plots the readings as recorded — a cut's bodyweight slopes down.
-/// Whether that is progress is said in the movement line's words *and* its colour;
-/// the words are what carry it, since a 16-colour terminal may render both verdicts
-/// alike.
-fn render_trend(s: &SeriesView) -> Vec<Line<'static>> {
+/// The plot draws the readings as recorded — a cut's bodyweight slopes down. Whether
+/// that is progress is said in the movement line's words *and* its colour; the words
+/// are what carry it, since a 16-colour terminal may render both verdicts alike.
+fn render_trend(s: &SeriesView, width: u16) -> Vec<Line<'static>> {
     let Some(latest) = s.latest() else {
         return vec![muted("  No readings yet".into())];
     };
@@ -270,41 +295,182 @@ fn render_trend(s: &SeriesView) -> Vec<Line<'static>> {
         line if line.is_empty() => s.latest_line(),
         line => line,
     };
-    let mut lines = vec![
-        Line::from(vec![Span::raw("  "), Span::styled(s.spark(), Style::default().fg(ACCENT))]),
-        Line::from(vec![Span::raw("  "), Span::styled(movement, Style::default().fg(verdict_colour(s)))]),
-    ];
+    let mut lines = trend_plot(s, width);
+    lines.push(Line::from(vec![Span::raw(INDENT), Span::styled(movement, Style::default().fg(verdict_colour(s)))]));
 
     if !s.target_line().is_empty() {
-        lines.push(muted(format!("  {}", s.target_line())));
+        lines.push(muted(format!("{INDENT}{}", s.target_line())));
     }
-    if let Some(first) = s.points.first()
+    // A chart names both ends on its x-axis already; only the sparkline needs telling
+    // what span it covers.
+    if !is_charted(s, width)
+        && let Some(first) = s.points.first()
         && first.label != latest.label
     {
-        lines.push(muted(format!("  {} to {}", first.label, latest.label)));
+        lines.push(muted(format!("{INDENT}{} to {}", first.label, latest.label)));
     }
     lines
 }
 
-/// Independent buckets as proportional bars, scaled to the largest. A breakdown has
-/// no time order, so no sparkline and no trend line.
-fn render_bars(s: &SeriesView) -> Vec<Line<'static>> {
+/// Whether a series gets a real [`Chart`] or falls back to the sparkline. Two readings
+/// chart as a bare line segment that says less than the numbers under it, and a narrow
+/// transcript has no columns to spare for axes.
+fn is_charted(s: &SeriesView, width: u16) -> bool {
+    plot_width(width) >= MIN_CHART_WIDTH && s.points.len() >= 3
+}
+
+/// The readings as a [`Chart`], or as a sparkline where a chart would not fit.
+fn trend_plot(s: &SeriesView, width: u16) -> Vec<Line<'static>> {
+    match s.bounds().filter(|_| is_charted(s, width)) {
+        Some((min, max)) => trend_chart(s, min, max, width),
+        None => vec![Line::from(vec![Span::raw(INDENT), Span::styled(s.spark(), Style::default().fg(ACCENT))])],
+    }
+}
+
+/// The readings as a braille line against a labelled axis pair.
+///
+/// A [`SeriesShape::Trajectory`] adds its target as a flat reference line drawn in a
+/// different *marker* — dots against braille — so the two are told apart by shape
+/// rather than by a hue the terminal may not have. The y-axis takes
+/// [`SeriesView::bounds`] as given: it has already been widened to hold that target,
+/// which is what keeps the reference line on the chart.
+fn trend_chart(s: &SeriesView, min: f64, max: f64, width: u16) -> Vec<Line<'static>> {
+    let (low, high) = pad(min, max);
+    let last_x = (s.points.len() - 1) as f64;
+    let readings: Vec<(f64, f64)> = s.points.iter().enumerate().map(|(i, p)| (i as f64, p.value)).collect();
+    let target: Vec<(f64, f64)> = match s.shape {
+        SeriesShape::Trajectory { target } => vec![(0.0, target), (last_x, target)],
+        _ => Vec::new(),
+    };
+
+    let readings_set = Dataset::default()
+        .marker(Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(verdict_colour(s)))
+        .data(&readings);
+    // The target goes in first so the readings draw over it where they meet.
+    let datasets = match target.is_empty() {
+        true => vec![readings_set],
+        false => vec![
+            Dataset::default().marker(Marker::Dot).graph_type(GraphType::Line).style(Style::default().fg(MUTED)).data(&target),
+            readings_set,
+        ],
+    };
+
+    let axis = Style::default().fg(MUTED);
+    let chart = Chart::new(datasets)
+        .x_axis(Axis::default().style(axis).bounds([0.0, last_x]).labels(span_labels(s)))
+        .y_axis(Axis::default().style(axis).bounds([low, high]).labels([s.value_label(low), s.value_label(high)]));
+    plot_lines(chart, plot_width(width), CHART_HEIGHT)
+}
+
+/// The first and last point labels — the dates the x-axis runs between.
+fn span_labels(s: &SeriesView) -> Vec<String> {
+    match (s.points.first(), s.points.last()) {
+        (Some(first), Some(last)) => vec![first.label.clone(), last.label.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// Give a flat range some height. A series that never moved has `min == max`, and a
+/// zero-tall axis plots every reading on the same row as the axis itself.
+fn pad(min: f64, max: f64) -> (f64, f64) {
+    match (max - min).abs() < f64::EPSILON {
+        true => (min - 1.0, max + 1.0),
+        false => (min, max),
+    }
+}
+
+/// Independent buckets as a horizontal [`BarChart`], the largest filling the width the
+/// transcript actually has. A breakdown has no time order, so no trend line and no
+/// direction to have a verdict about.
+fn render_bars(s: &SeriesView, width: u16) -> Vec<Line<'static>> {
     let Some((_, max)) = s.bounds() else {
         return vec![muted("  No readings yet".into())];
     };
-    let width = s.points.iter().map(|p| p.label.chars().count()).max().unwrap_or(0);
-
-    s.points
+    let bars: Vec<Bar<'static>> = s
+        .points
         .iter()
-        .map(|p| {
-            let filled = if max <= 0.0 { 0 } else { ((p.value / max) * BAR_WIDTH as f64).round() as usize };
-            Line::from(vec![
-                Span::raw(format!("  {:<width$} ", p.label)),
-                Span::styled("█".repeat(filled.min(BAR_WIDTH)), Style::default().fg(ACCENT)),
-                Span::raw(format!(" {}", s.value_label(p.value))),
-            ])
+        .zip(bucket_labels(s))
+        .map(|(p, label)| {
+            Bar::default()
+                .label(Line::from(label))
+                .value(ticks(p.value, max))
+                // Emptied deliberately: `BarChart` draws a bar's own value *over* the
+                // bar, which eats the short buckets it matters most to see. The
+                // reading is in the label instead, where every bar starts after it.
+                .text_value(String::new())
+                .style(Style::default().fg(ACCENT))
         })
-        .collect()
+        .collect();
+    let chart = BarChart::horizontal(bars).bar_width(1).bar_gap(0).max(BAR_TICKS);
+    plot_lines(chart, plot_width(width), s.points.len() as u16)
+}
+
+/// `Chest      12 sets` — bucket name and reading in two aligned columns, which
+/// `BarChart` pads to a common width and starts every bar after.
+fn bucket_labels(s: &SeriesView) -> Vec<String> {
+    let name_w = s.points.iter().map(|p| p.label.chars().count()).max().unwrap_or(0);
+    let value_w = s.points.iter().map(|p| s.value_label(p.value).chars().count()).max().unwrap_or(0);
+    s.points.iter().map(|p| format!("{:<name_w$} {:>value_w$}", p.label, s.value_label(p.value))).collect()
+}
+
+/// A reading as a share of the largest bucket, in [`BAR_TICKS`]. A negative reading has
+/// no bar length to speak of, so it keeps its number and loses its bar rather than
+/// being clamped into a misleading stub.
+fn ticks(value: f64, max: f64) -> u64 {
+    match max > 0.0 {
+        true => ((value.max(0.0) / max) * BAR_TICKS as f64).round() as u64,
+        false => 0,
+    }
+}
+
+/// Columns a plot has once the transcript's indent is taken out.
+fn plot_width(width: u16) -> u16 {
+    width.saturating_sub(INDENT.len() as u16)
+}
+
+/// The transcript is a flowing `Vec<Line>`, but `Chart` and `BarChart` want a fixed
+/// `Rect`. Hand them one off-screen and lift the result back into lines: the widgets
+/// get their area and their axes, the transcript keeps the flat run of text it scrolls
+/// and measures, and `app.rs` still never sees a widget type ([T1.1]).
+fn plot_lines<W: Widget>(widget: W, width: u16, height: u16) -> Vec<Line<'static>> {
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    let area = Rect::new(0, 0, width, height);
+    let mut buffer = Buffer::empty(area);
+    widget.render(area, &mut buffer);
+    (0..height).map(|y| buffer_row(&buffer, y, width)).collect()
+}
+
+/// One row of a rendered buffer as an indented `Line`, runs of a common style merged
+/// into single spans.
+fn buffer_row(buffer: &Buffer, y: u16, width: u16) -> Line<'static> {
+    let runs = (0..width).filter_map(|x| buffer.cell((x, y))).fold(Vec::<(String, Style)>::new(), |mut runs, cell| {
+        match runs.last_mut() {
+            Some((text, style)) if *style == cell.style() => text.push_str(cell.symbol()),
+            _ => runs.push((cell.symbol().to_string(), cell.style())),
+        }
+        runs
+    });
+    Line::from(
+        std::iter::once(Span::raw(INDENT))
+            .chain(trim_trailing(runs).into_iter().map(|(text, style)| Span::styled(text, style)))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Drop the blank cells a widget leaves at the end of a row. They are invisible but
+/// not free: the transcript wraps on a line's width, so padding every chart row out to
+/// the full width would cost a wrapped row per chart row on the narrowest terminals.
+fn trim_trailing(mut runs: Vec<(String, Style)>) -> Vec<(String, Style)> {
+    let kept = runs.iter().rposition(|(text, _)| !text.trim_end().is_empty()).map_or(0, |i| i + 1);
+    runs.truncate(kept);
+    if let Some((text, _)) = runs.last_mut() {
+        text.truncate(text.trim_end().len());
+    }
+    runs
 }
 
 /// The colour for a series' movement: its own [`SeriesView::improving`] verdict, never
@@ -354,6 +520,13 @@ mod tests {
     use super::*;
     use gymbuddy_proto::{CatalogEntry, CatalogGroup, ExerciseLog, HealthNote, Measurement, SessionView};
 
+    /// A comfortable transcript width — wide enough that a chartable series charts.
+    const WIDE: u16 = 72;
+
+    fn render(view: &View) -> Vec<Line<'static>> {
+        render_view(view, WIDE)
+    }
+
     fn flat(lines: &[Line]) -> String {
         lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect::<Vec<_>>().join("\n")
     }
@@ -361,7 +534,7 @@ mod tests {
     #[test]
     fn message_renders_notes_and_failures() {
         let view = View::Message { text: "Logged it!".into(), notes: vec!["Nice streak".into()], failures: vec!["bad thing".into()] };
-        let text = flat(&render_view(&view));
+        let text = flat(&render(&view));
         assert!(text.contains("Logged it!"));
         assert!(text.contains("Nice streak"));
         assert!(text.contains("⚠ bad thing"));
@@ -381,7 +554,7 @@ mod tests {
             }),
             health: vec![HealthNote { kind: "injury".into(), body_part: "shoulder".into(), description: "sore".into() }],
         });
-        let text = flat(&render_view(&view));
+        let text = flat(&render(&view));
         assert!(text.contains("Status for Alice"));
         assert!(text.contains("Bench Press"));
         assert!(text.contains("8×80kg"));
@@ -405,7 +578,7 @@ mod tests {
             }],
             notes: vec!["Skipped deadlift for your back.".into()],
         });
-        let text = flat(&render_view(&view));
+        let text = flat(&render(&view));
         assert!(text.contains("Push focus"));
         assert!(text.contains("Bench was easy last time."));
         assert!(text.contains("1. Bench Press — 3 sets × 6 reps @ 65kg"));
@@ -425,21 +598,21 @@ mod tests {
             roster: roster.clone(),
             mode: TrainingModeView::Programme { programme_title: "12-week".into(), week: 2, day: 1, focus: "upper".into() },
         };
-        assert!(flat(&render_view(&slot)).contains("Programme: 12-week — week 2, day 1: upper"));
+        assert!(flat(&render(&slot)).contains("Programme: 12-week — week 2, day 1: upper"));
 
         let ad_hoc = View::ProgrammeSessionRoster { roster, mode: TrainingModeView::AdHoc { programme_title: "12-week".into() } };
-        assert!(flat(&render_view(&ad_hoc)).contains("Ad-hoc session — 12-week is untouched"));
+        assert!(flat(&render(&ad_hoc)).contains("Ad-hoc session — 12-week is untouched"));
     }
 
     fn series_points(raw: &[(&str, f64)]) -> Vec<gymbuddy_proto::SeriesPointView> {
         raw.iter().map(|(label, value)| gymbuddy_proto::SeriesPointView { label: (*label).into(), value: *value }).collect()
     }
 
-    /// [C6.2]: a trend shows the sparkline, the movement, the target and the span.
-    #[test]
-    fn progress_renders_a_trend_with_its_target() {
+    /// A bench press climbing towards a 100 kg goal — enough readings to chart. Held
+    /// note-free so tests about chart geometry are not measuring wrappable prose.
+    fn trajectory_view() -> View {
         use gymbuddy_proto::{Direction, ProgressView, SeriesShape, SeriesView};
-        let view = View::Progress(ProgressView {
+        View::Progress(ProgressView {
             headline: "2 of 3 goals on track".into(),
             series: vec![SeriesView {
                 title: "Bench Press".into(),
@@ -448,17 +621,72 @@ mod tests {
                 shape: SeriesShape::Trajectory { target: 100.0 },
                 points: series_points(&[("2026-05-01", 80.0), ("2026-06-01", 85.0), ("2026-07-01", 92.5)]),
             }],
-            notes: vec!["Squat has too few sessions to trend.".into()],
-        });
-        let text = flat(&render_view(&view));
+            notes: vec![],
+        })
+    }
+
+    /// Whether any *chart* row carries the dotted reference marker. Scoped to rows with
+    /// an axis on them: `•` is also the bullet the notes list uses.
+    fn has_reference_line(view: &View) -> bool {
+        render_view(view, WIDE).iter().map(|line| flat(std::slice::from_ref(line))).any(|row| row.contains('│') && row.contains('•'))
+    }
+
+    /// A trajectory: the readings charted against axes, its movement, and its target.
+    #[test]
+    fn progress_charts_a_trajectory_with_its_target() {
+        let View::Progress(mut progress) = trajectory_view() else { panic!("a progress view") };
+        progress.notes = vec!["Squat has too few sessions to trend.".into()];
+        let text = flat(&render(&View::Progress(progress)));
         assert!(text.contains("2 of 3 goals on track"));
         assert!(text.contains("Bench Press"));
-        assert!(text.contains("▁▄█"));
         assert!(text.contains("80 → 92.5 kg (+12.5, better)"));
         assert!(text.contains("Target: 100 kg"));
-        assert!(text.contains("2026-05-01 to 2026-07-01"));
         assert!(text.contains("Squat has too few sessions to trend."));
+        // The axes: the span across the bottom, and a y-axis widened by `bounds()` to
+        // hold the target so the reference line cannot fall off the chart.
+        assert!(text.contains("2026-05-01"), "the x-axis names where the series starts: {text}");
+        assert!(text.contains("2026-07-01"), "the x-axis names where it ends: {text}");
+        assert!(text.contains("100 kg"), "the y-axis reaches the target, not just the readings: {text}");
+        assert!(text.contains('│') && text.contains('└'), "a chart has axes: {text}");
         assert!(!text.contains('<'), "no HTML markup should appear: {text}");
+    }
+
+    /// Colour is not load-bearing: the target reference line is told from the readings
+    /// by its *marker* — dots against braille — which survives a 16-colour terminal
+    /// where cyan and dark grey may come out alike.
+    #[test]
+    fn a_target_is_a_reference_line_in_its_own_marker() {
+        use gymbuddy_proto::SeriesShape;
+        let View::Progress(mut progress) = trajectory_view() else { panic!("a progress view") };
+        assert!(has_reference_line(&View::Progress(progress.clone())), "the target is plotted, not just named");
+
+        // The same readings with no target have nothing to draw a reference line for.
+        progress.series[0].shape = SeriesShape::Trend;
+        let trend = View::Progress(progress);
+        assert!(!has_reference_line(&trend), "a plain trend has no reference line");
+        assert!(flat(&render(&trend)).contains('│'), "it is still charted");
+    }
+
+    /// A chart is drawn into a fixed area, so it must be told the transcript's width:
+    /// one drawn wider would be folded by the `Paragraph`'s wrap into nonsense.
+    #[test]
+    fn a_chart_never_outruns_the_width_it_is_given() {
+        let view = trajectory_view();
+        for width in [34u16, 40, 60, 72, 120] {
+            let widest = render_view(&view, width).iter().map(Line::width).max().unwrap_or(0);
+            assert!(widest <= width as usize, "a {widest}-wide line in a {width}-wide transcript");
+        }
+    }
+
+    /// Under the width axes need, the sparkline says more per column than a squeezed
+    /// chart does — and it carries the span the x-axis would otherwise have named.
+    #[test]
+    fn a_narrow_transcript_falls_back_to_the_sparkline() {
+        let text = flat(&render_view(&trajectory_view(), 20));
+        assert!(text.contains("▁▄█"), "got: {text}");
+        assert!(!text.contains('│'), "no room for axes: {text}");
+        assert!(text.contains("2026-05-01 to 2026-07-01"), "the span is said in words instead: {text}");
+        assert!(text.contains("Target: 100 kg"), "the target is still named: {text}");
     }
 
     /// The direction-aware rule [T2.2] turns on: falling bodyweight on a cut is
@@ -474,7 +702,7 @@ mod tests {
             shape: SeriesShape::Trend,
             points: series_points(&[("2026-05-01", 90.0), ("2026-06-01", 87.5)]),
         };
-        let lines = render_view(&View::Progress(ProgressView {
+        let lines = render(&View::Progress(ProgressView {
             headline: "Cutting".into(),
             series: vec![series.clone()],
             notes: vec![],
@@ -488,7 +716,7 @@ mod tests {
 
         // The same numbers with the opposite goal are a regression, and say so.
         let bulking = SeriesView { better: Direction::Higher, ..series };
-        let text = flat(&render_view(&View::Progress(ProgressView {
+        let text = flat(&render(&View::Progress(ProgressView {
             headline: "Bulking".into(),
             series: vec![bulking],
             notes: vec![],
@@ -496,9 +724,45 @@ mod tests {
         assert!(text.contains("(-2.5, worse)"), "got: {text}");
     }
 
-    /// A breakdown is bars, not a trend — its buckets carry no time order.
+    /// The same rule inside a chart: the plotted line slopes the way the readings run,
+    /// and takes its colour from the verdict rather than from that slope. Flipping the
+    /// geometry would mean drawing the user data they never recorded.
     #[test]
-    fn progress_renders_a_breakdown_as_bars() {
+    fn a_charted_series_is_coloured_by_its_verdict_not_its_slope() {
+        use gymbuddy_proto::{Direction, ProgressView, SeriesShape, SeriesView};
+        let cutting = SeriesView {
+            title: "Bodyweight".into(),
+            unit: "kg".into(),
+            better: Direction::Lower,
+            shape: SeriesShape::Trend,
+            points: series_points(&[("2026-05-01", 90.0), ("2026-06-01", 88.0), ("2026-07-01", 87.5)]),
+        };
+        // The y-axis runs low-to-high whichever way "better" points, so a falling
+        // series still starts at the top of the chart.
+        let plot_colours = |series: SeriesView| -> Vec<Color> {
+            let view = View::Progress(ProgressView { headline: "Cutting".into(), series: vec![series], notes: vec![] });
+            render(&view)
+                .iter()
+                .flat_map(|line| line.spans.clone())
+                .filter(|span| span.content.chars().any(|c| ('\u{2800}'..='\u{28ff}').contains(&c)))
+                .filter_map(|span| span.style.fg)
+                .collect()
+        };
+
+        let falling = plot_colours(cutting.clone());
+        assert!(!falling.is_empty(), "the readings are plotted as braille");
+        assert!(falling.iter().all(|c| *c == SUCCESS), "losing weight on a cut is progress, not a regression: {falling:?}");
+
+        // The same readings against the opposite goal are the same shape, other verdict.
+        let bulking = plot_colours(SeriesView { better: Direction::Higher, ..cutting });
+        assert!(bulking.iter().all(|c| *c == WARNING), "got: {bulking:?}");
+    }
+
+    /// A breakdown is bars, not a trend — its buckets carry no time order. The bars are
+    /// proportional to the largest bucket and scaled to the width on offer, so the same
+    /// data fills a wide transcript and still fits a narrow one.
+    #[test]
+    fn progress_renders_a_breakdown_as_proportional_bars() {
         use gymbuddy_proto::{Direction, ProgressView, SeriesShape, SeriesView};
         let view = View::Progress(ProgressView {
             headline: "This week".into(),
@@ -511,10 +775,25 @@ mod tests {
             }],
             notes: vec![],
         });
-        let text = flat(&render_view(&view));
-        assert!(text.contains(&format!("Back  {} 16 sets", "█".repeat(20))), "the largest bucket fills the bar: {text}");
-        assert!(text.contains(&format!("Chest {} 12 sets", "█".repeat(15))), "got: {text}");
+
+        let bars = |width: u16| -> Vec<usize> {
+            flat(&render_view(&view, width))
+                .lines()
+                .map(|line| line.chars().filter(|c| *c == '█').count())
+                .filter(|filled| *filled > 0)
+                .collect()
+        };
+
+        let text = flat(&render(&view));
+        assert!(text.contains("Chest 12 sets"), "each bucket is named and numbered: {text}");
+        assert!(text.contains("Back  16 sets"), "the labels align: {text}");
+        assert!(text.contains("Legs   9 sets"), "and so do the readings: {text}");
         assert!(!text.contains('→'), "a breakdown has no trend to report: {text}");
+
+        let [chest, back, legs] = bars(WIDE)[..] else { panic!("one bar per bucket: {:?}", bars(WIDE)) };
+        assert!(back > chest && chest > legs, "bars rank with their buckets: {back} {chest} {legs}");
+        assert_eq!(back, WIDE as usize - INDENT.len() - "Back  16 sets ".len(), "the largest bucket fills the width");
+        assert!(bars(40)[0] < chest, "a narrower transcript gets narrower bars: {:?}", bars(40));
     }
 
     #[test]
@@ -525,10 +804,11 @@ mod tests {
                 exercises: vec![CatalogEntry { name: "Bench Press".into(), aliases: "bench".into(), kind: "weight_reps".into() }],
             }],
         });
-        let lines = render_view(&view);
+        let lines = render(&view);
         let text = flat(&lines);
         assert!(text.contains("Chest"));
         assert!(text.contains("Bench Press"));
         assert!(text.contains("weight_reps"));
     }
 }
+
