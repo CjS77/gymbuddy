@@ -1353,6 +1353,78 @@ pub struct ProgrammeStatus {
     pub counts: SlotCounts,
 }
 
+/// How many settled misses of one recurring day make a *pattern* rather than a life
+/// event ([C4.4]). Two: one skipped leg day is Tuesday going wrong, two is a standing
+/// fact about the user's week that a programme should bend to instead of scolding.
+pub const DRIFT_MIN_MISSES: i32 = 2;
+
+/// Adherence to one recurring training day (`day_idx`) of a [`Programme`]'s repeating
+/// week, rolled up over the settled slots that share it ([C4.4]).
+///
+/// "Settled" is the weeks the calendar has closed, so [`SlotStatus::Missed`] has been
+/// stamped by the missed-slot sweep — drift reads those statuses, it does not re-derive
+/// them. A [`SlotStatus::Skipped`] day is the user's own deliberate call and counts as
+/// neither `trained` nor `missed`: dropping a session on purpose is not drifting away
+/// from one. `trained` applies the same executed-roster test as everywhere else
+/// ([`SlotAdherence`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotDrift {
+    /// 1-based ordinal training day within the repeating week.
+    pub day_idx: i32,
+    /// The day's focus, shared across every week it repeats in.
+    pub focus: String,
+    /// Settled occurrences of this day that were actually trained.
+    pub trained: i32,
+    /// Settled occurrences that lapsed to `missed`.
+    pub missed: i32,
+}
+
+impl SlotDrift {
+    /// Whether this recurring day is *consistently* missed: at least [`DRIFT_MIN_MISSES`]
+    /// misses, and missed more often than it is trained. The card's leg-day case — not an
+    /// error to report at the user, but information a programme should act on.
+    pub fn is_drifting(&self) -> bool {
+        self.missed >= DRIFT_MIN_MISSES && self.missed > self.trained
+    }
+}
+
+/// The explicit answer to drift ([C4.4]): what a PT does about a day the user keeps
+/// missing, chosen deterministically by [`Database::programme_drift`](super::Database)
+/// rather than left to emerge from a prompt. Exactly the spec's three — shift, drop or
+/// compress — as a decision the rest of the system can read and the user can be offered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReschedulePolicy {
+    /// One recurring day is repeatedly missed while the rest of the week holds: move it
+    /// to a day the user can make. Weekly volume and the programme's span both unchanged.
+    Shift { day_idx: i32, focus: String },
+    /// The user is realistically training fewer days a week than the plan asks: drop the
+    /// worst-adhered day from the weeks ahead. Lower weekly volume, same span.
+    Drop { day_idx: i32, focus: String },
+    /// The user is behind and the target end date is closing in faster than the grid can
+    /// be walked one week at a time: consolidate the remaining work into the weeks left.
+    Compress,
+}
+
+/// Drift over a live programme and the reschedule it recommends ([C4.4]).
+///
+/// `drifting` names every recurring day whose miss pattern qualifies — empty when the
+/// programme is being kept to. `recommendation` is the single explicit policy that
+/// follows from it, or `None` when nothing needs moving. Feeds the programme status
+/// view ([C4.6]) and the goal-likelihood projection ([C6.4]), for which adherence is
+/// the dominant term.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProgrammeDrift {
+    pub drifting: Vec<SlotDrift>,
+    pub recommendation: Option<ReschedulePolicy>,
+}
+
+impl ProgrammeDrift {
+    /// The programme is being kept to well enough that no reschedule is called for.
+    pub fn is_on_track(&self) -> bool {
+        self.recommendation.is_none()
+    }
+}
+
 pub fn new_programme(user_id: i64, title: &str, days_per_week: i32, split: &str, progression_policy: &str) -> Programme {
     let now = now_str();
     Programme {

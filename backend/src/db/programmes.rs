@@ -15,8 +15,8 @@ use rusqlite::params;
 use super::database::Database;
 use super::goals::{SELECT_GOAL, row_to_goal};
 use super::models::{
-    Goal, LifecycleStatus, Programme, ProgrammeBlock, ProgrammeContext, ProgrammeSlot, ProgrammeStatus, SlotAdherence, SlotCounts,
-    SlotStatus, TrainingMode, today_str,
+    Goal, LifecycleStatus, Programme, ProgrammeBlock, ProgrammeContext, ProgrammeDrift, ProgrammeSlot, ProgrammeStatus, ReschedulePolicy,
+    SlotAdherence, SlotCounts, SlotDrift, SlotStatus, TrainingMode, today_str,
 };
 
 fn row_to_programme(row: &rusqlite::Row) -> rusqlite::Result<Programme> {
@@ -399,6 +399,95 @@ impl Database {
                 Ok(SlotAdherence { due: row.get(0)?, trained: row.get(1)?, missed: row.get(2)?, skipped: row.get(3)? })
             })
             .context("Failed to read programme slot adherence")
+    }
+
+    // ── Drift detection and the reschedule policy ([C4.4]) ────────────────────────
+
+    /// Detect drift over a live programme and recommend the reschedule that answers it.
+    ///
+    /// Sweeps first ([`mark_missed_slots`](Self::mark_missed_slots)), so the verdict reads the
+    /// very `missed` statuses the design path and the status read do — drift is a predicate over
+    /// the *marked* grid, never a second count of its own. It then groups the settled slots by
+    /// their recurring `day_idx` and asks, per day, whether that day is consistently missed
+    /// ([`SlotDrift::is_drifting`]). Measured over slots, not over every session: an ad-hoc
+    /// roster fills no slot ([C1.4]), so it is structurally absent here and cannot mask a day the
+    /// programme itself keeps missing.
+    ///
+    /// The recommendation is one explicit [`ReschedulePolicy`] — the point of the ticket is that
+    /// this decision is named and deterministic, not emergent from a prompt.
+    pub fn programme_drift(&self, programme: &Programme, today: &str) -> anyhow::Result<ProgrammeDrift> {
+        self.mark_missed_slots(programme.id, today)?;
+        let per_day = self.day_drift(programme.id)?;
+        let drifting: Vec<SlotDrift> = per_day.iter().filter(|d| d.is_drifting()).cloned().collect();
+        let recommendation = self.recommend_reschedule(programme, &per_day, &drifting, today)?;
+        Ok(ProgrammeDrift { drifting, recommendation })
+    }
+
+    /// Per recurring `day_idx`, how its slots across every week have resolved — one [`SlotDrift`]
+    /// row per training day of the repeating week, in day order. `focus` is the day's shared
+    /// template focus (identical across the weeks it repeats in, so `MIN` returns it), and the
+    /// two counts apply the same tests as [`Self::slot_counts`].
+    fn day_drift(&self, programme_id: i64) -> anyhow::Result<Vec<SlotDrift>> {
+        let sql = "\
+            SELECT s.day_idx, MIN(s.focus), \
+                   COALESCE(SUM(s.status NOT IN ('missed', 'skipped') AND EXISTS (SELECT 1 FROM session_rosters r \
+                       WHERE r.programme_slot_id = s.id AND r.status IN ('active', 'completed'))), 0), \
+                   COALESCE(SUM(s.status = 'missed'), 0) \
+            FROM programme_slots s WHERE s.programme_id = ?1 GROUP BY s.day_idx ORDER BY s.day_idx";
+        let mut stmt = self.conn().prepare(sql)?;
+        let rows = stmt.query_map(params![programme_id], |row| {
+            Ok(SlotDrift { day_idx: row.get(0)?, focus: row.get(1)?, trained: row.get(2)?, missed: row.get(3)? })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().context("Failed to read per-day programme drift")
+    }
+
+    /// Choose the one reschedule that answers the detected drift, or `None` when nothing drifts.
+    ///
+    /// The order encodes the priority a PT would apply:
+    /// 1. **Compress** when the calendar is the binding constraint — the target end date is
+    ///    closing in faster than the grid's remaining weeks can be walked one at a time, so no
+    ///    per-day move can make it fit; only consolidating what is left keeps the date.
+    /// 2. **Shift** when a single recurring day is the whole problem and the rest of the week is
+    ///    being trained — move that day, provided there is more than one day to move it among.
+    /// 3. **Drop** otherwise — the user is training fewer days than the plan asks, so the
+    ///    worst-adhered drifting day comes out of the weeks ahead.
+    fn recommend_reschedule(
+        &self,
+        programme: &Programme,
+        per_day: &[SlotDrift],
+        drifting: &[SlotDrift],
+        today: &str,
+    ) -> anyhow::Result<Option<ReschedulePolicy>> {
+        if drifting.is_empty() {
+            return Ok(None);
+        }
+        if self.deadline_binds(programme, today)? {
+            return Ok(Some(ReschedulePolicy::Compress));
+        }
+        // The worst offender: most misses, then the widest miss-over-train margin, then the
+        // earliest day, so the choice is deterministic when days tie.
+        let worst = drifting
+            .iter()
+            .max_by_key(|d| (d.missed, d.missed - d.trained, std::cmp::Reverse(d.day_idx)))
+            .expect("drifting is non-empty");
+        if drifting.len() == 1 && per_day.len() >= 2 {
+            return Ok(Some(ReschedulePolicy::Shift { day_idx: worst.day_idx, focus: worst.focus.clone() }));
+        }
+        Ok(Some(ReschedulePolicy::Drop { day_idx: worst.day_idx, focus: worst.focus.clone() }))
+    }
+
+    /// Whether the target end date leaves too little calendar to finish the grid at one week per
+    /// week. `None` target — an open-ended programme — never binds: there is no date to miss.
+    /// Read off the grid and the calendar, so it agrees with [`Self::programme_status`]'s week.
+    fn deadline_binds(&self, programme: &Programme, today: &str) -> anyhow::Result<bool> {
+        let Some(target) = programme.target_end_date.as_deref() else {
+            return Ok(false);
+        };
+        let total_weeks = self.programme_span_weeks(programme.id)?;
+        let current_week = self.weeks_elapsed(&programme.start_date, today)?.saturating_add(1).clamp(1, total_weeks.max(1));
+        let grid_weeks_remaining = (total_weeks - current_week).max(0);
+        let weeks_left = self.weeks_elapsed(today, target)?.max(0);
+        Ok(weeks_left < grid_weeks_remaining)
     }
 }
 
@@ -885,6 +974,159 @@ mod tests {
         assert!(status.next_slot.is_none(), "a settled grid has nothing due");
         assert_eq!(status.counts, SlotCounts { total: 4, trained: 0, missed: 4, skipped: 0 });
         assert_eq!(status.counts.remaining(), 0);
+    }
+
+    // ── Drift detection and the reschedule policy ([C4.4]) ─────────────────────
+
+    /// A day trained every week it comes round is not drifting, and a kept programme needs no
+    /// reschedule at all — the empty, on-track case the rest build against.
+    #[test]
+    fn a_day_that_is_kept_to_does_not_drift() {
+        let (db, user_id) = test_db();
+        let programme_id = programme_starting(&db, user_id, "2026-07-01", 3);
+        let slots = db.list_programme_slots(programme_id).unwrap();
+        slots.iter().for_each(|s| train_slot(&db, user_id, s.id));
+        let programme = db.get_programme(programme_id).unwrap().unwrap();
+
+        let drift = db.programme_drift(&programme, "2026-07-25").unwrap();
+        assert!(drift.drifting.is_empty(), "every scheduled day was trained");
+        assert!(drift.is_on_track(), "a kept programme needs no reschedule");
+    }
+
+    /// One missed week of a day is a life event, not a pattern: below [`DRIFT_MIN_MISSES`] it does
+    /// not drift, so the programme is left alone.
+    #[test]
+    fn a_single_missed_week_is_not_yet_drift() {
+        let (db, user_id) = test_db();
+        let programme_id = programme_starting(&db, user_id, "2026-07-01", 3);
+        let slots = db.list_programme_slots(programme_id).unwrap();
+        // Day 1 kept throughout; day 2 kept for weeks 1-2 and missed once in week 3.
+        [slots[0].id, slots[2].id, slots[4].id, slots[1].id, slots[3].id].iter().for_each(|id| train_slot(&db, user_id, *id));
+        let programme = db.get_programme(programme_id).unwrap().unwrap();
+
+        let drift = db.programme_drift(&programme, "2026-07-25").unwrap();
+        assert!(drift.drifting.is_empty(), "one miss is not consistent missing");
+        assert!(drift.is_on_track());
+    }
+
+    /// The card's leg-day case: one recurring day is missed week after week while the rest of the
+    /// week holds. That day drifts, and the explicit answer is to *shift* it, not scold.
+    #[test]
+    fn a_consistently_missed_day_drifts_and_recommends_a_shift() {
+        let (db, user_id) = test_db();
+        let programme_id = programme_starting(&db, user_id, "2026-07-01", 3);
+        let slots = db.list_programme_slots(programme_id).unwrap();
+        // Day 2 ("lower") trained every week; day 1 ("upper") left to lapse each week.
+        [slots[1].id, slots[3].id, slots[5].id].iter().for_each(|id| train_slot(&db, user_id, *id));
+        let programme = db.get_programme(programme_id).unwrap().unwrap();
+
+        let drift = db.programme_drift(&programme, "2026-07-25").unwrap();
+        assert_eq!(drift.drifting.len(), 1, "only the missed day drifts");
+        assert_eq!(drift.drifting[0], SlotDrift { day_idx: 1, focus: "upper".into(), trained: 0, missed: 3 });
+        assert_eq!(drift.recommendation, Some(ReschedulePolicy::Shift { day_idx: 1, focus: "upper".into() }));
+    }
+
+    /// When more than one day is being missed the user is simply training fewer days than the plan
+    /// asks: no single move fixes it, so the worst-adhered day is dropped from the weeks ahead.
+    #[test]
+    fn broad_missing_recommends_dropping_the_worst_day() {
+        let (db, user_id) = test_db();
+        let programme_id = programme_starting(&db, user_id, "2026-07-01", 3);
+        let slots = db.list_programme_slots(programme_id).unwrap();
+        // Day 1 salvaged once (missed twice); day 2 never trained (missed three times).
+        train_slot(&db, user_id, slots[0].id);
+        let programme = db.get_programme(programme_id).unwrap().unwrap();
+
+        let drift = db.programme_drift(&programme, "2026-07-25").unwrap();
+        assert_eq!(drift.drifting.len(), 2, "both days drift");
+        assert_eq!(
+            drift.recommendation,
+            Some(ReschedulePolicy::Drop { day_idx: 2, focus: "lower".into() }),
+            "the worse-adhered day is the one dropped"
+        );
+    }
+
+    /// Compress is the calendar's answer: with a target end date closing in faster than the grid's
+    /// remaining weeks can be walked one at a time, no per-day move fits it — only consolidating does.
+    #[test]
+    fn a_binding_target_date_recommends_compressing() {
+        let (db, user_id) = test_db();
+        let mut draft = new_programme(user_id, "Deadline", 2, "upper/lower", "linear");
+        draft.start_date = "2026-07-01".into();
+        draft.target_end_date = Some("2026-07-29".into());
+        let programme_id = db.create_programme(&draft).unwrap();
+        db.activate_programme(programme_id).unwrap();
+        (1..=8).for_each(|week| {
+            db.add_programme_slot(&new_programme_slot(programme_id, week, 1, "upper")).unwrap();
+            db.add_programme_slot(&new_programme_slot(programme_id, week, 2, "lower")).unwrap();
+        });
+        let programme = db.get_programme(programme_id).unwrap().unwrap();
+
+        // Weeks 1-3 have elapsed untrained; five grid weeks remain but only one calendar week does.
+        let drift = db.programme_drift(&programme, "2026-07-22").unwrap();
+        assert!(!drift.drifting.is_empty(), "the elapsed weeks drift");
+        assert_eq!(drift.recommendation, Some(ReschedulePolicy::Compress), "the deadline binds, so no day-move can help");
+    }
+
+    /// A deliberately skipped day is the user's own call, not drift: it counts as neither trained
+    /// nor missed, so a day skipped every week never triggers a reschedule.
+    #[test]
+    fn a_deliberately_skipped_day_is_not_drift() {
+        let (db, user_id) = test_db();
+        let programme_id = programme_starting(&db, user_id, "2026-07-01", 3);
+        let slots = db.list_programme_slots(programme_id).unwrap();
+        // Day 2 trained; day 1 skipped by hand every week.
+        [slots[1].id, slots[3].id, slots[5].id].iter().for_each(|id| train_slot(&db, user_id, *id));
+        [slots[0].id, slots[2].id, slots[4].id].iter().for_each(|id| db.set_slot_status(*id, SlotStatus::Skipped).unwrap());
+        let programme = db.get_programme(programme_id).unwrap().unwrap();
+
+        let drift = db.programme_drift(&programme, "2026-07-25").unwrap();
+        assert!(drift.is_on_track(), "skipping on purpose is not drifting");
+    }
+
+    /// Drift is measured over *slots*, not over every session ([C1.4]): ad-hoc training under an
+    /// active programme fills no slot, so it cannot paper over a programme day the user keeps missing.
+    #[test]
+    fn drift_reads_slots_not_ad_hoc_sessions() {
+        let (db, user_id) = test_db();
+        let programme_id = programme_starting(&db, user_id, "2026-07-01", 3);
+        let slots = db.list_programme_slots(programme_id).unwrap();
+        [slots[1].id, slots[3].id, slots[5].id].iter().for_each(|id| train_slot(&db, user_id, *id));
+
+        // Plenty of ad-hoc work — rosters bound to a session but to no slot.
+        (0..3).for_each(|_| {
+            let roster = db.create_roster(user_id, "Ad-hoc", None, None).unwrap();
+            let session = db.start_session(user_id, None).unwrap();
+            db.bind_roster_to_session(roster, session.id).unwrap();
+        });
+        let programme = db.get_programme(programme_id).unwrap().unwrap();
+
+        let drift = db.programme_drift(&programme, "2026-07-25").unwrap();
+        assert_eq!(drift.recommendation, Some(ReschedulePolicy::Shift { day_idx: 1, focus: "upper".into() }));
+        assert_eq!(drift.drifting[0].missed, 3, "ad-hoc sessions do not count toward the missed programme day");
+    }
+
+    /// A one-day-a-week programme has nowhere to shift a missed day to, so a consistently missed
+    /// single day drops rather than shifts.
+    #[test]
+    fn a_single_day_week_drops_rather_than_shifts() {
+        let (db, user_id) = test_db();
+        let mut draft = new_programme(user_id, "Once a week", 1, "full body", "linear");
+        draft.start_date = "2026-07-01".into();
+        let programme_id = db.create_programme(&draft).unwrap();
+        db.activate_programme(programme_id).unwrap();
+        (1..=3).for_each(|week| {
+            db.add_programme_slot(&new_programme_slot(programme_id, week, 1, "full body")).unwrap();
+        });
+        let programme = db.get_programme(programme_id).unwrap().unwrap();
+
+        let drift = db.programme_drift(&programme, "2026-07-25").unwrap();
+        assert_eq!(drift.drifting.len(), 1);
+        assert_eq!(
+            drift.recommendation,
+            Some(ReschedulePolicy::Drop { day_idx: 1, focus: "full body".into() }),
+            "with one training day there is nowhere to shift it"
+        );
     }
 
     #[test]
