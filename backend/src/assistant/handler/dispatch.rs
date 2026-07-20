@@ -33,6 +33,7 @@ impl AssistantHandler {
             Command::Philosophy => Ok(Some(self.cmd_philosophy_start(user, platform).await?.into())),
             Command::NextWorkout => Ok(Some(self.cmd_next_workout(user, text).await?.into())),
             Command::Programme => Ok(Some(self.cmd_programme_start(user, platform).await?.into())),
+            Command::Progress => Ok(Some(self.cmd_progress(user).await?.into())),
             Command::Cancel => Ok(Some(self.cmd_cancel(user, platform).await?.into())),
             Command::Feedback => Ok(self.cmd_feedback(user, text).await?.map(Into::into)),
         }

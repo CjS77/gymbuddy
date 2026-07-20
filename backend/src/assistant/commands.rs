@@ -27,6 +27,7 @@ pub enum Command {
     Philosophy,
     NextWorkout,
     Programme,
+    Progress,
     Cancel,
     Clear,
     Timers,
@@ -116,6 +117,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "/programme",
         args: None,
         description: "Build a multi-week programme your sessions are designed against (multi-turn)",
+        visibility: Visibility::Everyone,
+    },
+    CommandSpec {
+        command: Command::Progress,
+        name: "/progress",
+        args: None,
+        description: "How you're tracking against each of your goals",
         visibility: Visibility::Everyone,
     },
     CommandSpec {

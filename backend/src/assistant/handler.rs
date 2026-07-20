@@ -23,6 +23,7 @@ mod interview;
 mod llm;
 mod onboarding;
 mod programme;
+mod progress;
 #[cfg(test)]
 mod test_support;
 
