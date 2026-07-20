@@ -186,6 +186,16 @@ fn render_programme(p: &ProgrammeView) -> String {
     };
     result.push_str(&format!("{dates}\nProgression: {}\n", escape_html(&p.progression_policy)));
 
+    // [R2.1]: present only on a live programme being reported on, and rendered first,
+    // because "where am I?" is the whole question `/programme status` was asked.
+    if let (Some(position), Some(status)) = (p.position_line(), p.status.as_ref()) {
+        result.push_str(&format!("\n<b>Where you are:</b>\n{}\n", escape_html(&position)));
+        if let Some(slot) = &status.next_slot {
+            result.push_str(&format!("Next: {}\n", escape_html(&slot.label())));
+        }
+        result.push_str(&format!("{}\n", escape_html(&status.counts_line())));
+    }
+
     if !p.goals.is_empty() {
         result.push_str("\n<b>Goals served:</b>\n");
         result.extend(p.goals.iter().map(|goal| format!("- {}\n", escape_html(goal))));

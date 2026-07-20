@@ -327,6 +327,17 @@ impl RosterExerciseView {
 /// `week_template` is the repeating week the slot grid was expanded from, not the whole
 /// grid: `weeks × days_per_week` cells all read from the same handful of day intents, so
 /// sending the grid itself would be the same few strings repeated dozens of times.
+///
+/// The struct carries both a *proposed* programme (the `/programme` interview) and a
+/// *live* one being reported on (`/programme status`); `status` is what separates them.
+/// One type rather than two because the skeleton is the same artefact either way, and a
+/// second `View` variant would render the same nine fields twice in every client.
+///
+/// [R2.1] appended `status`, which the append-only rule in the crate root otherwise
+/// forbids for an existing type. It is sound exactly once and only here: `ProgrammeView`
+/// was introduced after 0.22.0 and has never been in a release, so no deployed peer has
+/// ever decoded one and there are no old bytes to misparse. Once it ships, this struct
+/// is closed like every other — a later addition wants a new appended `View` variant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgrammeView {
     pub title: String,
@@ -352,6 +363,10 @@ pub struct ProgrammeView {
     /// Whether this programme is live. A draft is still awaiting the user's "lock it in";
     /// clients use this to decide whether to ask for that confirmation.
     pub active: bool,
+    /// Where the user has got to, present only when the programme is being *reported on*
+    /// (`/programme status`) rather than proposed. A freshly designed programme has no
+    /// position to report, so this stays `None` through the whole `/programme` interview.
+    pub status: Option<ProgrammeStatusView>,
 }
 
 impl ProgrammeView {
@@ -359,6 +374,69 @@ impl ProgrammeView {
     /// every client renderer so the summary reads identically everywhere.
     pub fn shape_line(&self) -> String {
         format!("{} weeks × {} days/week, {}", self.weeks, self.days_per_week, self.split)
+    }
+
+    /// Where the user is, e.g. "Week 3 of 12 — accumulation", or `None` for a programme
+    /// with no [`status`](Self::status) to report. Lives here rather than on
+    /// [`ProgrammeStatusView`] because the span it counts against is the programme's.
+    pub fn position_line(&self) -> Option<String> {
+        let status = self.status.as_ref()?;
+        Some(match &status.block_focus {
+            Some(focus) => format!("Week {} of {} — {focus}", status.current_week, self.weeks),
+            None => format!("Week {} of {}", status.current_week, self.weeks),
+        })
+    }
+}
+
+/// Where a live programme has got to ([R2.1]): calendar position, the block that covers
+/// it, the next session due, and how the grid behind the user has resolved.
+///
+/// Only the cheap half of programme reporting — counts of settled slots, no adherence
+/// ratios and no drift verdict. Those are [C4.4]'s, and will be built on these numbers
+/// rather than beside them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgrammeStatusView {
+    /// The 1-based week the calendar puts the user in, clamped to the programme's span.
+    /// Read off `start_date` and today, so it says where the user *is* — which can be
+    /// behind `next_slot` when they train more than one slot in a week.
+    pub current_week: u32,
+    /// Focus of the mesocycle covering `current_week`, when a block covers it. Blocks
+    /// need not tile the programme, so a week between them has none.
+    pub block_focus: Option<String>,
+    /// The next session due, or `None` once every slot is settled.
+    pub next_slot: Option<ProgrammeSlotView>,
+    /// Slots whose bound roster was actually executed — designing one is not training it.
+    pub trained: u32,
+    /// Slots whose week passed with nothing designed for them.
+    pub missed: u32,
+    /// Slots deliberately dropped.
+    pub skipped: u32,
+    /// Slots still ahead: everything neither trained, missed nor skipped. The four counts
+    /// are disjoint and sum to the grid, so a client can render them as a whole.
+    pub remaining: u32,
+}
+
+impl ProgrammeStatusView {
+    /// The counts as one line, e.g. "5 trained · 1 missed · 0 skipped · 12 to go". Shared
+    /// by every client renderer so the tally reads identically everywhere.
+    pub fn counts_line(&self) -> String {
+        format!("{} trained · {} missed · {} skipped · {} to go", self.trained, self.missed, self.skipped, self.remaining)
+    }
+}
+
+/// One cell of a programme's week/day grid. `week_idx` and `day_idx` are both 1-based,
+/// and `day_idx` is the ordinal training day within the week, never a calendar weekday.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgrammeSlotView {
+    pub week_idx: u32,
+    pub day_idx: u32,
+    pub focus: String,
+}
+
+impl ProgrammeSlotView {
+    /// The slot's position and intent as one line, e.g. "Week 3, day 2: pull".
+    pub fn label(&self) -> String {
+        format!("Week {}, day {}: {}", self.week_idx, self.day_idx, self.focus)
     }
 }
 
@@ -1112,7 +1190,44 @@ pub(crate) mod tests {
             goals: vec!["Bench Press to 100.0".into()],
             notes: vec![],
             active: false,
+            status: None,
         }
+    }
+
+    /// The same programme, live and reported on — what `/programme status` emits.
+    pub(crate) fn programme_status_view() -> ProgrammeView {
+        ProgrammeView {
+            active: true,
+            status: Some(ProgrammeStatusView {
+                current_week: 3,
+                block_focus: Some("accumulation".into()),
+                next_slot: Some(ProgrammeSlotView { week_idx: 3, day_idx: 2, focus: "lower".into() }),
+                trained: 5,
+                missed: 1,
+                skipped: 0,
+                remaining: 12,
+            }),
+            ..programme_view()
+        }
+    }
+
+    #[test]
+    fn status_lines_read_for_humans() {
+        let view = programme_status_view();
+        assert_eq!(view.position_line().as_deref(), Some("Week 3 of 12 — accumulation"));
+        let status = view.status.unwrap();
+        assert_eq!(status.counts_line(), "5 trained · 1 missed · 0 skipped · 12 to go");
+        assert_eq!(status.next_slot.unwrap().label(), "Week 3, day 2: lower");
+    }
+
+    /// A week between blocks has no focus to name, and a proposed programme has no
+    /// position at all — neither may render as an empty or half-written line.
+    #[test]
+    fn position_line_degrades_without_a_block_and_without_a_status() {
+        let mut view = programme_status_view();
+        view.status.as_mut().unwrap().block_focus = None;
+        assert_eq!(view.position_line().as_deref(), Some("Week 3 of 12"));
+        assert_eq!(programme_view().position_line(), None, "a draft has nowhere to be");
     }
 
     #[test]

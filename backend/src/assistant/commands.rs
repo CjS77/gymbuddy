@@ -123,8 +123,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         command: Command::Programme,
         name: "/programme",
-        args: None,
-        description: "Build a multi-week programme your sessions are designed against (multi-turn)",
+        args: Some("[status|new]"),
+        description: "Where you're up to in your multi-week programme, or build one (multi-turn)",
         visibility: Visibility::Everyone,
     },
     CommandSpec {

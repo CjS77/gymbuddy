@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 pub mod view;
 pub use view::{
     CatalogEntry, CatalogGroup, CatalogView, Direction, ExerciseLog, HealthNote, HistoryView, Measurement, ProgrammeBlockView,
-    ProgrammeDayView, ProgrammeView, ProgressView, Render, ReviewEffortView, ReviewExerciseView, ReviewKindView, ReviewRecordView,
-    RosterExerciseView, SeriesPointView, SeriesShape, SeriesView, SessionReviewView, SessionRosterView, SessionSummaryView, SessionView,
+    ProgrammeDayView, ProgrammeSlotView, ProgrammeStatusView, ProgrammeView, ProgressView, Render, ReviewEffortView, ReviewExerciseView,
+    ReviewKindView, ReviewRecordView, RosterExerciseView, SeriesPointView, SeriesShape, SeriesView, SessionReviewView, SessionRosterView,
+    SessionSummaryView, SessionView,
     SetLine, StatusView, TrainingModeView, View,
 };
 
@@ -148,7 +149,7 @@ pub fn decode_response(data: &[u8]) -> postcard::Result<ServerResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use view::tests::{adhoc_review_view, programme_view, progress_view, session_review_view};
+    use view::tests::{adhoc_review_view, programme_status_view, programme_view, progress_view, session_review_view};
 
     fn roundtrip_request(req: ClientRequest) {
         let bytes = encode_request(&req).expect("encode");
@@ -255,6 +256,8 @@ mod tests {
             View::Progress(view::ProgressView { headline: "No goals set yet.".into(), series: vec![], notes: vec![] }),
             View::SessionReview(Box::new(session_review_view())),
             View::SessionReview(Box::new(adhoc_review_view())),
+            // [R2.1]: the same variant carrying a live programme's position.
+            View::Programme(Box::new(programme_status_view())),
         ] {
             roundtrip_response(ServerResponse::Reply { view, timer: None });
         }

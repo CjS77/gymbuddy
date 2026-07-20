@@ -805,6 +805,15 @@ fn now_str() -> String {
     Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+/// Today's date as `YYYY-MM-DD`.
+///
+/// The date half of [`now_str`], exposed because the programme sweep and status read
+/// take "today" as an argument rather than calling `date('now')` inside their SQL —
+/// which is what lets a test place itself anywhere in a programme's calendar.
+pub fn today_str() -> String {
+    Utc::now().format("%Y-%m-%d").to_string()
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1293,6 +1302,55 @@ pub struct ProgrammeContext {
     /// to tile the whole programme, so a week between them has none.
     pub block: Option<ProgrammeBlock>,
     pub adherence: SlotAdherence,
+}
+
+/// How a whole programme grid has resolved so far ([R2.1]): every slot falls into exactly
+/// one bucket, so the four add up to the grid and can be reported as a whole.
+///
+/// `trained` applies the same test as [`SlotAdherence`] — a bound [`SessionRoster`] that
+/// reached [`LifecycleStatus::Active`] or [`LifecycleStatus::Completed`] — narrowed to
+/// slots that are neither `missed` nor `skipped`, which is what keeps the buckets disjoint
+/// when a slot was designed and then dropped by hand.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SlotCounts {
+    /// Every slot in the grid.
+    pub total: i32,
+    pub trained: i32,
+    pub missed: i32,
+    pub skipped: i32,
+}
+
+impl SlotCounts {
+    /// Slots still ahead: neither trained, missed nor skipped. Saturating, so a grid that
+    /// somehow over-counts reports zero rather than a negative remainder.
+    pub fn remaining(&self) -> i32 {
+        (self.total - self.trained - self.missed - self.skipped).max(0)
+    }
+}
+
+/// Where a *live* programme has got to ([R2.1]), as `/programme status` reports it.
+///
+/// Distinct from [`ProgrammeContext`], which answers "what should this one session be?"
+/// for the designer. This answers "where am I?" for the user: it exists whether or not a
+/// design is in flight, spans the whole grid rather than the slots before one cell, and
+/// reads the calendar as well as the grid.
+///
+/// `current_week` comes off `start_date` and today, so it reports where the user *is*;
+/// `next_slot` comes off the grid, so it reports what is *due*. The two agree once the
+/// missed-slot sweep has run, and diverge legitimately when a user trains a week's slots
+/// early — reporting both is what makes that legible rather than contradictory.
+#[derive(Debug, Clone)]
+pub struct ProgrammeStatus {
+    /// 1-based, clamped into `1..=total_weeks`, so a programme run past its end reports
+    /// its last week rather than a week the grid does not have.
+    pub current_week: i32,
+    /// Weeks the grid spans — the same figure [`ProgrammeContext::total_weeks`] carries.
+    pub total_weeks: i32,
+    /// The block covering `current_week`, when the programme has one there.
+    pub block: Option<ProgrammeBlock>,
+    /// The next session due, `None` once every slot is settled.
+    pub next_slot: Option<ProgrammeSlot>,
+    pub counts: SlotCounts,
 }
 
 pub fn new_programme(user_id: i64, title: &str, days_per_week: i32, split: &str, progression_policy: &str) -> Programme {

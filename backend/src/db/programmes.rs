@@ -15,7 +15,8 @@ use rusqlite::params;
 use super::database::Database;
 use super::goals::{SELECT_GOAL, row_to_goal};
 use super::models::{
-    Goal, LifecycleStatus, Programme, ProgrammeBlock, ProgrammeContext, ProgrammeSlot, SlotAdherence, SlotStatus, TrainingMode,
+    Goal, LifecycleStatus, Programme, ProgrammeBlock, ProgrammeContext, ProgrammeSlot, ProgrammeStatus, SlotAdherence, SlotCounts,
+    SlotStatus, TrainingMode, today_str,
 };
 
 fn row_to_programme(row: &rusqlite::Row) -> rusqlite::Result<Programme> {
@@ -238,6 +239,41 @@ impl Database {
         rows.next().transpose().context("Failed to read next design slot")
     }
 
+    // ── The missed-slot sweep ([R2.1]) ────────────────────────────────────────────
+
+    /// Settle the slots the user has now run out of time for: every slot still
+    /// `pending` whose week has *fully* passed becomes `missed`. Returns how many
+    /// moved.
+    ///
+    /// Week `n` covers the seven days from `start_date + (n-1)*7`, so it has fully
+    /// passed once `today` reaches `start_date + n*7` — the day after its last. A
+    /// week still in progress is left alone: the user can train it today.
+    ///
+    /// Only `pending` moves. A `filled` slot has a design against it and belongs to
+    /// [C4.4]'s drift question, not this one; `missed` and `skipped` are already
+    /// settled. That makes the sweep idempotent, which matters because it runs on
+    /// every design rather than on a schedule.
+    ///
+    /// Both dates go through SQLite's `date()`, so a stored `YYYY-MM-DD HH:MM:SS`
+    /// and a bare `YYYY-MM-DD` compare alike. An unparseable `today` yields NULL,
+    /// the comparison fails, and nothing is swept — the sweep fails closed, never
+    /// marking a slot missed on the strength of a date it could not read.
+    pub fn mark_missed_slots(&self, programme_id: i64, today: &str) -> anyhow::Result<usize> {
+        let swept = self
+            .conn()
+            .execute(
+                "UPDATE programme_slots SET status = 'missed', updated_at = datetime('now') \
+                 WHERE programme_id = ?1 AND status = 'pending' \
+                   AND date(?2) >= date((SELECT start_date FROM programmes WHERE id = ?1), '+' || (week_idx * 7) || ' days')",
+                params![programme_id, today],
+            )
+            .context("sweeping missed programme slots")?;
+        if swept > 0 {
+            tracing::info!(programme_id, swept, "marked programme slots missed");
+        }
+        Ok(swept)
+    }
+
     // ── Training mode ([C1.4]) ────────────────────────────────────────────────────
 
     /// Resolve the [`TrainingMode`] a new session design runs in. With no active
@@ -246,10 +282,18 @@ impl Database {
     /// `force_ad_hoc` records the user's explicit "leave my programme alone" (or
     /// the grid has no designable slot left): then the programme is reported but
     /// no slot is targeted, so adherence can never mutate.
+    ///
+    /// This is also where [`mark_missed_slots`](Self::mark_missed_slots) runs ([R2.1]).
+    /// Lazily, and *before* the slot is chosen: weeks the user has run out of time for
+    /// have to be settled first, or a design six weeks in would target week 1 and the
+    /// programme would silently become a to-do list that never advances. Doing it here
+    /// rather than on a timer keeps the whole feature free of a scheduler — the only
+    /// moment a stale slot can do harm is the moment one is picked.
     pub fn training_mode_for_design(&self, user_id: i64, force_ad_hoc: bool) -> anyhow::Result<TrainingMode> {
         let Some(programme) = self.active_programme_for_user(user_id)? else {
             return Ok(TrainingMode::AdHoc { programme: None });
         };
+        self.mark_missed_slots(programme.id, &today_str())?;
         if force_ad_hoc {
             return Ok(TrainingMode::AdHoc { programme: Some(programme) });
         }
@@ -257,6 +301,56 @@ impl Database {
             Some(slot) => Ok(TrainingMode::Programme { programme, slot }),
             None => Ok(TrainingMode::AdHoc { programme: Some(programme) }),
         }
+    }
+
+    // ── Programme status ([R2.1]) ─────────────────────────────────────────────────
+
+    /// Where a live programme has got to: the calendar week against the grid's span,
+    /// the block covering it, the next session due, and how every slot has resolved.
+    ///
+    /// Sweeps first, so the status can never show a pending week the calendar has
+    /// already closed — the read and the design path agree about what is still owed.
+    pub fn programme_status(&self, programme: &Programme, today: &str) -> anyhow::Result<ProgrammeStatus> {
+        self.mark_missed_slots(programme.id, today)?;
+
+        let total_weeks = self.programme_span_weeks(programme.id)?;
+        let current_week = self.weeks_elapsed(&programme.start_date, today)?.saturating_add(1).clamp(1, total_weeks.max(1));
+        Ok(ProgrammeStatus {
+            current_week,
+            total_weeks,
+            block: self.block_for_week(programme.id, current_week)?,
+            next_slot: self.next_design_slot(programme.id)?,
+            counts: self.slot_counts(programme.id)?,
+        })
+    }
+
+    /// Whole weeks between two dates, floored, and never negative — a programme whose
+    /// start date is in the future has not begun, which is week 1, not week zero.
+    fn weeks_elapsed(&self, start_date: &str, today: &str) -> anyhow::Result<i32> {
+        let sql = "SELECT CAST(MAX(julianday(date(?2)) - julianday(date(?1)), 0) / 7 AS INTEGER)";
+        self.conn()
+            .query_row(sql, params![start_date, today], |row| row.get::<_, Option<i32>>(0))
+            .map(|weeks| weeks.unwrap_or(0))
+            .context("Failed to read a programme's elapsed weeks")
+    }
+
+    /// Every slot of the grid in exactly one bucket. `trained` applies
+    /// [`next_design_slot`](Self::next_design_slot)'s test — an executed roster, not a
+    /// merely designed one — and excludes slots settled as missed or skipped, so the
+    /// buckets stay disjoint and sum to the grid.
+    fn slot_counts(&self, programme_id: i64) -> anyhow::Result<SlotCounts> {
+        let sql = "\
+            SELECT COUNT(*), \
+                   COALESCE(SUM(s.status NOT IN ('missed', 'skipped') AND EXISTS (SELECT 1 FROM session_rosters r \
+                       WHERE r.programme_slot_id = s.id AND r.status IN ('active', 'completed'))), 0), \
+                   COALESCE(SUM(s.status = 'missed'), 0), \
+                   COALESCE(SUM(s.status = 'skipped'), 0) \
+            FROM programme_slots s WHERE s.programme_id = ?1";
+        self.conn()
+            .query_row(sql, params![programme_id], |row| {
+                Ok(SlotCounts { total: row.get(0)?, trained: row.get(1)?, missed: row.get(2)?, skipped: row.get(3)? })
+            })
+            .context("Failed to read programme slot counts")
     }
 
     // ── Programme context for a design ([C4.3]) ───────────────────────────────────

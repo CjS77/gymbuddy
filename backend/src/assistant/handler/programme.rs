@@ -20,12 +20,13 @@ use crate::assistant::actions::{AssistantAction, ProposedProgrammeBlock, Propose
 use crate::assistant::parser::parse_assistant_response;
 use crate::assistant::prompts::build_programme_prompt;
 use crate::db::{
-    Database, GoalProgress, InterviewState, Programme, User, new_programme, new_programme_block, new_programme_slot,
+    Database, GoalProgress, InterviewState, Programme, ProgrammeStatus, User, new_programme, new_programme_block, new_programme_slot,
+    today_str,
 };
 
 use super::AssistantHandler;
 use super::affirmative::is_affirmative;
-use gymbuddy_proto::{ProgrammeBlockView, ProgrammeDayView, ProgrammeView, View};
+use gymbuddy_proto::{ProgrammeBlockView, ProgrammeDayView, ProgrammeSlotView, ProgrammeStatusView, ProgrammeView, View};
 
 /// The `interview_states.mode` value this interview runs under. The column's CHECK
 /// constraint accepts exactly `'philosophy'` and `'programme'`.
@@ -44,11 +45,43 @@ const MAX_PROGRAMME_WEEKS: i32 = 52;
 const MAX_DAYS_PER_WEEK: usize = 7;
 
 impl AssistantHandler {
+    /// The `/programme` entry point: report on a live programme, or build one.
+    ///
+    /// Bare `/programme` does whichever the user can only have meant ([R2.1]) — with a
+    /// programme already running, "how's it going?"; without one, "let's make one". The
+    /// other reading stays reachable by name (`/programme new`, `/programme status`),
+    /// because guessing is only acceptable while the alternative is one word away.
+    pub(super) async fn cmd_programme(&self, user: &User, text: &str, platform: &str) -> anyhow::Result<View> {
+        let active = self.db.lock().await.active_programme_for_user(user.id)?;
+        match (programme_request(text), active) {
+            (ProgrammeRequest::New, _) | (_, None) => self.cmd_programme_start(user, platform).await,
+            (_, Some(programme)) => self.programme_status(user, &programme).await,
+        }
+    }
+
+    /// `/programme status`: where the user is in their live programme.
+    ///
+    /// Costs no LLM call — every figure is read from the grid and the calendar. The
+    /// artefact is the same [`View::Programme`] the interview emits, carrying a
+    /// [`ProgrammeStatusView`] the draft has no equivalent of, so a client that can show
+    /// a programme can already show this one.
+    async fn programme_status(&self, user: &User, programme: &Programme) -> anyhow::Result<View> {
+        let db = self.db.lock().await;
+        // Sweeps stale weeks before reading, so the counts can never show a week as
+        // still owed that the calendar has already closed.
+        let status = db.programme_status(programme, &today_str())?;
+        let goals = linked_goal_labels(&db, user.id, programme.id)?;
+        let view = stored_programme_view(&db, programme, goals, vec![next_step_note(&status)], true)?;
+
+        tracing::info!(user_id = user.id, programme_id = programme.id, week = status.current_week, "programme status");
+        Ok(View::Programme(Box::new(ProgrammeView { status: Some(status_view(&status)), ..view })))
+    }
+
     /// Enter the multi-turn `/programme` interview and return the opening question.
     ///
     /// Refuses before arming anything when the inputs a programme needs are missing,
     /// so the user is never walked through an interview that cannot conclude.
-    pub(super) async fn cmd_programme_start(&self, user: &User, platform: &str) -> anyhow::Result<View> {
+    async fn cmd_programme_start(&self, user: &User, platform: &str) -> anyhow::Result<View> {
         let (philosophy, goals, active) = {
             let db = self.db.lock().await;
             (db.latest_philosophy(user.id)?, db.goal_progress_report(user.id, None, None)?, db.active_programme_for_user(user.id)?)
@@ -203,6 +236,55 @@ impl AssistantHandler {
         tracing::info!(user_id = user.id, programme_id, "programme locked in and activated");
         self.store_conversation_on_platform(user.id, platform, text, "Locked in -- your programme is now active.").await?;
         Ok(View::Programme(Box::new(view)))
+    }
+}
+
+/// What a `/programme` invocation is asking for. Anything unrecognised reads as bare
+/// `/programme` rather than an error — an unknown word after the command is far more
+/// likely to be someone talking to the command than mistyping a subcommand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProgrammeRequest {
+    /// Report on the live programme.
+    Status,
+    /// Build a new one, even when a programme is already running.
+    New,
+    /// Unqualified — resolved against whether a programme is live.
+    Bare,
+}
+
+fn programme_request(text: &str) -> ProgrammeRequest {
+    match text.split_whitespace().nth(1).map(str::to_lowercase).as_deref() {
+        Some("status") => ProgrammeRequest::Status,
+        Some("new") => ProgrammeRequest::New,
+        _ => ProgrammeRequest::Bare,
+    }
+}
+
+/// The one thing to do next, as the note under a status report. A programme the user has
+/// finished walking says so and points at the next one, rather than leaving them at a
+/// report with nothing to act on.
+fn next_step_note(status: &ProgrammeStatus) -> String {
+    match &status.next_slot {
+        Some(slot) => format!("Next up -- week {}, day {}: {}. Run /nextworkout when you're ready.", slot.week_idx, slot.day_idx, slot.focus),
+        None => "Every slot is settled. Run /programme new when you want to build the next one.".to_string(),
+    }
+}
+
+/// The wire view of a programme's position. Counts are clamped into `u32` at the edge,
+/// which is the only place the DB's signed integers meet the protocol's unsigned ones.
+fn status_view(status: &ProgrammeStatus) -> ProgrammeStatusView {
+    ProgrammeStatusView {
+        current_week: status.current_week.max(0) as u32,
+        block_focus: status.block.as_ref().map(|b| b.focus.clone()),
+        next_slot: status.next_slot.as_ref().map(|slot| ProgrammeSlotView {
+            week_idx: slot.week_idx.max(0) as u32,
+            day_idx: slot.day_idx.max(0) as u32,
+            focus: slot.focus.clone(),
+        }),
+        trained: status.counts.trained.max(0) as u32,
+        missed: status.counts.missed.max(0) as u32,
+        skipped: status.counts.skipped.max(0) as u32,
+        remaining: status.counts.remaining() as u32,
     }
 }
 
@@ -396,6 +478,9 @@ fn stored_programme_view(db: &Database, programme: &Programme, goals: Vec<String
         goals,
         notes,
         active,
+        // A programme being proposed has no position to report; the status read fills
+        // this in afterwards, which is the one thing that distinguishes the two views.
+        status: None,
     })
 }
 
@@ -680,8 +765,9 @@ mod tests {
             id
         };
 
+        // `/programme new`, because bare `/programme` now reports on the live one ([R2.1]).
         // The opener warns that locking a new one in replaces it.
-        let opener = handler.handle_text_message(&msg, "/programme").await.unwrap();
+        let opener = handler.handle_text_message(&msg, "/programme new").await.unwrap();
         assert!(shown(&opener).contains("Old plan-of-record"), "the user must be told what would be replaced: {}", shown(&opener));
 
         llm.set_response(PROPOSAL);

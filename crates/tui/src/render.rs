@@ -224,6 +224,16 @@ fn render_session_roster(roster: &SessionRosterView, mode: Option<&TrainingModeV
 /// `/nextworkout` designs a roster for a slot.
 ///
 /// A draft closes with the lock-in ask; an active programme has nothing left to confirm.
+/// The "where you are" bullets of a live programme, or empty for one that is merely
+/// proposed — which renders as no section at all, the same as any other empty list.
+fn position_items(p: &ProgrammeView) -> Vec<String> {
+    let (Some(position), Some(status)) = (p.position_line(), p.status.as_ref()) else {
+        return Vec::new();
+    };
+    let next = status.next_slot.as_ref().map(|slot| format!("Next: {}", slot.label()));
+    [position].into_iter().chain(next).chain([status.counts_line()]).collect()
+}
+
 fn render_programme(p: &ProgrammeView) -> Vec<Line<'static>> {
     let mut lines = vec![heading(p.title.clone()), muted(p.shape_line())];
 
@@ -244,6 +254,9 @@ fn render_programme(p: &ProgrammeView) -> Vec<Line<'static>> {
         );
     };
 
+    // [R2.1]: present only on a live programme being reported on, and rendered first,
+    // because "where am I?" is the whole question `/programme status` was asked.
+    section(&mut lines, "Where you are", position_items(p));
     section(&mut lines, "Goals served", p.goals.clone());
     section(&mut lines, "Blocks", p.blocks.iter().map(|b| format!("{}: {}", b.weeks_label(), b.focus)).collect());
     section(&mut lines, "Each week", p.week_template.iter().map(|d| format!("Day {}: {}", d.day_idx, d.focus)).collect());
