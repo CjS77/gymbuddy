@@ -439,7 +439,11 @@ fn hold_reason(outings: &[Outing]) -> String {
     if latest.cleared_target() || latest.effort == Difficulty::Easy {
         return format!("one qualifying session so far ({}) — one more clears the 2-for-2 rule and the load goes up", latest.date);
     }
-    format!("last session sat inside the working range ({}, {}) — hold and let the reps come up first", latest.date, reps_in_reserve(latest.effort))
+    format!(
+        "last session sat inside the working range ({}, {}) — hold and let the reps come up first",
+        latest.date,
+        reps_in_reserve(latest.effort)
+    )
 }
 
 /// The corpus also places a deload "when back-off signals accumulate". Several exercises backing off

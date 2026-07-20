@@ -1187,7 +1187,15 @@ mod tests {
     // ── Progressive overload policy, through the production path [C5.3] ───────
 
     /// Log one session at `started_at`, every set at `effort` — the effort the policy reads.
-    fn seed_session_at_effort(db: &Database, user_id: i64, started_at: &str, et_id: i64, weight: f64, reps: i32, effort: Difficulty) -> i64 {
+    fn seed_session_at_effort(
+        db: &Database,
+        user_id: i64,
+        started_at: &str,
+        et_id: i64,
+        weight: f64,
+        reps: i32,
+        effort: Difficulty,
+    ) -> i64 {
         let session_id = db.start_session_at(user_id, started_at, None, None).unwrap();
         let entry_id = db.insert_entry(&new_exercise_entry_at(user_id, Some(session_id), None, started_at)).unwrap();
         let mut set = new_exercise_set(entry_id, et_id, MeasurementType::WeightReps, weight);
