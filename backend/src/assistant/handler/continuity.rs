@@ -12,27 +12,62 @@ use super::{AssistantHandler, Reply};
 use gymbuddy_proto::View;
 
 impl AssistantHandler {
-    pub(super) async fn close_stale_session(&self, user: &User) -> anyhow::Result<()> {
-        let db = self.db.lock().await;
-        let Some(session) = db.get_active_session(user.id)? else {
-            return Ok(());
+    /// Close a session the user has plainly walked away from, and write it up.
+    ///
+    /// Returns the note the triggering turn's reply should carry, or `None` when nothing
+    /// was closed. The user is not here to be asked how the session went, so `end_session`
+    /// distils the verdict itself and marks it `derived` ([C6.5]); the note hands that
+    /// reading back for correction rather than asserting it, and a correction flows through
+    /// the ordinary `RecordSessionOutcome` path, which regenerates the review.
+    pub(super) async fn close_stale_session(&self, user: &User) -> anyhow::Result<Option<String>> {
+        let closed = {
+            let db = self.db.lock().await;
+            let Some(session) = db.get_active_session(user.id)? else {
+                return Ok(None);
+            };
+
+            let entries = db.list_entries_for_session(session.id)?;
+            let last_activity = entries.last().map(|e| e.start_timestamp.clone()).unwrap_or_else(|| session.started_at.clone());
+
+            let threshold_hours = self.config.session_timeout_hours as i64;
+            let stale = NaiveDateTime::parse_from_str(&last_activity, "%Y-%m-%d %H:%M:%S")
+                .is_ok_and(|last| (Utc::now().naive_utc() - last).num_hours() >= threshold_hours);
+            if !stale {
+                return Ok(None);
+            }
+
+            tracing::info!("Auto-closing stale session {} (last activity: {last_activity})", session.id);
+            db.end_session(session.id)?;
+            (session.id, db.get_session(session.id)?.and_then(|s| s.overall_effort))
         };
 
-        let entries = db.list_entries_for_session(session.id)?;
-        let last_activity = entries.last().map(|e| e.start_timestamp.clone()).unwrap_or_else(|| session.started_at.clone());
+        let (session_id, effort) = closed;
+        let Some(view) = self.generate_session_review(user, session_id).await.ok() else {
+            // The session is closed either way; a failed write-up must not cost the user
+            // their turn, and claiming a review that does not exist would be worse still.
+            return Ok(Some("I closed your last session — it had been idle a while.".to_string()));
+        };
 
-        let threshold_hours = self.config.session_timeout_hours as i64;
-        if let Ok(last) = chrono::NaiveDateTime::parse_from_str(&last_activity, "%Y-%m-%d %H:%M:%S") {
-            let elapsed = Utc::now().naive_utc() - last;
-            if elapsed.num_hours() >= threshold_hours {
-                tracing::info!("Auto-closing stale session {} (last activity: {last_activity})", session.id);
-                db.end_session(session.id)?;
-            }
-        }
-
-        Ok(())
+        Ok(Some(stale_close_note(&view.headline, effort.map(|e| e.as_str()))))
     }
+}
 
+/// The note an auto-close puts on the triggering turn's reply.
+///
+/// It says three things, in the order that matters: that a session was closed without being
+/// asked about, what the review made of it, and that the effort behind that verdict is the
+/// server's guess and can be corrected. The last part is not politeness — the verdict was
+/// stored as `derived`, and inviting the correction is what eventually turns it into the
+/// user's own.
+fn stale_close_note(headline: &str, effort: Option<&str>) -> String {
+    let correction = match effort {
+        Some(effort) => format!(" — tell me if {effort} sounds wrong"),
+        None => String::new(),
+    };
+    format!("I closed your last session. Quick take: {headline}. /review for the full report{correction}.")
+}
+
+impl AssistantHandler {
     /// Hard server-side enforcement of the SESSION CONTINUITY ask-window. If
     /// there is an active session whose last activity was between 0.5 and 12
     /// hours ago, and we have not already asked the user about it on the

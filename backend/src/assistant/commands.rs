@@ -23,6 +23,7 @@ pub enum Command {
     Start,
     Status,
     History,
+    Review,
     Exercises,
     Philosophy,
     NextWorkout,
@@ -89,6 +90,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "/history",
         args: None,
         description: "Last 5 workout summaries",
+        visibility: Visibility::Everyone,
+    },
+    CommandSpec {
+        command: Command::Review,
+        name: "/review",
+        args: None,
+        description: "The review of your last finished session",
         visibility: Visibility::Everyone,
     },
     CommandSpec {

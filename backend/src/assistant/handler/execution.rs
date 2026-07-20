@@ -190,7 +190,12 @@ impl AssistantHandler {
                 // end_session distilled a proposed verdict from the final set of each
                 // exercise; ask the user to confirm or override it. Resting is over
                 // once the session ends, so the timer cancel rides along either way.
-                let suffix = db.get_session(session.id)?.and_then(|s| s.overall_effort).map(session_verdict_question);
+                let verdict = db.get_session(session.id)?.and_then(|s| s.overall_effort).map(session_verdict_question);
+                // The review reads the session, so it has to run after the writes above —
+                // and outside this lock, which it takes for itself.
+                drop(db);
+                let review = self.write_session_review(user, session.id).await;
+                let suffix = join_suffixes(verdict, review);
                 Ok(ActionOutcome { suffix, timer: Some(TimerSignal::Cancel) })
             }
             AssistantAction::RecordSessionOutcome { overall_effort, felt, cut_short, cut_short_reason } => {
@@ -204,7 +209,17 @@ impl AssistantHandler {
                 db.set_session_outcome(session.id, *overall_effort, *felt, *cut_short, cut_short_reason.as_deref())?;
                 let updated = db.get_session(session.id)?.context("session vanished while recording its outcome")?;
                 tracing::debug!(id = session.id, effort = ?updated.overall_effort, felt = ?updated.felt, "Recorded session outcome");
-                Ok(format_session_outcome(&updated).map(|p| format!("Session verdict saved: {p}.")).into())
+                let saved = format_session_outcome(&updated).map(|p| format!("Session verdict saved: {p}."));
+                drop(db);
+                // The correction the auto-close note invited: the effort is now the user's
+                // own, so the review that quoted the derived one is out of date. Regenerating
+                // is cheap and idempotent — the upsert replaces, and a goal already marked
+                // achieved keeps the date it was first hit.
+                let regenerated = match updated.ended_at.is_some() && overall_effort.is_some() {
+                    true => self.write_session_review(user, session.id).await,
+                    false => None,
+                };
+                Ok(ActionOutcome { suffix: join_suffixes(saved, regenerated), timer: None })
             }
             AssistantAction::CloseExerciseEntry { exercise, entry_id } => {
                 Ok(self.close_exercise_entry_action(user, exercise.as_deref(), *entry_id, false).await?.into_action_outcome())
@@ -680,6 +695,14 @@ fn opt_count(c: Option<i32>) -> String {
 /// session verdict distilled from the final set of each exercise, so the user can
 /// agree with one word — or override it with effort, feel, or a cut-short reason,
 /// which the LLM relays as a `record_session_outcome` action.
+/// Join an action's own suffix with the review note that rides along with it.
+fn join_suffixes(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(a), Some(b)) => Some(format!("{a} {b}")),
+        (a, b) => a.or(b),
+    }
+}
+
 fn session_verdict_question(effort: Difficulty) -> String {
     format!(
         "Going by the final set of each exercise, I'd call that session {effort} overall — sound right? \

@@ -246,6 +246,16 @@ impl Database {
         Ok(RosterVsActual { roster_id, session_id, matched, skipped, unrostered })
     }
 
+    /// Every exercise a session performed, rolled up in the order it was first logged.
+    ///
+    /// The ad-hoc counterpart to [`roster_vs_actual`](Self::roster_vs_actual), for a
+    /// session with no roster to be measured against. [`UnrosteredExercise`] is
+    /// precisely the right shape: performed, with nothing prescribed to compare to.
+    pub fn session_performed(&self, session_id: i64) -> anyhow::Result<Vec<UnrosteredExercise>> {
+        let (performed, order) = self.performed_by_exercise(session_id)?;
+        order.iter().map(|&type_id| self.unrostered_exercise(type_id, &performed[&type_id])).collect()
+    }
+
     /// Every set logged in `session_id`, grouped by `exercise_type_id`, plus the
     /// exercise_type ids in the order they were first logged (so the unrostered list
     /// keeps a stable, session-chronological order).

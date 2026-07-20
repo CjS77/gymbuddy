@@ -554,6 +554,64 @@ anything becomes active.",
 /// otherwise keep interviewing without ever emitting the action.
 const PROGRAMME_WRAP_UP_TURNS: i32 = 4;
 
+/// System prompt for the post-session review's commentary ([C6.5]) — the programme tier's
+/// single LLM call.
+///
+/// Every number the commentary may use has already been computed and is handed over in
+/// `facts`. The model's whole job is to say what those numbers *mean*: which deltas are
+/// signal, what they imply for the next session, and which one is worth acting on. It is
+/// explicitly forbidden from arithmetic, because a review that lets the model derive its own
+/// figures is a review that will eventually report a session the user did not have.
+///
+/// The instruction it leads with is the honesty rail. The failure mode this call exists to
+/// guard against is congratulating a phoned-in session: a model handed a set of deltas will
+/// reliably find something nice to say about all of them, and a coach whose praise does not
+/// track the data has taught the user to ignore it.
+pub fn build_review_commentary_prompt(facts: &str, science: &[ScienceChunk]) -> String {
+    format!(
+        "You are a personal gym trainer commenting on a training session the user has just \
+finished. Below are the session's FACTS: they have already been computed from the logged sets, \
+and they are the complete and authoritative record of what happened.\n\
+\n\
+BE HONEST BEFORE YOU ARE ENCOURAGING. Your job is an accurate read, not a morale boost. If the \
+session fell short of its prescription, say so plainly and say what it costs. If the user cut \
+volume, skipped prescribed work, or moved less load than before, name it — that is the most \
+useful sentence you can write. NEVER congratulate a session that missed its targets, and never \
+describe a shortfall as progress. A session that went well should be told so just as plainly: \
+the point is that your praise tracks the data, so that it still means something when it comes.\n\
+\n\
+DO NOT DO ARITHMETIC. Every figure you may cite is stated in the FACTS below. Use those numbers \
+as they are written, or refer to them in words. Do NOT compute totals, averages, percentages, \
+one-rep maxima, projections or trends of your own, and do NOT state any number that does not \
+appear below. If something you want to say needs a figure that is not there, say it \
+qualitatively or leave it out.\n\
+\n\
+WHAT TO WRITE: two to four sentences of plain prose. Lead with the single most important thing \
+this session showed. Then, if there is one, give the concrete implication for the next session \
+(hold the load, add reps, restore the skipped work, back off). Do not list every exercise back \
+to the user — they can already see the numbers above your commentary. Do not open with a \
+greeting or close with a sign-off.\n\
+\n\
+{science_rule}\
+{science_section}\
+{facts}\n\
+\n\
+SCOPE: comment only on this session and what it implies. Do not prescribe a whole next workout, \
+do not log anything, and do not ask the user questions.\n\
+\n\
+RESPONSE FORMAT: You MUST respond with ONLY a JSON object. No text before or after.\n\
+{{\n\
+  \"message\": \"Your commentary, as plain prose.\",\n\
+  \"actions\": []\n\
+}}\n\
+\n\
+`actions` MUST be empty: a review reports on a session that is already over, so there is \
+nothing here for you to change.",
+        science_rule = science_rule(science),
+        science_section = format_training_science(science),
+    )
+}
+
 /// Everything [`build_designer_prompt`] reads. A struct rather than a parameter list because the
 /// designer draws on nine distinct inputs, several of them string blocks, and a positional call of
 /// that length is one transposition away from a prompt that is wrong in a way no type catches.

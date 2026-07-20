@@ -27,6 +27,7 @@ impl AssistantHandler {
             Command::Help => Ok(Some(View::notice(Self::cmd_help(user)).into())),
             Command::Status => Ok(Some(self.cmd_status(user).await?.into())),
             Command::History => Ok(Some(View::History(self.cmd_history(user).await?).into())),
+            Command::Review => Ok(Some(self.cmd_review(user).await?.into())),
             Command::Exercises => Ok(Some(View::Catalog(self.cmd_exercises()).into())),
             Command::Clear => Ok(Some(View::notice(self.cmd_clear(user, platform).await?).into())),
             Command::Timers => Ok(Some(self.cmd_timers(user).await?)),
@@ -77,6 +78,29 @@ impl AssistantHandler {
              - \"What did I do today?\"",
             Self::command_list(user, "")
         )
+    }
+
+    /// `/review` — the review of the user's last finished session ([C6.5]).
+    ///
+    /// Replays the stored snapshot rather than recomputing it, so the review the user reads
+    /// today is word for word the one generated when the session ended. A session that
+    /// finished before reviews existed, or whose review generation failed, has none stored:
+    /// that is generated on demand here, which is also the only path that can produce a
+    /// review for a session the user has since edited.
+    async fn cmd_review(&self, user: &User) -> anyhow::Result<View> {
+        if let Some(view) = self.latest_stored_review(user).await? {
+            return Ok(View::SessionReview(Box::new(view)));
+        }
+
+        let latest = {
+            let db = self.db.lock().await;
+            db.latest_session_for_user(user.id)?
+        };
+        // An active session is still being lived; there is nothing to review yet.
+        match latest.filter(|s| s.ended_at.is_some()) {
+            Some(session) => Ok(View::SessionReview(Box::new(self.generate_session_review(user, session.id).await?))),
+            None => Ok(View::notice("You don't have a finished session to review yet. Log a workout and I'll write one up.")),
+        }
     }
 
     async fn cmd_status(&self, user: &User) -> anyhow::Result<View> {

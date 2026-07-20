@@ -24,6 +24,7 @@ mod llm;
 mod onboarding;
 mod programme;
 mod progress;
+mod review;
 #[cfg(test)]
 mod test_support;
 
@@ -53,6 +54,28 @@ pub struct Reply {
 impl Reply {
     fn view(view: View) -> Self {
         Self { view, timer: None }
+    }
+}
+
+/// Attach a server-side note to a reply that is about to be returned early.
+///
+/// The auto-close note reports something that happened *before* the user's message was
+/// read, so it must survive every path out of a turn — including the continuity
+/// short-circuits, which never reach the LLM. A view with nowhere to put a note keeps its
+/// own text and the note is dropped rather than mangling the view.
+fn with_note(reply: Reply, note: Option<String>) -> Reply {
+    let Some(note) = note else {
+        return reply;
+    };
+    match reply.view {
+        View::Message { text, mut notes, failures } => {
+            notes.insert(0, note);
+            Reply { view: View::Message { text, notes, failures }, timer: reply.timer }
+        }
+        View::Notice { text } => {
+            Reply { view: View::Message { text, notes: vec![note], failures: vec![] }, timer: reply.timer }
+        }
+        view => Reply { view, timer: reply.timer },
     }
 }
 
@@ -111,16 +134,16 @@ impl AssistantHandler {
             return Ok(reply.into());
         }
 
-        self.close_stale_session(user).await?;
+        let stale_note = self.close_stale_session(user).await?;
 
         let text = crate::text::truncate_on_char_boundary(text, self.config.max_message_length);
 
         if let Some(reply) = self.maybe_session_continuity_short_circuit(user, text, platform).await? {
-            return Ok(reply.into());
+            return Ok(with_note(reply.into(), stale_note));
         }
 
         if let Some(reply) = self.maybe_session_continuity_resume(user, text, platform).await? {
-            return Ok(reply);
+            return Ok(with_note(reply, stale_note));
         }
 
         let system_prompt = self.build_context(user).await?;
@@ -189,7 +212,8 @@ impl AssistantHandler {
         // The conversational follow-ups (`suffixes`) and any action `failures` ride
         // alongside the prose as structured `notes`/`failures`; each client decides
         // how to present them. `strip_markdown` keeps stray markup out of chat boxes.
-        Ok(Reply { view: View::Message { text: crate::text::strip_markdown(&parsed.message), notes: suffixes, failures }, timer })
+        let notes = stale_note.into_iter().chain(suffixes).collect();
+        Ok(Reply { view: View::Message { text: crate::text::strip_markdown(&parsed.message), notes, failures }, timer })
     }
 
     async fn ensure_user(&self, message: &TgMessage) -> anyhow::Result<(User, bool)> {
