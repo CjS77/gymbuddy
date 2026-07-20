@@ -564,7 +564,7 @@ mod tests {
     fn reconnecting_does_not_repeat_the_onboarding_ask() {
         let mut app = App::new("pk".into(), None, None);
         app.on_response(ServerResponse::Welcome { name: "Alice".into() });
-        assert!(!system_lines(&app).iter().any(|l| *l == gymbuddy_proto::ONBOARDING_ASK));
+        assert!(!system_lines(&app).contains(&gymbuddy_proto::ONBOARDING_ASK));
     }
 
     /// The ask belongs to the registration it answered, not to the connection.
