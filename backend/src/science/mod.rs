@@ -5,8 +5,8 @@
 //! than retrieving it live is that a person who can judge it reads it once; a change to the science is a
 //! diff with the reasoning in the commit message.
 //!
-//! This module owns the corpus and its parsing only. Building a search index over the chunks, and injecting
-//! retrieved chunks into a prompt, both belong to its consumers.
+//! This module owns the corpus and its parsing. Choosing which chunks answer a given user's situation is
+//! [`retrieval`]'s job; injecting the chosen chunks into a prompt belongs to `assistant::prompts`.
 //!
 //! # Document format
 //!
@@ -45,6 +45,10 @@ use include_dir::{Dir, include_dir};
 use serde::Deserialize;
 
 use crate::db::GoalKind;
+
+pub mod retrieval;
+
+pub use retrieval::{ScienceIndex, ScienceQuery, normalise_body_part};
 
 static SCIENCE_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/science");
 
