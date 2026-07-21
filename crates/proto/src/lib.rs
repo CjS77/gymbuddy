@@ -9,12 +9,12 @@ use serde::{Deserialize, Serialize};
 
 pub mod view;
 pub use view::{
-    CatalogEntry, CatalogGroup, CatalogView, DayAdherenceView, Direction, ExerciseLog, HealthNote, HistoryView, Measurement,
-    ProgrammeAdherenceView, ProgrammeBlockView, ProgrammeDayView, ProgrammeProgressView, ProgrammeSlotView, ProgrammeStatusView,
-    ProgrammeView, ProgressView, Render, RescheduleView, ReviewEffortView, ReviewExerciseView, ReviewKindView, ReviewRecordView,
-    RosterExerciseView, SeriesPointView, SeriesShape, SeriesView, SessionReviewView, SessionRosterView,
-    SessionSummaryView, SessionView,
-    SetLine, StatusView, TrainingModeView, View,
+    Adherence, CatalogEntry, CatalogGroup, CatalogView, DayAdherenceView, Direction, ExerciseLog, GoalLimiter, GoalOutlook,
+    GoalOutlookView, HealthNote, HistoryView, MIN_PROJECTION_DAYS, MIN_PROJECTION_READINGS, Measurement, ProgrammeAdherenceView,
+    ProgrammeBlockView, ProgrammeDayView, ProgrammeProgressView, ProgrammeSlotView, ProgrammeStatusView, ProgrammeView, ProgressView,
+    Render, RescheduleView, ReviewEffortView, ReviewExerciseView, ReviewKindView, ReviewRecordView, RosterExerciseView, SeriesPointView,
+    SeriesShape, SeriesView, SessionReviewView, SessionRosterView, SessionSummaryView, SessionView, SetLine, StatusView, TrainingModeView,
+    View,
 };
 
 /// Discriminator placed in confide's `Message::Custom { kind, .. }` so the peer
@@ -256,7 +256,7 @@ mod tests {
             },
             View::Programme(Box::new(programme_view())),
             View::Progress(progress_view()),
-            View::Progress(view::ProgressView { headline: "No goals set yet.".into(), series: vec![], notes: vec![] }),
+            View::Progress(view::ProgressView { headline: "No goals set yet.".into(), series: vec![], notes: vec![], goals: vec![] }),
             View::SessionReview(Box::new(session_review_view())),
             View::SessionReview(Box::new(adhoc_review_view())),
             // [R2.1]: the same variant carrying a live programme's position.
@@ -399,6 +399,47 @@ mod tests {
         assert_eq!(tag(postcard::to_allocvec(&view::Direction::Higher).unwrap()), 0, "Higher");
         assert_eq!(tag(postcard::to_allocvec(&view::Direction::Lower).unwrap()), 1, "Lower");
         assert_eq!(tag(postcard::to_allocvec(&view::Direction::Neutral).unwrap()), 2, "Neutral");
+    }
+
+    /// `GoalOutlook` and `GoalLimiter` ride inside tag 9 for [C6.4], so their variant
+    /// order is wire format too.
+    ///
+    /// `GoalOutlook` matters most: its variants are graded claims about the same goal,
+    /// so a shift does not corrupt a message into a decode error — it silently tells an
+    /// older client "on track" where the server said "off track", or turns "too early to
+    /// say" into a verdict. Nothing downstream would notice, which is the whole reason
+    /// this type refuses to emit a percentage in the first place.
+    #[test]
+    fn goal_outlook_discriminants_are_pinned_to_their_wire_tags() {
+        let tag = |bytes: Vec<u8>| bytes[0];
+        assert_eq!(tag(postcard::to_allocvec(&view::GoalOutlook::TooEarly).unwrap()), 0, "TooEarly leads: the most conservative answer");
+        assert_eq!(tag(postcard::to_allocvec(&view::GoalOutlook::OnTrack).unwrap()), 1, "OnTrack");
+        assert_eq!(tag(postcard::to_allocvec(&view::GoalOutlook::AtRisk).unwrap()), 2, "AtRisk");
+        assert_eq!(tag(postcard::to_allocvec(&view::GoalOutlook::OffTrack).unwrap()), 3, "OffTrack");
+        assert_eq!(tag(postcard::to_allocvec(&view::GoalOutlook::Achieved).unwrap()), 4, "Achieved");
+        assert_eq!(tag(postcard::to_allocvec(&view::GoalOutlook::Missed).unwrap()), 5, "Missed");
+
+        assert_eq!(tag(postcard::to_allocvec(&view::GoalLimiter::Attendance).unwrap()), 0, "Attendance");
+        assert_eq!(tag(postcard::to_allocvec(&view::GoalLimiter::Performance).unwrap()), 1, "Performance");
+        assert_eq!(tag(postcard::to_allocvec(&view::GoalLimiter::Ambition).unwrap()), 2, "Ambition");
+    }
+
+    /// The outlook's *evidence* has to cross with it: a verdict off two readings and
+    /// one off thirty read identically, and a client that cannot tell them apart will
+    /// present both as forecasts.
+    #[test]
+    fn a_goal_outlook_survives_the_wire_with_its_evidence() {
+        let sent = progress_view();
+        let bytes = encode_response(&ServerResponse::Reply { view: View::Progress(sent.clone()), timer: None }).unwrap();
+        let ServerResponse::Reply { view: View::Progress(got), .. } = decode_response(&bytes).unwrap() else {
+            panic!("expected a Progress reply");
+        };
+        assert_eq!(got.goals, sent.goals);
+        assert_eq!(got.goals[0].outlook, view::GoalOutlook::OnTrack);
+        assert_eq!(got.goals[0].projected, Some(120.5), "the projection it does stand behind crossed");
+        assert_eq!(got.goals[1].outlook, view::GoalOutlook::TooEarly, "and the goal it will not project for stayed unprojected");
+        assert_eq!(got.goals[1].projected, None);
+        assert_eq!(got.goals[1].readings, 2);
     }
 
     /// A series survives the wire with its numbers and its sense of "better" intact —

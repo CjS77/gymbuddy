@@ -5,8 +5,15 @@
 //! clients that already plot charts need no new code — carrying the readings, the
 //! target, and the [`Direction`] that says which way "better" runs. A `SeriesView`
 //! has no field for the rest of the question ("does this trend get me there, and
-//! is there time?"), so that lands as one plain-text note per goal alongside the
-//! series, and the headline counts how many goals the answer is yes for.
+//! is there time?"), so that lands as one [`GoalOutlookView`] per goal plus the
+//! sentence it produces, and the headline counts the bands they fall in.
+//!
+//! The projection is deliberately not a number ([C6.4]). It is a straight line
+//! through sparse, noisy, self-reported readings, so what travels is one of four
+//! bands — on track, at risk, off track, too early to say — and the refusal to
+//! project lives in [`GoalOutlookView::assess`], not in a client's wording. This
+//! module's job is only to gather the evidence the assessment is entitled to: the
+//! readings, the deadline, and whether the user is actually turning up.
 //!
 //! Direction-awareness runs the whole way through: the daily readings are pulled
 //! with the goal's direction (see [`crate::db::Database::exercise_time_series`]),
@@ -26,47 +33,61 @@ use crate::assistant::prompts::goals_by_priority;
 use crate::db::{Database, GoalDirection, GoalProgress, GoalStatus, MeasurementType, User};
 
 use super::AssistantHandler;
-use gymbuddy_proto::{Direction, ProgressView, SeriesPointView, SeriesShape, SeriesView, View};
+use gymbuddy_proto::{
+    Adherence, Direction, GoalOutlook, GoalOutlookView, MIN_PROJECTION_DAYS, ProgressView, SeriesPointView, SeriesShape, SeriesView, View,
+};
 
 /// The window the muscle-group volume breakdown covers.
 const VOLUME_WINDOW: &str = "-7 days";
 
-/// One goal, charted: the series a client plots, the sentence answering whether
-/// the trend arrives in time, and the verdict the headline tallies.
+/// One goal, charted: the series a client plots, its outlook, and the sentence that
+/// outlook produces.
 struct GoalChart {
     series: SeriesView,
     note: String,
-    on_track: bool,
+    outlook: GoalOutlookView,
 }
 
 impl AssistantHandler {
     /// Report progress against every goal on file as a [`View::Progress`].
     ///
-    /// Reads only — `/progress` logs nothing and changes nothing.
+    /// `/progress` logs nothing. Reading adherence runs [C4.4]'s missed-slot sweep,
+    /// which only settles weeks the calendar has already closed — the same
+    /// normalisation `/programme status` performs, never a new record of training.
     pub(super) async fn cmd_progress(&self, user: &User) -> anyhow::Result<View> {
         let today = chrono::Utc::now().date_naive();
         let (charts, volume) = {
             let db = self.db.lock().await;
             let goals = db.goal_progress_report(user.id, None, None)?;
+            let adherence = adherence(&db, user.id, today)?;
             let charts = goals_by_priority(&goals)
                 .into_iter()
-                .map(|gp| self.goal_chart(&db, user.id, gp, today))
+                .map(|gp| self.goal_chart(&db, user.id, gp, today, adherence))
                 .collect::<anyhow::Result<Vec<_>>>()?;
             (charts, volume_breakdown(&db, user.id)?)
         };
 
-        let on_track = charts.iter().filter(|chart| chart.on_track).count();
-        let headline = headline(on_track, charts.len());
+        let headline = headline(&charts.iter().map(|chart| chart.outlook.outlook).collect::<Vec<_>>());
         let notes = charts.iter().map(|chart| chart.note.clone()).collect();
-        let series = charts.into_iter().map(|chart| chart.series).chain(volume).collect();
+        let (goal_series, goals): (Vec<SeriesView>, Vec<GoalOutlookView>) =
+            charts.into_iter().map(|chart| (chart.series, chart.outlook)).unzip();
+        let series = goal_series.into_iter().chain(volume).collect();
 
-        Ok(View::Progress(ProgressView { headline, series, notes }))
+        Ok(View::Progress(ProgressView { headline, series, notes, goals }))
     }
 
     /// Chart one goal and read its outlook off the readings.
-    fn goal_chart(&self, db: &Database, user_id: i64, gp: &GoalProgress, today: NaiveDate) -> anyhow::Result<GoalChart> {
+    fn goal_chart(
+        &self,
+        db: &Database,
+        user_id: i64,
+        gp: &GoalProgress,
+        today: NaiveDate,
+        adherence: Adherence,
+    ) -> anyhow::Result<GoalChart> {
         let series = self.goal_series(db, user_id, gp, today)?;
-        Ok(GoalChart { note: goal_note(gp, &series, today), on_track: on_track(gp, &series, today), series })
+        let outlook = goal_outlook(gp, &series, today, adherence);
+        Ok(GoalChart { note: goal_note(gp, &series, &outlook, today), outlook, series })
     }
 
     /// The readings behind one goal, as a [`SeriesShape::Trajectory`] aimed at its
@@ -142,28 +163,75 @@ fn volume_breakdown(db: &Database, user_id: i64) -> anyhow::Result<Option<Series
 }
 
 /// The view's one-line answer to "how am I doing".
-fn headline(on_track: usize, total: usize) -> String {
-    match total {
-        0 => "No goals on file yet — tell me what you're working towards and I'll track it here.".to_string(),
-        1 => format!("{on_track} of 1 goal on track."),
-        _ => format!("{on_track} of {total} goals on track."),
+///
+/// Counts what is landing, then names the two bands that count would otherwise
+/// misrepresent. A goal at risk is not on track, and a goal with too little behind it
+/// is neither — filing it under "not on track" is exactly the dishonesty [C6.4]
+/// exists to prevent, so when *nothing* is projectable the line says so instead of
+/// leading with a zero.
+fn headline(outlooks: &[GoalOutlook]) -> String {
+    let total = outlooks.len();
+    let count = |band: GoalOutlook| outlooks.iter().filter(|o| **o == band).count();
+    if total == 0 {
+        return "No goals on file yet — tell me what you're working towards and I'll track it here.".to_string();
+    }
+    if count(GoalOutlook::TooEarly) == total {
+        return format!("Too early to say on {} — keep logging and I'll trend {}.", goals_label(total), them(total));
+    }
+
+    let landing = outlooks.iter().filter(|o| matches!(o, GoalOutlook::OnTrack | GoalOutlook::Achieved)).count();
+    let head = format!("{landing} of {} on track", goals_label(total));
+    let caveats: Vec<String> = [(count(GoalOutlook::AtRisk), "at risk"), (count(GoalOutlook::TooEarly), "too early to say")]
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, label)| format!("{n} {label}"))
+        .collect();
+    match caveats.is_empty() {
+        true => format!("{head}."),
+        false => format!("{head} — {}.", caveats.join(", ")),
     }
 }
 
-/// Whether the goal's own numbers say it arrives.
+fn goals_label(total: usize) -> String {
+    format!("{total} {}", if total == 1 { "goal" } else { "goals" })
+}
+
+fn them(total: usize) -> &'static str {
+    if total == 1 { "it" } else { "them" }
+}
+
+/// One goal's outlook ([C6.4]).
 ///
-/// A goal with a deadline is judged on whether the current rate clears the target
-/// by then; an open-ended one is judged on moving the right way at all. Too few
-/// readings to extrapolate from is not "on track" — there is nothing to be on.
-fn on_track(gp: &GoalProgress, series: &SeriesView, today: NaiveDate) -> bool {
+/// Settled goals report what happened; a live one is assessed against its deadline
+/// and the user's attendance. The band itself is decided in the wire model — this
+/// only hands over the evidence it is entitled to.
+fn goal_outlook(gp: &GoalProgress, series: &SeriesView, today: NaiveDate, adherence: Adherence) -> GoalOutlookView {
+    let subject = subject(series);
+    let target_date = gp.goal.target_date.clone();
     match gp.status {
-        GoalStatus::Achieved => true,
-        GoalStatus::Failed => false,
-        GoalStatus::Active => match (projection(series, gp, today), series.improving()) {
-            (Some(projected), _) => reaches(series.better, projected, gp.goal.target_value),
-            (None, improving) => days_remaining(gp, today).is_none() && improving == Some(true),
-        },
+        GoalStatus::Achieved => GoalOutlookView::achieved(subject, series, target_date),
+        GoalStatus::Failed => GoalOutlookView::missed(subject, series, target_date, adherence),
+        GoalStatus::Active => GoalOutlookView::assess(subject, series, projection(series, gp, today), target_date, adherence),
     }
+}
+
+/// The goal's subject, as the series names it: "Bench Press — daily best" is a chart
+/// of "Bench Press".
+fn subject(series: &SeriesView) -> String {
+    series.title.split(" — ").next().unwrap_or(&series.title).to_string()
+}
+
+/// How the user is turning up, as the outlook's dominant term ([C4.4]). Only a live
+/// programme has an attendance record to read, and its drift verdict is consumed as
+/// it stands rather than recomputed here.
+fn adherence(db: &Database, user_id: i64, today: NaiveDate) -> anyhow::Result<Adherence> {
+    let Some(drift) = db.goal_adherence(user_id, &today.format("%Y-%m-%d").to_string())? else {
+        return Ok(Adherence::Unprogrammed);
+    };
+    Ok(match drift.is_on_track() {
+        true => Adherence::Keeping,
+        false => Adherence::Drifting,
+    })
 }
 
 /// Where the current rate lands by the goal's target date. `None` when the goal is
@@ -174,22 +242,13 @@ fn projection(series: &SeriesView, gp: &GoalProgress, today: NaiveDate) -> Optio
     Some(latest + daily_rate(series)? * days.max(0) as f64)
 }
 
-/// Change per day across the charted readings. `None` when the series spans less
-/// than a day, which is a single session rather than a trend.
+/// Change per day across the charted readings. `None` when they span less than
+/// [`MIN_PROJECTION_DAYS`] — a handful of sets inside one week is a good week, not a
+/// rate to carry months forward.
 fn daily_rate(series: &SeriesView) -> Option<f64> {
     let change = series.change()?;
     let span = (parse_date(&series.points.last()?.label)? - parse_date(&series.points.first()?.label)?).num_days();
-    (span > 0).then(|| change / span as f64)
-}
-
-/// Whether `value` clears `target`, the way `better` runs. The one comparison the
-/// whole command turns on: for a weight-loss goal, below the target is success.
-fn reaches(better: Direction, value: f64, target: f64) -> bool {
-    match better {
-        Direction::Higher => value >= target,
-        Direction::Lower => value <= target,
-        Direction::Neutral => false,
-    }
+    (span >= MIN_PROJECTION_DAYS).then(|| change / span as f64)
 }
 
 /// Whole days from `today` to the goal's target date; `None` when it is open-ended.
@@ -198,46 +257,55 @@ fn days_remaining(gp: &GoalProgress, today: NaiveDate) -> Option<i64> {
     Some((parse_date(gp.goal.target_date.as_deref()?)? - today).num_days())
 }
 
-/// The per-goal sentence: where the user stands, how long is left, and whether the
-/// trend arrives — the half of [C6.3] a [`SeriesView`] has no field for.
-fn goal_note(gp: &GoalProgress, series: &SeriesView, today: NaiveDate) -> String {
-    let subject = series.title.split(" — ").next().unwrap_or(&series.title);
+/// The per-goal sentence: where the user stands, how long is left, and what the
+/// outlook says — the half of [C6.3] a [`SeriesView`] has no field for, in the
+/// vocabulary [C6.4] settled on.
+fn goal_note(gp: &GoalProgress, series: &SeriesView, outlook: &GoalOutlookView, today: NaiveDate) -> String {
     let target = series.value_label(gp.goal.target_value);
     let standing = match gp.current_value {
         Some(current) => format!("{} of {target}", series.value_label(current)),
         None => format!("nothing logged yet, target {target}"),
     };
-    format!("{subject}: {standing}{}", outlook(gp, series, today))
+    format!("{}: {standing}{}", outlook.goal, outlook_clause(gp, series, outlook, today))
 }
 
 /// The outlook clause of a goal's note, leading with its own separator so a goal
 /// with nothing to say about the future contributes nothing.
-fn outlook(gp: &GoalProgress, series: &SeriesView, today: NaiveDate) -> String {
-    match gp.status {
-        GoalStatus::Achieved => " — achieved.".to_string(),
-        GoalStatus::Failed => format!(" — {} passed without it.", gp.goal.target_date.as_deref().unwrap_or("the target date")),
-        GoalStatus::Active => match days_remaining(gp, today) {
-            Some(days) => format!(", {} left — {}.", remaining_label(days), verdict(gp, series, today)),
-            None => format!(", open-ended — {}.", verdict(gp, series, today)),
+fn outlook_clause(gp: &GoalProgress, series: &SeriesView, outlook: &GoalOutlookView, today: NaiveDate) -> String {
+    match outlook.outlook {
+        GoalOutlook::Achieved => " — achieved.".to_string(),
+        GoalOutlook::Missed => format!(" — {} passed without it.", gp.goal.target_date.as_deref().unwrap_or("the target date")),
+        _ => match days_remaining(gp, today) {
+            Some(days) => format!(", {} left — {}.", remaining_label(days), verdict(series, outlook)),
+            None => format!(", open-ended — {}.", verdict(series, outlook)),
         },
     }
 }
 
-/// The judgement on an active goal's trend, in words.
-fn verdict(gp: &GoalProgress, series: &SeriesView, today: NaiveDate) -> String {
-    match (projection(series, gp, today), series.improving()) {
-        (Some(projected), _) => {
-            // Rounded for the sentence only: a straight-line extrapolation is not
-            // precise to fourteen decimal places, and printing them claims it is.
-            let label = series.value_label((projected * 10.0).round() / 10.0);
-            match reaches(series.better, projected, gp.goal.target_value) {
-                true => format!("on track, heading for {label}"),
-                false => format!("behind: this rate reaches only {label}"),
-            }
-        }
-        (None, Some(true)) => "moving the right way, too soon to project".to_string(),
-        (None, Some(false)) => "moving the wrong way".to_string(),
-        (None, None) => "not enough readings to trend yet".to_string(),
+/// The judgement on a live goal, in words: the outlook's own vocabulary, and a number
+/// only where one travelled with it.
+fn verdict(series: &SeriesView, outlook: &GoalOutlookView) -> String {
+    // Rounded for the sentence only: a straight-line extrapolation is not precise to
+    // fourteen decimal places, and printing them claims it is.
+    let landing = outlook.projected.map(|projected| series.value_label((projected * 10.0).round() / 10.0));
+    match (outlook.outlook, landing) {
+        (GoalOutlook::OnTrack, Some(label)) => format!("on track, heading for {label}"),
+        (GoalOutlook::OnTrack, None) => "on track, moving the right way".to_string(),
+        (GoalOutlook::TooEarly, _) => format!("too early to say: {}", evidence_label(outlook.readings)),
+        (band, Some(label)) => format!("{}: this rate reaches only {label}", band.label()),
+        (band, None) => match outlook.limiter {
+            Some(limiter) => format!("{}: {}", band.label(), limiter.reason()),
+            None => band.label().to_string(),
+        },
+    }
+}
+
+/// What the refusal to project rests on, said plainly rather than left implied.
+fn evidence_label(readings: u32) -> String {
+    match readings {
+        0 => "nothing logged against it yet".to_string(),
+        1 => "one reading so far".to_string(),
+        n => format!("{n} readings so far, and no trend across them yet"),
     }
 }
 
@@ -318,8 +386,9 @@ mod tests {
     use crate::assistant::commands;
     use crate::db::{
         Database, GoalKind, MeasurementType, User, new_body_metric, new_exercise_entry, new_exercise_goal, new_exercise_set, new_goal,
+        new_programme, new_programme_slot,
     };
-    use gymbuddy_proto::View;
+    use gymbuddy_proto::{GoalLimiter, View};
 
     /// A registered user plus a handle on the database, the start of every test here.
     async fn setup() -> (super::AssistantHandler, User, crate::telegram::Message) {
@@ -361,6 +430,29 @@ mod tests {
         [(-60, 60.0), (-30, 75.0), (-1, 90.0)].iter().for_each(|(day, kg)| {
             log_set(&db, user_id, bench.id, MeasurementType::WeightReps, *day, *kg);
         });
+    }
+
+    /// A live two-day-a-week programme whose three weeks have all closed. `kept`
+    /// trains every slot; otherwise they all lapse to missed, which is drift by
+    /// [C4.4]'s rule and the only way this module learns the user is not turning up.
+    async fn seed_programme(handler: &super::AssistantHandler, user_id: i64, kept: bool) {
+        let db = handler.db.lock().await;
+        let mut draft = new_programme(user_id, "12-week hypertrophy", 2, "upper/lower", "linear");
+        draft.start_date = days_from_today(-30);
+        let programme_id = db.create_programme(&draft).unwrap();
+        db.activate_programme(programme_id).unwrap();
+        (1..=3).for_each(|week| {
+            db.add_programme_slot(&new_programme_slot(programme_id, week, 1, "upper")).unwrap();
+            db.add_programme_slot(&new_programme_slot(programme_id, week, 2, "lower")).unwrap();
+        });
+        if kept {
+            db.list_programme_slots(programme_id).unwrap().iter().for_each(|slot| {
+                let roster = db.create_roster(user_id, "Trained", None, None).unwrap();
+                db.bind_roster_to_slot(roster, slot.id).unwrap();
+                let session = db.start_session(user_id, None).unwrap();
+                db.bind_roster_to_session(roster, session.id).unwrap();
+            });
+        }
     }
 
     // ── Registration ─────────────────────────────────────────────────────────
@@ -413,6 +505,14 @@ mod tests {
         assert!(note.contains("8 weeks left"), "and how long is left: {note}");
         assert!(note.contains("on track, heading for 120.5 kg"), "and where the rate lands, rounded: {note}");
         assert_eq!(progress.headline, "1 of 1 goal on track.");
+
+        // The same verdict, structured, for the clients and for [C6.6].
+        let outlook = progress.goals.first().expect("an outlook per goal");
+        assert_eq!(outlook.goal, "Bench Press");
+        assert_eq!(outlook.outlook, GoalOutlook::OnTrack);
+        assert_eq!(outlook.limiter, None);
+        assert_eq!(outlook.readings, 3, "the evidence travels with the verdict");
+        assert!(outlook.projected.is_some_and(|p| (p - 120.5).abs() < 0.1));
     }
 
     /// The correctness requirement of [C6.3]: on a cut a falling number is progress,
@@ -473,22 +573,29 @@ mod tests {
     }
 
     /// A goal whose deadline is too close for the current rate must not be counted
-    /// as on track, however encouraging the trend looks.
+    /// as on track, however encouraging the trend looks. The user is turning up and
+    /// improving, so what does not fit is the date — which is the goal's fault, and
+    /// the distinction [C6.6] needs to give different advice.
     #[tokio::test]
-    async fn a_trend_that_misses_the_deadline_reads_as_behind() {
+    async fn a_trend_that_misses_the_deadline_reads_as_off_track() {
         let (handler, user, msg) = setup().await;
         seed_rising_bench(&handler, user.id, Some(days_from_today(2))).await;
 
         let progress = progress_of(&handler, &msg).await;
         assert_eq!(progress.headline, "0 of 1 goal on track.");
         let note = progress.notes.iter().find(|n| n.starts_with("Bench Press")).unwrap();
-        assert!(note.contains("behind"), "2 days at ~0.5kg/day does not close a 10kg gap: {note}");
+        assert!(note.contains("off track: this rate reaches only 91 kg"), "2 days at ~0.5kg/day does not close a 10kg gap: {note}");
+
+        let outlook = &progress.goals[0];
+        assert_eq!(outlook.outlook, GoalOutlook::OffTrack);
+        assert_eq!(outlook.limiter, Some(GoalLimiter::Ambition), "the training is fine; the deadline never allowed for it");
     }
 
     /// The series still travels for a goal with nothing logged — the client shows an
-    /// empty chart — but it must not be tallied as on track.
+    /// empty chart — but "nothing to project" must not be reported as "not on track".
+    /// With no goal in any other band, that is the headline's whole answer.
     #[tokio::test]
-    async fn a_goal_with_no_readings_says_so_rather_than_guessing() {
+    async fn a_goal_with_no_readings_is_too_early_rather_than_a_failure() {
         let (handler, user, msg) = setup().await;
         {
             let db = handler.db.lock().await;
@@ -500,9 +607,136 @@ mod tests {
         }
 
         let progress = progress_of(&handler, &msg).await;
-        assert_eq!(progress.headline, "0 of 1 goal on track.");
+        assert_eq!(progress.headline, "Too early to say on 1 goal — keep logging and I'll trend it.");
         let note = progress.notes.iter().find(|n| n.starts_with("Bench Press")).unwrap();
         assert!(note.contains("nothing logged yet"), "{note}");
+        assert!(note.contains("too early to say: nothing logged against it yet"), "{note}");
+
+        let outlook = &progress.goals[0];
+        assert_eq!(outlook.outlook, GoalOutlook::TooEarly);
+        assert_eq!(outlook.readings, 0);
+        assert_eq!(outlook.projected, None);
+        assert_eq!(outlook.limiter, None, "an unknown cause is not a diagnosed one");
+    }
+
+    /// Two readings are two readings, however far apart and however encouraging. The
+    /// refusal has to reach the client as a refusal — a number here would be shown.
+    #[tokio::test]
+    async fn two_readings_do_not_make_a_projection() {
+        let (handler, user, msg) = setup().await;
+        {
+            let db = handler.db.lock().await;
+            let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+            let mut goal = new_exercise_goal(user.id, bench.id, 100.0);
+            goal.start_date = days_from_today(-60);
+            goal.target_date = Some(days_from_today(60));
+            db.insert_goal(&goal).unwrap();
+            [(-40, 80.0), (-5, 95.0)].iter().for_each(|(day, kg)| {
+                log_set(&db, user.id, bench.id, MeasurementType::WeightReps, *day, *kg);
+            });
+        }
+
+        let progress = progress_of(&handler, &msg).await;
+        let outlook = &progress.goals[0];
+        assert_eq!(outlook.outlook, GoalOutlook::TooEarly, "15kg in five weeks would sail past 100kg — and it is still two points");
+        assert_eq!(outlook.readings, 2);
+        assert_eq!(outlook.projected, None);
+        let note = progress.notes.iter().find(|n| n.starts_with("Bench Press")).unwrap();
+        assert!(note.contains("too early to say: 2 readings so far"), "{note}");
+    }
+
+    /// Readings bunched into one week give a slope, and a slope over three days is not
+    /// a rate to carry two months forward.
+    #[tokio::test]
+    async fn readings_inside_a_single_week_give_no_rate() {
+        let (handler, user, msg) = setup().await;
+        {
+            let db = handler.db.lock().await;
+            let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+            let mut goal = new_exercise_goal(user.id, bench.id, 100.0);
+            goal.start_date = days_from_today(-60);
+            goal.target_date = Some(days_from_today(60));
+            db.insert_goal(&goal).unwrap();
+            [(-5, 80.0), (-3, 85.0), (-2, 90.0)].iter().for_each(|(day, kg)| {
+                log_set(&db, user.id, bench.id, MeasurementType::WeightReps, *day, *kg);
+            });
+        }
+
+        let progress = progress_of(&handler, &msg).await;
+        let outlook = &progress.goals[0];
+        assert_eq!(outlook.outlook, GoalOutlook::TooEarly, "three readings in three days are one good week");
+        assert_eq!(outlook.readings, 3, "and the readings still travel — it is the rate that is withheld");
+        assert_eq!(outlook.projected, None);
+    }
+
+    /// Adherence dominates ([C4.4]): the bench trend arrives comfortably, and the user
+    /// is not turning up for the sessions that would produce it.
+    #[tokio::test]
+    async fn a_drifting_programme_pulls_an_arriving_goal_back_to_at_risk() {
+        let (handler, user, msg) = setup().await;
+        seed_rising_bench(&handler, user.id, Some(days_from_today(60))).await;
+        seed_programme(&handler, user.id, false).await;
+
+        let progress = progress_of(&handler, &msg).await;
+        assert_eq!(progress.headline, "0 of 1 goal on track — 1 at risk.");
+        let outlook = &progress.goals[0];
+        assert_eq!(outlook.outlook, GoalOutlook::AtRisk);
+        assert_eq!(outlook.limiter, Some(GoalLimiter::Attendance), "turning up outranks the trend line");
+        assert!(outlook.projected.is_some(), "the projection is still a claim, and still travels");
+
+        let note = progress.notes.iter().find(|n| n.starts_with("Bench Press")).unwrap();
+        assert!(note.contains("at risk"), "{note}");
+    }
+
+    /// The same goal under a programme that is being kept to: nothing is in its way,
+    /// so the attendance term must not manufacture a caveat out of a live programme.
+    #[tokio::test]
+    async fn a_programme_that_is_kept_to_leaves_the_verdict_alone() {
+        let (handler, user, msg) = setup().await;
+        seed_rising_bench(&handler, user.id, Some(days_from_today(60))).await;
+        seed_programme(&handler, user.id, true).await;
+
+        let progress = progress_of(&handler, &msg).await;
+        assert_eq!(progress.headline, "1 of 1 goal on track.");
+        assert_eq!(progress.goals[0].outlook, GoalOutlook::OnTrack);
+        assert_eq!(progress.goals[0].limiter, None);
+    }
+
+    /// A settled goal is a record of what happened. Achieved names no cause; a goal
+    /// whose date passed still names one, because that is what the post-mortem in
+    /// [C6.6] is made of.
+    #[tokio::test]
+    async fn settled_goals_report_what_happened() {
+        let (handler, user, msg) = setup().await;
+        {
+            let db = handler.db.lock().await;
+            let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+            let squat = db.get_exercise_type_by_name("Squat").unwrap().unwrap();
+
+            let mut done = new_exercise_goal(user.id, bench.id, 100.0);
+            done.start_date = days_from_today(-90);
+            done.achieved = true;
+            db.insert_goal(&done).unwrap();
+
+            let mut lapsed = new_exercise_goal(user.id, squat.id, 140.0);
+            lapsed.start_date = days_from_today(-90);
+            lapsed.target_date = Some(days_from_today(-2));
+            db.insert_goal(&lapsed).unwrap();
+            [(-60, 100.0), (-30, 110.0), (-10, 120.0)].iter().for_each(|(day, kg)| {
+                log_set(&db, user.id, squat.id, MeasurementType::WeightReps, *day, *kg);
+            });
+        }
+
+        let progress = progress_of(&handler, &msg).await;
+        let done = progress.goals.iter().find(|g| g.goal == "Bench Press").expect("the achieved goal");
+        assert_eq!(done.outlook, GoalOutlook::Achieved);
+        assert_eq!(done.limiter, None);
+        assert_eq!(done.projected, None, "there is nothing left to project");
+
+        let lapsed = progress.goals.iter().find(|g| g.goal == "Squat").expect("the lapsed goal");
+        assert_eq!(lapsed.outlook, GoalOutlook::Missed);
+        assert_eq!(lapsed.limiter, Some(GoalLimiter::Ambition), "20kg in two months was real progress towards an unreachable date");
+        assert_eq!(progress.headline, "1 of 2 goals on track.");
     }
 
     /// Recent work becomes the one breakdown in the view: buckets, not a timeline,
@@ -525,14 +759,24 @@ mod tests {
 
     // ── The arithmetic ───────────────────────────────────────────────────────
 
-    /// The comparison the whole command turns on.
+    /// The headline is the one line every client leads with, so each band has to be
+    /// visible in it — and "too early to say" must never be counted as a failure.
     #[test]
-    fn reaches_is_direction_aware() {
-        assert!(reaches(Direction::Higher, 100.0, 100.0));
-        assert!(!reaches(Direction::Higher, 99.0, 100.0));
-        assert!(reaches(Direction::Lower, 79.0, 80.0), "under the target is success for a cut");
-        assert!(!reaches(Direction::Lower, 81.0, 80.0));
-        assert!(!reaches(Direction::Neutral, 100.0, 100.0), "a series with no better end never arrives");
+    fn the_headline_names_the_bands_a_count_would_hide() {
+        use GoalOutlook::*;
+        assert_eq!(headline(&[]), "No goals on file yet — tell me what you're working towards and I'll track it here.");
+        assert_eq!(headline(&[OnTrack]), "1 of 1 goal on track.");
+        assert_eq!(headline(&[OnTrack, Achieved, OffTrack]), "2 of 3 goals on track.", "off track is already implied by the count");
+        assert_eq!(headline(&[OnTrack, AtRisk, TooEarly]), "1 of 3 goals on track — 1 at risk, 1 too early to say.");
+        assert_eq!(headline(&[TooEarly, TooEarly]), "Too early to say on 2 goals — keep logging and I'll trend them.");
+    }
+
+    /// The evidence behind a refusal to project, said rather than implied.
+    #[test]
+    fn the_evidence_label_says_what_is_missing() {
+        assert_eq!(evidence_label(0), "nothing logged against it yet");
+        assert_eq!(evidence_label(1), "one reading so far");
+        assert_eq!(evidence_label(2), "2 readings so far, and no trend across them yet");
     }
 
     #[test]

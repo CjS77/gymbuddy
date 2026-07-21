@@ -585,6 +585,7 @@ mod tests {
                 points: points(&[("2026-05-01", 80.0), ("2026-06-01", 85.0), ("2026-07-01", 92.5)]),
             }],
             notes: vec!["Squat has too few sessions to trend.".into()],
+            goals: vec![],
         });
         let (html, mode) = Telegram.render(&view);
         assert_eq!(mode, Some("HTML"));
@@ -755,6 +756,7 @@ mod tests {
                 points: points(&[("2026-05-01", 90.0), ("2026-06-01", 87.5)]),
             }],
             notes: vec![],
+            goals: vec![],
         });
         let (html, _) = Telegram.render(&view);
         assert!(html.contains("90 → 87.5 kg (-2.5, better)"), "got: {html}");
@@ -775,6 +777,7 @@ mod tests {
                 points: points(&[("Chest", 12.0), ("Back", 16.0), ("Legs", 9.0)]),
             }],
             notes: vec![],
+            goals: vec![],
         });
         let (html, _) = Telegram.render(&view);
         // Labels are padded to a common width, and the largest bucket fills the bar.
@@ -796,6 +799,7 @@ mod tests {
                 points: points(&[("A & B", 5.0)]),
             }],
             notes: vec!["<not markup>".into()],
+            goals: vec![],
         });
         let (html, _) = Telegram.render(&view);
         assert!(html.contains("Progress &amp; &lt;goals&gt;"), "got: {html}");

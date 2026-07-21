@@ -965,6 +965,7 @@ mod tests {
                 points: series_points(&[("2026-05-01", 80.0), ("2026-06-01", 85.0), ("2026-07-01", 92.5)]),
             }],
             notes: vec![],
+            goals: vec![],
         })
     }
 
@@ -1049,6 +1050,7 @@ mod tests {
             headline: "Cutting".into(),
             series: vec![series.clone()],
             notes: vec![],
+            goals: vec![],
         }));
         let text = flat(&lines);
         assert!(text.contains("█▁"), "the readings are plotted as logged: {text}");
@@ -1063,6 +1065,7 @@ mod tests {
             headline: "Bulking".into(),
             series: vec![bulking],
             notes: vec![],
+            goals: vec![],
         })));
         assert!(text.contains("(-2.5, worse)"), "got: {text}");
     }
@@ -1083,7 +1086,7 @@ mod tests {
         // The y-axis runs low-to-high whichever way "better" points, so a falling
         // series still starts at the top of the chart.
         let plot_colours = |series: SeriesView| -> Vec<Color> {
-            let view = View::Progress(ProgressView { headline: "Cutting".into(), series: vec![series], notes: vec![] });
+            let view = View::Progress(ProgressView { headline: "Cutting".into(), series: vec![series], notes: vec![], goals: vec![] });
             render(&view)
                 .iter()
                 .flat_map(|line| line.spans.clone())
@@ -1117,6 +1120,7 @@ mod tests {
                 points: series_points(&[("Chest", 12.0), ("Back", 16.0), ("Legs", 9.0)]),
             }],
             notes: vec![],
+            goals: vec![],
         });
 
         let bars = |width: u16| -> Vec<usize> {

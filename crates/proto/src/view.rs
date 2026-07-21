@@ -681,22 +681,348 @@ impl SeriesView {
     pub fn latest_line(&self) -> String {
         self.latest().map(|p| format!("{} ({})", self.value_label(p.value), p.label)).unwrap_or_default()
     }
+
+    /// Whether `value` clears a [`SeriesShape::Trajectory`]'s target, the way
+    /// [`better`](Self::better) runs — below the target is success for a cut.
+    ///
+    /// `false` for every other shape: a series with no target never arrives at one,
+    /// and neither does a [`Direction::Neutral`] one, which has no better end to
+    /// arrive at.
+    pub fn reaches(&self, value: f64) -> bool {
+        let SeriesShape::Trajectory { target } = self.shape else {
+            return false;
+        };
+        match self.better {
+            Direction::Higher => value >= target,
+            Direction::Lower => value <= target,
+            Direction::Neutral => false,
+        }
+    }
+
+    /// How much of the distance from the latest reading to a
+    /// [`SeriesShape::Trajectory`]'s target `value` covers: `1.0` arrives, `0.5` gets
+    /// halfway, `0.0` stands still and negative moves away from it.
+    ///
+    /// Direction-free by construction — the target is subtracted from the same end
+    /// for a cut as for a lift — so callers grade a shortfall without re-deriving
+    /// which way "better" runs. `None` when there is no target, no reading to measure
+    /// from, or the target is already met exactly, which leaves nothing to cover.
+    pub fn coverage(&self, value: f64) -> Option<f64> {
+        let SeriesShape::Trajectory { target } = self.shape else {
+            return None;
+        };
+        let latest = self.latest()?.value;
+        let gap = target - latest;
+        (gap != 0.0).then(|| (value - latest) / gap)
+    }
+}
+
+// ── goal outlook ([C6.4]) ────────────────────────────────────────────────────────
+
+/// The fewest readings an outlook may be projected from.
+///
+/// Two points draw a line through any two accidents; three is the fewest that can
+/// disagree with each other. Below this the answer is [`GoalOutlook::TooEarly`], and
+/// [`GoalOutlookView::assess`] drops the projected value rather than carry a number
+/// it will not stand behind.
+pub const MIN_PROJECTION_READINGS: usize = 3;
+
+/// The shortest span of readings, in days, a rate may be extrapolated from. Three
+/// good sets inside one week are a good week, not a trend to carry across a training
+/// block. Enforced by whoever computes the rate — it needs a calendar, and this crate
+/// deliberately has none.
+pub const MIN_PROJECTION_DAYS: i64 = 7;
+
+/// How much of the remaining gap a rate has to close by the deadline before the
+/// shortfall stops being a near miss. Three quarters: at that point a push, a
+/// deadline nudge or a slightly kinder target still gets there, which is "at risk";
+/// below it the plan does not arrive, which is "off track".
+const AT_RISK_COVERAGE: f64 = 0.75;
+
+/// How likely a goal is to land, in the only vocabulary this data supports ([C6.4]).
+///
+/// Four bands and no percentage, deliberately. A goal projection is a straight line
+/// through a handful of noisy, sparse, self-reported readings; "87% likely" claims a
+/// precision that is not there, and a user who is shown a number believes it. These
+/// are the answers a PT would actually give.
+///
+/// [`TooEarly`](Self::TooEarly) is a verdict, not a missing value. It sits at tag 0
+/// so the most conservative answer is also the cheapest thing to say, and it must
+/// survive the wire as itself rather than collapsing into "not on track" — those are
+/// different claims, and only one of them is true of a user who has just started.
+///
+/// Rides inside `View::Progress`, so its variant order is wire format: append only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GoalOutlook {
+    /// Not enough logged to project from: too few readings, or too little time
+    /// between them. "Ask me again in a fortnight", and a real answer.
+    TooEarly,
+    /// The current trend arrives by the target date — or, for an open-ended goal, is
+    /// moving the right way — and the sessions behind it are happening.
+    OnTrack,
+    /// It nearly arrives, or it arrives on paper while the sessions are being missed.
+    /// Recoverable, and worth saying out loud before it is not.
+    AtRisk,
+    /// The current trend does not get there, and not by a little.
+    OffTrack,
+    /// Already met. A record of what happened, not a projection.
+    Achieved,
+    /// The target date passed without it. Also a record — kept in this enum so a goal
+    /// always has exactly one outlook, and so a post-mortem can still name what went
+    /// wrong ([`GoalLimiter`]).
+    Missed,
+}
+
+impl GoalOutlook {
+    /// The verdict in the words a client should use, e.g. `too early to say`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::TooEarly => "too early to say",
+            Self::OnTrack => "on track",
+            Self::AtRisk => "at risk",
+            Self::OffTrack => "off track",
+            Self::Achieved => "achieved",
+            Self::Missed => "missed",
+        }
+    }
+
+    /// Whether the goal is finished either way — a record rather than a forecast.
+    pub fn is_settled(&self) -> bool {
+        matches!(self, Self::Achieved | Self::Missed)
+    }
+
+    /// Whether this verdict is a claim about where the goal lands. `false` for
+    /// [`TooEarly`](Self::TooEarly) and for both settled outcomes, so a client can
+    /// tell "I project you miss" from "I am not projecting".
+    pub fn is_projection(&self) -> bool {
+        matches!(self, Self::OnTrack | Self::AtRisk | Self::OffTrack)
+    }
+}
+
+/// What is holding a goal back — the cause a shortfall commentary hangs off ([C6.6]).
+///
+/// Exactly three, because a goal that is not landing fails in exactly three ways, and
+/// the remedy differs completely between them: turn up, train harder, or fix the
+/// goal. Carried rather than re-derived so the diagnosis is made once, next to the
+/// evidence, instead of being guessed at from prose further down the pipeline.
+///
+/// Rides inside `View::Progress`: append only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GoalLimiter {
+    /// The sessions are not happening. A live programme is drifting ([C4.4]), and
+    /// turning up is the best predictor there is — so this outranks whatever the
+    /// trend line says.
+    Attendance,
+    /// The sessions are happening and the numbers are not moving, or are moving the
+    /// wrong way. The training, not the diary.
+    Performance,
+    /// Attendance and trend are both fine and the arithmetic still does not fit the
+    /// date: the goal was set beyond what the time allows. The one cause that is not
+    /// the user's to fix by training harder.
+    Ambition,
+}
+
+impl GoalLimiter {
+    /// What to tell the user is in the way, e.g. `sessions are being missed`.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Attendance => "sessions are being missed",
+            Self::Performance => "the sessions are happening, the numbers are not moving",
+            Self::Ambition => "the trend is fine — the target date never allowed for it",
+        }
+    }
+}
+
+/// How the user is turning up, as the outlook's dominant term ([C4.4]).
+///
+/// An *input* to [`GoalOutlookView::assess`], not wire data: the server derives it
+/// from the live programme's drift, and what reaches a client is the verdict it
+/// produced plus, where it bites, [`GoalLimiter::Attendance`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Adherence {
+    /// No programme is live, so there is no attendance to judge and the outlook rests
+    /// on the readings alone. The default: absent evidence must not read as bad news.
+    #[default]
+    Unprogrammed,
+    /// A programme is live and is being kept to.
+    Keeping,
+    /// A programme is live and a recurring day is being consistently missed.
+    Drifting,
+}
+
+/// One goal's projected outlook ([C6.4]): the verdict, what is holding it back, and
+/// the evidence the verdict rests on.
+///
+/// The evidence travels because the verdict alone invites over-reading: three
+/// readings and thirty produce the same four words, and a client (or [C6.6]) that
+/// wants to hedge needs to know which it has. `projected` is present only when a
+/// projection was actually made — see [`GoalOutlook::is_projection`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GoalOutlookView {
+    /// The goal's subject, e.g. "Bench Press" or "Bodyweight" — the head of its
+    /// series title, so a client can pair the two.
+    pub goal: String,
+    pub outlook: GoalOutlook,
+    /// What is in the way. `None` when nothing is (on track, achieved) and when there
+    /// is too little evidence to name a cause (too early) — an unknown cause must not
+    /// be dressed up as a diagnosed one.
+    pub limiter: Option<GoalLimiter>,
+    /// Where the current rate lands by `target_date`, in the series' unit. `None`
+    /// whenever no projection was made, which is most of the honest cases.
+    pub projected: Option<f64>,
+    /// The date the goal aims at; `None` for an open-ended goal.
+    pub target_date: Option<String>,
+    /// How many readings the verdict rests on.
+    pub readings: u32,
+}
+
+impl GoalOutlookView {
+    /// Read a live goal's outlook off its trend, its deadline and the user's
+    /// attendance.
+    ///
+    /// `projected` is where the caller's rate lands by `target_date` — `None` for an
+    /// open-ended goal, and `None` whenever the readings were too thin or too
+    /// bunched to give a rate at all (see [`MIN_PROJECTION_DAYS`]). It is dropped
+    /// here too if the series has fewer than [`MIN_PROJECTION_READINGS`] points: the
+    /// refusal to project belongs in the model, not in a client's wording.
+    ///
+    /// The verdict on the movement comes from [`SeriesView::improving`], never from a
+    /// raw slope — a flat series and a neutral one have no verdict to give, and
+    /// inventing one is the whole failure mode this type exists to prevent.
+    pub fn assess(
+        goal: impl Into<String>,
+        series: &SeriesView,
+        projected: Option<f64>,
+        target_date: Option<String>,
+        adherence: Adherence,
+    ) -> Self {
+        let projected = (series.points.len() >= MIN_PROJECTION_READINGS).then_some(projected).flatten();
+        let outlook = trend_outlook(series, projected, target_date.is_some());
+        let (outlook, limiter) = under_adherence(outlook, series, adherence);
+        Self { outlook, limiter, projected: outlook.is_projection().then_some(projected).flatten(), ..Self::of(goal, series, target_date) }
+    }
+
+    /// A goal already met. Nothing is in its way and there is nothing left to project.
+    pub fn achieved(goal: impl Into<String>, series: &SeriesView, target_date: Option<String>) -> Self {
+        Self { outlook: GoalOutlook::Achieved, ..Self::of(goal, series, target_date) }
+    }
+
+    /// A goal whose target date passed without it. Settled, and still diagnosed: what
+    /// went wrong is exactly what [C6.6] needs to talk about afterwards.
+    pub fn missed(goal: impl Into<String>, series: &SeriesView, target_date: Option<String>, adherence: Adherence) -> Self {
+        Self { outlook: GoalOutlook::Missed, limiter: Some(limiter(series, adherence)), ..Self::of(goal, series, target_date) }
+    }
+
+    /// The shared skeleton: the subject, the deadline and the weight of evidence.
+    fn of(goal: impl Into<String>, series: &SeriesView, target_date: Option<String>) -> Self {
+        Self {
+            goal: goal.into(),
+            outlook: GoalOutlook::TooEarly,
+            limiter: None,
+            projected: None,
+            target_date,
+            readings: series.points.len() as u32,
+        }
+    }
+
+    /// The outlook as one line, e.g.
+    /// `Bench Press — off track: the trend is fine — the target date never allowed for it`.
+    /// Plain text; styling stays at the renderer.
+    pub fn line(&self) -> String {
+        match self.limiter {
+            Some(limiter) => format!("{} — {}: {}", self.goal, self.outlook.label(), limiter.reason()),
+            None => format!("{} — {}", self.goal, self.outlook.label()),
+        }
+    }
+}
+
+/// The band the readings alone put a live goal in, before attendance has its say.
+fn trend_outlook(series: &SeriesView, projected: Option<f64>, dated: bool) -> GoalOutlook {
+    if series.points.len() < MIN_PROJECTION_READINGS {
+        return GoalOutlook::TooEarly;
+    }
+    match (projected, dated) {
+        // A dated goal with a rate: grade how much of the remaining gap it closes.
+        (Some(value), _) => shortfall(series, value),
+        // A dated goal whose readings gave no rate — nothing to extrapolate from.
+        (None, true) => GoalOutlook::TooEarly,
+        // Open-ended: there is no date to arrive by, so the only question is whether
+        // it is moving the right way at all.
+        (None, false) => match series.improving() {
+            Some(true) => GoalOutlook::OnTrack,
+            Some(false) => GoalOutlook::OffTrack,
+            None => GoalOutlook::TooEarly,
+        },
+    }
+}
+
+/// Grade a projection that has a target to be measured against.
+fn shortfall(series: &SeriesView, projected: f64) -> GoalOutlook {
+    if series.reaches(projected) {
+        return GoalOutlook::OnTrack;
+    }
+    match series.coverage(projected) {
+        Some(covered) if covered >= AT_RISK_COVERAGE => GoalOutlook::AtRisk,
+        _ => GoalOutlook::OffTrack,
+    }
+}
+
+/// Let attendance dominate, and name the cause of anything short of on track.
+///
+/// Nobody is on track while they are not turning up, and missed sessions are a
+/// verdict where a thin trend line is not: a drifting programme is enough to call a
+/// goal at risk on its own, which is the [C4.4] signal doing the work the readings
+/// cannot.
+fn under_adherence(outlook: GoalOutlook, series: &SeriesView, adherence: Adherence) -> (GoalOutlook, Option<GoalLimiter>) {
+    if adherence == Adherence::Drifting {
+        let outlook = match outlook {
+            GoalOutlook::OffTrack => GoalOutlook::OffTrack,
+            _ => GoalOutlook::AtRisk,
+        };
+        return (outlook, Some(GoalLimiter::Attendance));
+    }
+    match outlook {
+        GoalOutlook::AtRisk | GoalOutlook::OffTrack => (outlook, Some(limiter(series, adherence))),
+        _ => (outlook, None),
+    }
+}
+
+/// Which of the three things is in the way of a goal that is not landing.
+fn limiter(series: &SeriesView, adherence: Adherence) -> GoalLimiter {
+    match (adherence, series.improving()) {
+        (Adherence::Drifting, _) => GoalLimiter::Attendance,
+        // Turning up, moving the right way, and it still does not arrive: the target
+        // or the date is what does not fit, and no amount of training fixes that.
+        (_, Some(true)) => GoalLimiter::Ambition,
+        _ => GoalLimiter::Performance,
+    }
 }
 
 /// Progress against the user's goals ( `/progress` ): a headline plus the chartable
 /// series behind it.
 ///
-/// Holds nothing but [`SeriesView`]s and text, so every chart in the app — here, and
-/// in the post-session review — travels through the same contract rather than
-/// growing a second one.
+/// Holds nothing but [`SeriesView`]s, outlooks and text, so every chart in the app —
+/// here, and in the post-session review — travels through the same contract rather
+/// than growing a second one.
+///
+/// [C6.4] appended `goals`. The append-only rule in the crate root otherwise forbids
+/// that for an existing type, and the exemption is the same one [R2.1] used on
+/// `ProgrammeView`: `ProgressView` was introduced after 0.22.0 and has never been in
+/// a release, so no deployed peer has ever decoded one and there are no old bytes to
+/// misparse. Once it ships, this struct is closed like every other.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProgressView {
     /// The server's one-line answer to "how am I doing", e.g. "2 of 3 goals on track".
     pub headline: String,
     pub series: Vec<SeriesView>,
     /// Free-text caveats — a goal with too little data to chart, a metric not logged
-    /// recently enough to trend.
+    /// recently enough to trend. Also where each goal's sentence lands, in the order
+    /// its outlook appears in [`goals`](Self::goals).
     pub notes: Vec<String>,
+    /// One outlook per goal, in the same order as the goal series ([C6.4]): the
+    /// structured half of what `notes` says in prose, so a client — or the shortfall
+    /// commentary in [C6.6] — reads a verdict and a cause rather than parsing English.
+    pub goals: Vec<GoalOutlookView>,
 }
 
 impl ProgressView {
@@ -1033,7 +1359,7 @@ pub(crate) mod tests {
             View::Progress(progress_view()),
             // A headline the server left empty is the case that would otherwise
             // fall through to an empty message.
-            View::Progress(ProgressView { headline: String::new(), series: vec![], notes: vec![] }),
+            View::Progress(ProgressView { headline: String::new(), series: vec![], notes: vec![], goals: vec![] }),
             View::SessionReview(Box::new(session_review_view())),
             View::SessionReview(Box::new(SessionReviewView { headline: String::new(), ..session_review_view() })),
             View::ProgrammeProgress(Box::new(programme_progress_view())),
@@ -1049,6 +1375,10 @@ pub(crate) mod tests {
             headline: "2 of 3 goals on track".into(),
             series: vec![trend(), bodyweight(), breakdown()],
             notes: vec!["Squat has too few sessions to trend yet.".into()],
+            goals: vec![
+                GoalOutlookView::assess("Bench Press", &trend(), Some(120.5), Some("2026-12-31".into()), Adherence::Keeping),
+                GoalOutlookView::assess("Squat", &sparse(), None, Some("2026-12-31".into()), Adherence::Unprogrammed),
+            ],
         }
     }
 
@@ -1196,6 +1526,11 @@ pub(crate) mod tests {
         }
     }
 
+    /// Two readings a fortnight apart: real movement, and still not a trend.
+    fn sparse() -> SeriesView {
+        SeriesView { points: points(&[("2026-06-01", 80.0), ("2026-06-15", 85.0)]), ..trend() }
+    }
+
     /// Muscle-group volume: buckets, not a timeline.
     fn breakdown() -> SeriesView {
         SeriesView {
@@ -1315,11 +1650,170 @@ pub(crate) mod tests {
     fn progress_summary_falls_back_to_a_count() {
         assert_eq!(progress_view().summary_line(), "2 of 3 goals on track");
 
-        let one = ProgressView { headline: "  ".into(), series: vec![trend()], notes: vec![] };
+        let one = ProgressView { headline: "  ".into(), series: vec![trend()], notes: vec![], goals: vec![] };
         assert_eq!(one.summary_line(), "Here's your progress (1 chart).");
 
-        let none = ProgressView { headline: String::new(), series: vec![], notes: vec![] };
+        let none = ProgressView { headline: String::new(), series: vec![], notes: vec![], goals: vec![] };
         assert_eq!(none.summary_line(), "Here's your progress (0 charts).");
+    }
+
+    // ── goal outlook ([C6.4]) ────────────────────────────────────────────────
+
+    /// A three-reading trend that clears its target is the one case the four bands
+    /// are allowed to say "yes" to, and nothing is in its way.
+    #[test]
+    fn a_trend_that_arrives_reads_as_on_track() {
+        let outlook = GoalOutlookView::assess("Bench Press", &trend(), Some(120.5), Some("2026-12-31".into()), Adherence::Keeping);
+        assert_eq!(outlook.outlook, GoalOutlook::OnTrack);
+        assert_eq!(outlook.limiter, None, "nothing is in the way of a goal that lands");
+        assert_eq!(outlook.projected, Some(120.5));
+        assert_eq!(outlook.readings, 3);
+        assert_eq!(outlook.line(), "Bench Press — on track");
+    }
+
+    /// Two points are a line through two accidents. The refusal has to live in the
+    /// model: the caller may hand over a projection and it is still dropped, because
+    /// a client that receives a number will show it.
+    #[test]
+    fn two_readings_are_too_early_to_say_however_good_they_look() {
+        let outlook = GoalOutlookView::assess("Bench Press", &sparse(), Some(140.0), Some("2026-12-31".into()), Adherence::Keeping);
+        assert_eq!(outlook.outlook, GoalOutlook::TooEarly);
+        assert_eq!(outlook.projected, None, "the number must not travel — a client would render it");
+        assert_eq!(outlook.limiter, None, "an unknown cause is not a diagnosed one");
+        assert_eq!(outlook.readings, 2);
+        assert!(!outlook.outlook.is_projection());
+        assert_eq!(outlook.line(), "Bench Press — too early to say");
+    }
+
+    /// The sparsest case of all, and the one a user sees on day one: a goal with
+    /// nothing logged against it is not failing, it has not started.
+    #[test]
+    fn a_goal_with_no_readings_is_too_early_not_off_track() {
+        let empty = SeriesView { points: vec![], ..trend() };
+        let outlook = GoalOutlookView::assess("Squat", &empty, None, Some("2026-12-31".into()), Adherence::Unprogrammed);
+        assert_eq!(outlook.outlook, GoalOutlook::TooEarly);
+        assert_eq!(outlook.readings, 0);
+        assert_eq!(outlook.projected, None);
+    }
+
+    /// Enough readings, but bunched inside a day or two, so the caller could give no
+    /// rate. "No rate" and "a rate that misses" are different answers.
+    #[test]
+    fn readings_that_give_no_rate_are_too_early_too() {
+        let bunched = SeriesView { points: points(&[("2026-06-01", 80.0), ("2026-06-01", 82.5), ("2026-06-01", 85.0)]), ..trend() };
+        let outlook = GoalOutlookView::assess("Bench Press", &bunched, None, Some("2026-12-31".into()), Adherence::Keeping);
+        assert_eq!(outlook.outlook, GoalOutlook::TooEarly, "three points inside one day are one session, not a trend");
+    }
+
+    /// A near miss and a hopeless one are different news, and the split is a stated
+    /// fraction of the remaining gap rather than a feeling.
+    #[test]
+    fn a_near_miss_is_at_risk_and_a_wide_one_is_off_track() {
+        let near = GoalOutlookView::assess("Bench Press", &trend(), Some(98.5), Some("2026-12-31".into()), Adherence::Keeping);
+        assert_eq!(near.outlook, GoalOutlook::AtRisk, "92.5 → 98.5 closes 80% of the 7.5 kg still owed");
+        assert_eq!(near.projected, Some(98.5), "a projection that is a claim still travels");
+
+        let wide = GoalOutlookView::assess("Bench Press", &trend(), Some(93.0), Some("2026-12-31".into()), Adherence::Keeping);
+        assert_eq!(wide.outlook, GoalOutlook::OffTrack, "and 92.5 → 93 closes 7% of it");
+    }
+
+    /// The user is turning up and improving, and the sum still does not work: that is
+    /// the goal's fault, not theirs, and [C6.6] has to be able to say so.
+    #[test]
+    fn a_goal_the_time_never_allowed_for_blames_the_goal() {
+        let wide = GoalOutlookView::assess("Bench Press", &trend(), Some(93.0), Some("2026-08-01".into()), Adherence::Keeping);
+        assert_eq!(wide.limiter, Some(GoalLimiter::Ambition));
+        assert_eq!(wide.line(), "Bench Press — off track: the trend is fine — the target date never allowed for it");
+    }
+
+    /// Turning up and going backwards is a training problem, and must not be
+    /// confused with the two causes that are not.
+    #[test]
+    fn a_trend_going_the_wrong_way_blames_the_training() {
+        let regressed = SeriesView { points: points(&[("2026-05-01", 92.5), ("2026-06-01", 88.0), ("2026-07-01", 85.0)]), ..trend() };
+        let outlook = GoalOutlookView::assess("Bench Press", &regressed, Some(80.0), Some("2026-12-31".into()), Adherence::Keeping);
+        assert_eq!(outlook.outlook, GoalOutlook::OffTrack);
+        assert_eq!(outlook.limiter, Some(GoalLimiter::Performance));
+    }
+
+    /// Adherence dominates: the readings say this lands, the diary says the user is
+    /// not there for it. Nobody is on track while they are missing sessions.
+    #[test]
+    fn a_drifting_programme_pulls_a_landing_trend_back_to_at_risk() {
+        let kept = GoalOutlookView::assess("Bench Press", &trend(), Some(120.5), Some("2026-12-31".into()), Adherence::Keeping);
+        assert_eq!(kept.outlook, GoalOutlook::OnTrack);
+
+        let drifting = GoalOutlookView::assess("Bench Press", &trend(), Some(120.5), Some("2026-12-31".into()), Adherence::Drifting);
+        assert_eq!(drifting.outlook, GoalOutlook::AtRisk);
+        assert_eq!(drifting.limiter, Some(GoalLimiter::Attendance), "attendance outranks the trend line");
+        assert_eq!(drifting.projected, Some(120.5), "the projection is still a claim, and still travels");
+    }
+
+    /// Missed sessions are a verdict where a thin trend is not: not turning up is
+    /// evidence in its own right, so "too early to say" is not the last word when
+    /// the diary already says something.
+    #[test]
+    fn drift_speaks_where_the_readings_cannot() {
+        let outlook = GoalOutlookView::assess("Squat", &sparse(), None, Some("2026-12-31".into()), Adherence::Drifting);
+        assert_eq!(outlook.outlook, GoalOutlook::AtRisk);
+        assert_eq!(outlook.limiter, Some(GoalLimiter::Attendance));
+        assert_eq!(outlook.projected, None, "and it still invents no number");
+    }
+
+    /// An open-ended goal has no date to arrive by, so the only honest question is
+    /// whether it is moving the right way — read off `improving()`, never a slope.
+    #[test]
+    fn an_open_ended_goal_is_judged_on_movement_alone() {
+        let rising = GoalOutlookView::assess("Bench Press", &trend(), None, None, Adherence::Unprogrammed);
+        assert_eq!(rising.outlook, GoalOutlook::OnTrack);
+        assert_eq!(rising.target_date, None);
+
+        let flat = SeriesView { points: points(&[("2026-05-01", 90.0), ("2026-06-01", 90.0), ("2026-07-01", 90.0)]), ..trend() };
+        let stalled = GoalOutlookView::assess("Bench Press", &flat, None, None, Adherence::Unprogrammed);
+        assert_eq!(stalled.outlook, GoalOutlook::TooEarly, "no movement is no verdict, not a bad one");
+    }
+
+    /// A settled goal is a record. Achieved names no cause; missed still does, so a
+    /// post-mortem has something to work from.
+    #[test]
+    fn settled_goals_carry_records_not_forecasts() {
+        let done = GoalOutlookView::achieved("Overhead Press", &trend(), Some("2026-12-31".into()));
+        assert!(done.outlook.is_settled() && !done.outlook.is_projection());
+        assert_eq!(done.limiter, None);
+        assert_eq!(done.projected, None, "there is nothing left to project");
+
+        let missed = GoalOutlookView::missed("Squat", &sparse(), Some("2026-01-01".into()), Adherence::Drifting);
+        assert!(missed.outlook.is_settled());
+        assert_eq!(missed.limiter, Some(GoalLimiter::Attendance), "a post-mortem still names what went wrong");
+    }
+
+    /// Direction-awareness runs through the projection too: on a cut, under the
+    /// target is success and coverage is measured from the same end.
+    #[test]
+    fn reaching_and_coverage_are_direction_aware() {
+        let cut = SeriesView { shape: SeriesShape::Trajectory { target: 80.0 }, ..bodyweight() };
+        assert!(cut.reaches(79.0), "under the target is success for a cut");
+        assert!(!cut.reaches(81.0));
+        assert!((cut.coverage(85.0).unwrap() - 1.0 / 3.0).abs() < 1e-9, "87.5 → 85 of a 7.5 kg gap");
+        assert!(cut.coverage(90.0).unwrap() < 0.0, "moving away from the target covers less than nothing");
+
+        assert!(trend().reaches(100.0), "hitting a rising target exactly counts");
+        assert_eq!(bodyweight().coverage(85.0), None, "a plain trend has no target to cover");
+        assert!(!breakdown().reaches(20.0), "a series with no better end never arrives");
+    }
+
+    /// A cut whose weight is falling nicely and still not fast enough lands in the
+    /// same bands as a lift — the arithmetic must not flip with the direction.
+    #[test]
+    fn a_cut_that_misses_its_date_is_graded_like_any_other_goal() {
+        let cut = SeriesView { shape: SeriesShape::Trajectory { target: 80.0 }, ..bodyweight() };
+        let near = GoalOutlookView::assess("Bodyweight", &cut, Some(82.0), Some("2026-12-31".into()), Adherence::Keeping);
+        assert_eq!(near.outlook, GoalOutlook::TooEarly, "two weigh-ins are still two points");
+
+        let three = SeriesView { points: points(&[("2026-05-01", 90.0), ("2026-06-01", 88.0), ("2026-07-01", 87.5)]), ..cut };
+        let outlook = GoalOutlookView::assess("Bodyweight", &three, Some(81.5), Some("2026-12-31".into()), Adherence::Keeping);
+        assert_eq!(outlook.outlook, GoalOutlook::AtRisk, "87.5 → 81.5 sheds 80% of the 7.5 kg still owed");
+        assert_eq!(outlook.limiter, Some(GoalLimiter::Ambition), "the weight is coming off; the date is the problem");
     }
 
     /// A representative designed programme, shared by the tests below.

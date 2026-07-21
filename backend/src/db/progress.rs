@@ -2,7 +2,9 @@ use anyhow::Context as _;
 use rusqlite::{OptionalExtension as _, params};
 
 use super::database::Database;
-use super::models::{Goal, GoalDirection, GoalKind, GoalProgress, GoalStatus, MeasurementType, MuscleRecovery, TimeSeries, TimeSeriesPoint};
+use super::models::{
+    Goal, GoalDirection, GoalKind, GoalProgress, GoalStatus, MeasurementType, MuscleRecovery, ProgrammeDrift, TimeSeries, TimeSeriesPoint,
+};
 
 /// Fraction of the target reached, as a percentage, honouring `direction`. For an
 /// increase goal this is `current / target`; for a decrease goal (weightloss, a
@@ -237,6 +239,21 @@ impl Database {
             .collect()
     }
 
+    /// How the user is keeping to their live programme, or `None` when none is active —
+    /// the adherence term a goal's outlook is dominated by ([C6.4]).
+    ///
+    /// Consumes [C4.4]'s verdict rather than recomputing one: turning up is measured
+    /// once, over the marked slot grid, so a goal projection and the programme status
+    /// can never disagree about whether the user is showing up. `None` is "no programme
+    /// to keep to", which is not the same as keeping to one and must not read as bad
+    /// news.
+    pub fn goal_adherence(&self, user_id: i64, today: &str) -> anyhow::Result<Option<ProgrammeDrift>> {
+        match self.active_programme_for_user(user_id)? {
+            Some(programme) => self.programme_drift(&programme, today).map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// Per top-level muscle group: when it was last trained (any exercise in its
     /// subtree, rolled up via [`Database::descendant_ids_inclusive`]) and how many
     /// sets that most-recent day involved. Every muscle group appears — one never
@@ -305,7 +322,7 @@ impl Database {
 mod tests {
     use super::super::models::{
         GoalDirection, GoalKind, MeasurementType, new_body_metric, new_exercise_entry, new_exercise_goal, new_exercise_set, new_goal,
-        new_user,
+        new_programme, new_programme_slot, new_user,
     };
     use super::*;
 
@@ -446,6 +463,30 @@ mod tests {
         let report = db.goal_progress_report(user_id, Some("2024-01-01"), Some("2025-12-31")).unwrap();
         assert!(report.iter().any(|r| r.status == GoalStatus::Achieved));
         assert!(report.iter().any(|r| r.status == GoalStatus::Failed));
+    }
+
+    /// The adherence term a goal's outlook is dominated by ([C6.4]). Without a live
+    /// programme there is no attendance record at all — which is not the same as a
+    /// bad one — and with one, [C4.4]'s verdict is passed through rather than a second
+    /// count of the same slots being taken here.
+    #[test]
+    fn goal_adherence_passes_through_the_live_programmes_drift() {
+        let db = test_db();
+        let user_id = db.insert_user(&new_user("Tester", None, "UTC")).unwrap();
+        assert!(db.goal_adherence(user_id, "2026-07-25").unwrap().is_none(), "no programme means no attendance to judge");
+
+        let mut draft = new_programme(user_id, "12-week hypertrophy", 2, "upper/lower", "linear");
+        draft.start_date = "2026-07-01".into();
+        let programme_id = db.create_programme(&draft).unwrap();
+        db.activate_programme(programme_id).unwrap();
+        (1..=3).for_each(|week| {
+            db.add_programme_slot(&new_programme_slot(programme_id, week, 1, "upper")).unwrap();
+            db.add_programme_slot(&new_programme_slot(programme_id, week, 2, "lower")).unwrap();
+        });
+
+        let drift = db.goal_adherence(user_id, "2026-07-25").unwrap().expect("a live programme has an attendance record");
+        assert!(!drift.is_on_track(), "three settled weeks with nothing trained is drift");
+        assert_eq!(drift.drifting.len(), 2, "and it is the same per-day verdict /programme status reads");
     }
 
     #[test]
