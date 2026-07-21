@@ -1301,37 +1301,199 @@ mod tests {
         assert!(draft.contains(PROGRAMME_LOCK_IN_ASK));
     }
 
-    /// The [C4.6] report has no layout of its own yet ([T2.1] gives it one), but it must
-    /// still say what it is: an unhandled variant renders as "[unsupported message]", and
-    /// a programme report reaching the user as that would be worse than no report.
-    #[test]
-    fn a_programme_report_announces_itself_before_it_has_a_layout() {
-        let View::Programme(programme) = programme_view(Some(gymbuddy_proto::ProgrammeStatusView {
-            current_week: 3,
-            block_focus: Some("accumulation".into()),
-            next_slot: None,
-            trained: 2,
-            missed: 2,
-            skipped: 0,
-            remaining: 8,
-        })) else {
-            panic!("the fixture builds a programme view");
-        };
-
-        let report = gymbuddy_proto::ProgrammeProgressView {
-            programme: *programme,
-            adherence: gymbuddy_proto::ProgrammeAdherenceView {
-                settled: 4,
-                trained: 2,
-                drifting_days: vec![],
-                reschedule: None,
+    /// The [C4.6] report on a live programme that is drifting: a recurring day the user
+    /// keeps missing, the offer that follows from it, and a goal with enough readings to
+    /// chart.
+    fn full_report() -> ProgrammeProgressView {
+        use gymbuddy_proto::{Direction, ProgrammeBlockView, ProgrammeDayView, ProgrammeSlotView, ProgrammeStatusView, RescheduleView};
+        ProgrammeProgressView {
+            programme: ProgrammeView {
+                title: "12-week hypertrophy".into(),
+                start_date: "2026-07-01".into(),
+                target_end_date: Some("2026-09-23".into()),
+                weeks: 12,
+                days_per_week: 3,
+                split: "upper/lower".into(),
+                progression_policy: "double progression".into(),
+                blocks: vec![ProgrammeBlockView { start_week: 1, end_week: 4, focus: "accumulation".into() }],
+                week_template: vec![ProgrammeDayView { day_idx: 1, focus: "upper".into() }],
+                goals: vec!["Bench Press to 100.0".into()],
+                notes: vec!["Next up: week 3, day 2.".into()],
+                active: true,
+                status: Some(ProgrammeStatusView {
+                    current_week: 3,
+                    block_focus: Some("accumulation".into()),
+                    next_slot: Some(ProgrammeSlotView { week_idx: 3, day_idx: 2, focus: "pull".into() }),
+                    trained: 5,
+                    missed: 1,
+                    skipped: 0,
+                    remaining: 12,
+                }),
             },
-            goals: vec![],
+            adherence: ProgrammeAdherenceView {
+                settled: 6,
+                trained: 5,
+                drifting_days: vec![DayAdherenceView { day_idx: 1, focus: "upper".into(), trained: 1, missed: 3 }],
+                reschedule: Some(RescheduleView::Shift { day_idx: 1, focus: "upper".into() }),
+            },
+            goals: vec![SeriesView {
+                title: "Bench Press".into(),
+                unit: "kg".into(),
+                better: Direction::Higher,
+                shape: SeriesShape::Trajectory { target: 100.0 },
+                points: series_points(&[("2026-05-01", 80.0), ("2026-06-01", 85.0), ("2026-07-01", 92.5)]),
+            }],
+        }
+    }
+
+    fn report_view(report: ProgrammeProgressView) -> View {
+        View::ProgrammeProgress(Box::new(report))
+    }
+
+    /// Whether a line came out of a chart — axis glyphs or braille, none of which the
+    /// report's prose carries.
+    fn is_plotted(line: &Line) -> bool {
+        flat(std::slice::from_ref(line)).chars().any(|c| matches!(c, '│' | '└') || ('\u{2800}'..='\u{28ff}').contains(&c))
+    }
+
+    /// [T2.1]: the whole [C4.6] report reads end to end — the three questions §2 asks of a
+    /// programme, in order. It must never fall through to "[unsupported message]": `View`
+    /// is `#[non_exhaustive]` and `render_view` has a `_` arm, so nothing but this test
+    /// notices a missing variant.
+    #[test]
+    fn programme_report_renders_position_adherence_and_goals() {
+        let text = flat(&render(&report_view(full_report())));
+        // Where am I.
+        assert!(text.contains("12-week hypertrophy — Week 3 of 12 — accumulation"), "the headline places the user: {text}");
+        assert!(text.contains("12 weeks × 3 days/week, upper/lower"), "the shape: {text}");
+        assert!(text.contains("2026-07-01 to 2026-09-23"), "the span: {text}");
+        assert!(text.contains("Next: Week 3, day 2: pull"), "what is next: {text}");
+        assert!(text.contains("5 trained · 1 missed · 0 skipped · 12 to go"), "what is done: {text}");
+        // Am I keeping to it.
+        assert!(text.contains("Keeping to it"), "the adherence section: {text}");
+        assert!(text.contains("Trained 5 of the 6 sessions due so far (83%)"), "the rate: {text}");
+        assert!(text.contains("Day 1 (upper): 1 of 4 trained"), "the drifting day: {text}");
+        assert!(text.contains("Tell me a day that works and I'll shift it."), "Core's offer, verbatim: {text}");
+        // Is it working.
+        assert!(text.contains("Where the goals are heading"), "the trajectory section: {text}");
+        assert!(text.contains("80 → 92.5 kg (+12.5, better)"), "the movement: {text}");
+        assert!(text.contains("Target: 100 kg"), "the target: {text}");
+        assert!(text.contains('│') && text.contains('└'), "a wide transcript charts the goal: {text}");
+
+        assert!(!text.contains("[unsupported message]"), "the variant must not fall through: {text}");
+        assert!(!text.contains('<'), "no HTML markup should appear: {text}");
+        assert!(!text.contains(PROGRAMME_LOCK_IN_ASK), "a live programme is not awaiting confirmation: {text}");
+    }
+
+    /// With a live programme, `/programme` *is* `/programme status` — the report is the
+    /// only way to see the design, so it carries the whole skeleton rather than a summary.
+    #[test]
+    fn programme_report_carries_the_design_it_reports_on() {
+        let text = flat(&render(&report_view(full_report())));
+        assert!(text.contains("Progression: double progression"), "the progression policy: {text}");
+        assert!(text.contains("Goals served"), "the goals the programme serves: {text}");
+        assert!(text.contains("Weeks 1-4: accumulation"), "the blocks: {text}");
+        assert!(text.contains("Day 1: upper"), "the repeating week: {text}");
+        assert!(text.contains("Next up: week 3, day 2."), "the notes: {text}");
+        // The position sentence leads the report, so "Where you are" does not repeat it.
+        assert_eq!(text.matches("Week 3 of 12 — accumulation").count(), 1, "said once, not twice: {text}");
+    }
+
+    /// The goal charts are drawn into a fixed area, so the report must pass the width it
+    /// was given down to them: a plotted row wider than the transcript would be folded by
+    /// the `Paragraph`'s wrap into nonsense. Prose is left unmeasured — the transcript
+    /// wraps that on purpose, and a bullet is not a chart.
+    #[test]
+    fn a_programme_report_keeps_its_charts_inside_the_width() {
+        let view = report_view(full_report());
+        for width in [34u16, 40, 72, 120] {
+            let widest =
+                render_view(&view, width).iter().filter(|l| is_plotted(l)).map(Line::width).max().expect("the goal is charted here");
+            assert!(widest <= width as usize, "a {widest}-wide chart row in a {width}-wide transcript");
+        }
+    }
+
+    /// Below the width axes need, the report degrades exactly as `/progress` does — one
+    /// chart path means one fallback — and everything that is not a chart still reads.
+    #[test]
+    fn a_narrow_programme_report_falls_back_to_the_sparkline() {
+        let lines = render_view(&report_view(full_report()), 20);
+        let text = flat(&lines);
+        assert!(text.contains("▁▄█"), "the readings still move: {text}");
+        assert!(!text.contains('│'), "no room for axes at 20 columns: {text}");
+        assert!(text.contains("2026-05-01 to 2026-07-01"), "the span is said in words instead: {text}");
+        assert!(text.contains("Target: 100 kg"), "the target is still named: {text}");
+        assert!(text.contains("Trained 5 of the 6 sessions due so far (83%)"), "and the report itself still reads: {text}");
+        assert!(lines.iter().filter(|l| is_plotted(l)).all(|l| l.width() <= 20), "the sparkline fits: {text}");
+    }
+
+    /// [K-31], not negotiable: colour must not be the only carrier of meaning. A
+    /// 16-colour terminal can render the warning away, so the drift has to survive having
+    /// every style stripped — which is exactly what `flat` does. The colour is there too,
+    /// underlining the wording rather than doing its job.
+    #[test]
+    fn drift_is_carried_by_words_not_only_by_colour() {
+        let lines = render(&report_view(full_report()));
+        let drifting = flat(&lines);
+        assert!(drifting.contains("Days you keep missing"), "the section names the problem: {drifting}");
+        assert!(drifting.contains("Day 1 (upper): 1 of 4 trained"), "and the day it is about: {drifting}");
+        assert!(drifting.contains("You keep missing day 1 (upper)"), "and the offer that follows: {drifting}");
+
+        let heading = lines.iter().find(|l| flat(std::slice::from_ref(l)) == "Days you keep missing").expect("the drift heading");
+        assert_eq!(heading.spans[0].style.fg, Some(WARNING), "colour underlines the wording");
+
+        // A programme being kept to has no drift section at all — the distinction between
+        // the two states is structural and verbal before it is ever chromatic.
+        let kept = ProgrammeProgressView {
+            adherence: ProgrammeAdherenceView { settled: 6, trained: 6, drifting_days: vec![], reschedule: None },
+            ..full_report()
         };
-        let text = flat(&render(&View::ProgrammeProgress(Box::new(report))));
-        assert!(text.contains("6-week base"), "the programme is named: {text}");
-        assert!(text.contains("Week 3 of 6 — accumulation"), "and the position reaches the user: {text}");
-        assert!(!text.contains("unsupported"), "the variant is handled, however plainly: {text}");
+        let kept = flat(&render(&report_view(kept)));
+        assert!(kept.contains("Trained 6 of the 6 sessions due so far (100%)"), "the rate: {kept}");
+        assert!(!kept.contains("keep missing"), "nothing is drifting: {kept}");
+        assert!(!kept.contains("shift it"), "so there is nothing to offer: {kept}");
+    }
+
+    /// The goal verdict is the series' own `improving()` read, said in words — so the same
+    /// readings against the opposite goal read differently with the colour stripped, and
+    /// the report never invents a verdict from the direction the line happens to run.
+    #[test]
+    fn a_goal_verdict_is_worded_not_only_coloured() {
+        let mut worse = full_report();
+        worse.goals[0].better = gymbuddy_proto::Direction::Lower;
+        let text = flat(&render(&report_view(worse)));
+        assert!(text.contains("80 → 92.5 kg (+12.5, worse)"), "the verdict is in the words: {text}");
+    }
+
+    /// A programme that has only just started: nothing has come due, nothing is drifting,
+    /// no goal has readings. Every optional section is absent rather than rendered empty,
+    /// and no rate is shown for a failure the user has not yet had the chance to have.
+    #[test]
+    fn a_fresh_programme_report_shows_no_verdict_it_has_not_earned() {
+        let fresh = ProgrammeProgressView {
+            adherence: ProgrammeAdherenceView { settled: 0, trained: 0, drifting_days: vec![], reschedule: None },
+            goals: vec![],
+            ..full_report()
+        };
+        let text = flat(&render(&report_view(fresh)));
+        assert!(text.contains("Nothing has come due yet."), "the honest reading: {text}");
+        assert!(!text.contains('%'), "no rate to report: {text}");
+        assert!(!text.contains("Days you keep missing"), "nothing is drifting: {text}");
+        assert!(!text.contains("Where the goals are heading"), "and nothing to chart: {text}");
+        assert!(!text.contains("[unsupported message]"), "the variant is still handled: {text}");
+    }
+
+    /// Once every slot is settled there is no next session to name: the bullet is absent
+    /// rather than empty, and the tally still says where the programme ended up.
+    #[test]
+    fn a_settled_programme_report_names_no_next_slot() {
+        let mut done = full_report();
+        let status = done.programme.status.as_mut().expect("the fixture is live");
+        status.next_slot = None;
+        status.remaining = 0;
+        let text = flat(&render(&report_view(done)));
+        assert!(!text.contains("Next: Week"), "nothing is next: {text}");
+        assert!(text.contains("5 trained · 1 missed · 0 skipped · 0 to go"), "the tally still lands: {text}");
     }
 
     #[test]
