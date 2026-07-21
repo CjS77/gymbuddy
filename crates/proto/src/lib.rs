@@ -11,10 +11,10 @@ pub mod view;
 pub use view::{
     Adherence, CatalogEntry, CatalogGroup, CatalogView, DayAdherenceView, Direction, ExerciseLog, GoalLimiter, GoalOutlook,
     GoalOutlookView, HealthNote, HistoryView, MIN_PROJECTION_DAYS, MIN_PROJECTION_READINGS, Measurement, ProgrammeAdherenceView,
-    ProgrammeBlockView, ProgrammeDayView, ProgrammeProgressView, ProgrammeSlotView, ProgrammeStatusView, ProgrammeView, ProgressView,
-    Render, RescheduleView, ReviewEffortView, ReviewExerciseView, ReviewKindView, ReviewRecordView, RosterExerciseView, SeriesPointView,
-    SeriesShape, SeriesView, SessionReviewView, SessionRosterView, SessionSummaryView, SessionView, SetLine, StatusView, TrainingModeView,
-    View,
+    ProgrammeBlockView, ProgrammeCompleteView, ProgrammeDayView, ProgrammeProgressView, ProgrammeSlotView, ProgrammeStatusView,
+    ProgrammeView, ProgressView, Render, RescheduleView, ReviewEffortView, ReviewExerciseView, ReviewKindView, ReviewRecordView,
+    RosterExerciseView, SeriesPointView, SeriesShape, SeriesView, SessionReviewView, SessionRosterView, SessionSummaryView, SessionView,
+    SetLine, StatusView, TrainingModeView, View,
 };
 
 /// Discriminator placed in confide's `Message::Custom { kind, .. }` so the peer
@@ -151,7 +151,8 @@ pub fn decode_response(data: &[u8]) -> postcard::Result<ServerResponse> {
 mod tests {
     use super::*;
     use view::tests::{
-        adhoc_review_view, programme_progress_view, programme_status_view, programme_view, progress_view, session_review_view,
+        adhoc_review_view, completed_review_view, programme_progress_view, programme_status_view, programme_view, progress_view,
+        session_review_view,
     };
 
     fn roundtrip_request(req: ClientRequest) {
@@ -368,6 +369,22 @@ mod tests {
         assert!(got.commentary.is_some(), "the grounded commentary crossed");
         assert_eq!(got.achieved_goals, vec!["Overhead Press to 40kg".to_string()], "achieved goals are the record, not a re-derivation");
         assert_eq!(got.series[0].improving(), Some(true), "the embedded [C6.2] series kept its verdict");
+    }
+
+    /// The [R4.1] completion rides in the same tag 10 payload. It was appended last, so an
+    /// ordinary review — `programme_complete: None` — must still decode to exactly what was
+    /// sent rather than reading the field off the end of the buffer.
+    #[test]
+    fn a_programme_completion_survives_the_wire_and_an_ordinary_review_still_does() {
+        for sent in [completed_review_view(), session_review_view()] {
+            let bytes = postcard::to_allocvec(&View::SessionReview(Box::new(sent.clone()))).unwrap();
+            let View::SessionReview(got) = postcard::from_bytes::<View>(&bytes).unwrap() else {
+                panic!("expected a SessionReview");
+            };
+            assert_eq!(*got, sent);
+        }
+        let done = completed_review_view().programme_complete.expect("the completion");
+        assert_eq!(done.verdict(), "Every goal it served is reached — 22 of 24 sessions trained.");
     }
 
     /// `View::SessionReview` boxes its payload to keep `View` small, exactly as

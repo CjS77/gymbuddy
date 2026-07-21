@@ -24,16 +24,17 @@
 
 use anyhow::Context as _;
 use gymbuddy_proto::{
-    Direction, ReviewEffortView, ReviewExerciseView, ReviewKindView, ReviewRecordView, SeriesPointView, SeriesShape, SeriesView,
-    SessionReviewView, TrainingModeView,
+    Direction, ProgrammeCompleteView, ReviewEffortView, ReviewExerciseView, ReviewKindView, ReviewRecordView, SeriesPointView, SeriesShape,
+    SeriesView, SessionReviewView, TrainingModeView,
 };
 use serde::{Deserialize, Serialize};
 
 use super::AssistantHandler;
 use crate::assistant::parser::parse_assistant_response;
 use crate::db::{
-    Database, EffortSource, ExerciseDelta, GoalDirection, GoalProgress, GoalStatus, MeasurementType, PerformedRollup, ProgrammeSlot,
-    RosterVsActual, Session, SessionPersonalRecord, SessionRoster, UnrosteredExercise, User, today_str,
+    Database, EffortSource, ExerciseDelta, Goal, GoalDirection, GoalProgress, GoalStatus, LifecycleStatus, MeasurementType,
+    PerformedRollup, Programme, ProgrammeSlot, ProgrammeStatus, RosterVsActual, Session, SessionPersonalRecord, SessionRoster,
+    UnrosteredExercise, User, today_str,
 };
 use crate::science::ScienceQuery;
 use crate::text::strip_markdown;
@@ -91,6 +92,8 @@ struct ReviewSnapshot {
     week_line: Option<String>,
     #[serde(default)]
     notes: Vec<String>,
+    #[serde(default)]
+    programme_complete: Option<StoredProgrammeComplete>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +126,34 @@ struct StoredPosition {
     week: u32,
     day: u32,
     focus: String,
+}
+
+/// The programme-complete banner, as it read on the day ([R4.1]).
+///
+/// Stored rather than re-derived on read, for the same reason the deltas are: a programme is
+/// finished once, and the review that announced it has to go on announcing it however the grid
+/// is edited afterwards. It is also what makes regenerating this review honest — the completion
+/// check has already flipped the programme out of `active` by then.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredProgrammeComplete {
+    title: String,
+    reason: String,
+    trained: u32,
+    total: u32,
+    #[serde(default)]
+    achieved_goals: Vec<String>,
+}
+
+impl StoredProgrammeComplete {
+    fn into_view(self) -> ProgrammeCompleteView {
+        ProgrammeCompleteView {
+            title: self.title,
+            reason: self.reason,
+            trained: self.trained,
+            total: self.total,
+            achieved_goals: self.achieved_goals,
+        }
+    }
 }
 
 impl ReviewSnapshot {
@@ -170,6 +201,7 @@ impl ReviewSnapshot {
             week_line: self.week_line,
             series,
             notes: self.notes,
+            programme_complete: self.programme_complete.map(StoredProgrammeComplete::into_view),
         }
     }
 
@@ -227,6 +259,13 @@ impl ReviewSnapshot {
         if !self.achieved_goals.is_empty() {
             out.push_str("\nGOALS COMPLETED BY THIS SESSION (worth leading with):\n");
             out.extend(self.achieved_goals.iter().map(|g| format!("- {g}\n")));
+        }
+        // The completion reaches the prompt as the same two lines the user is shown, adherence
+        // included. A model told only "the programme is finished" would write the celebration
+        // every time; told four of twenty-four sessions were trained, it cannot.
+        if let Some(done) = &self.programme_complete {
+            let view = done.clone().into_view();
+            out.push_str(&format!("\nPROGRAMME FINISHED BY THIS SESSION:\n- {}\n- {}\n", view.banner(), view.verdict()));
         }
 
         if let Some(streak) = self.streak_days {
@@ -293,16 +332,24 @@ impl AssistantHandler {
                 return None;
             }
         };
-        let next = self.next_step_suffix(user).await;
+        let next = self.next_step_suffix(user, &view).await;
         Some(format!("{} /review for the full write-up. {next}", view.headline))
     }
 
-    /// The pointer back to the next session that a completed review's reply carries — step 6's
-    /// not-yet branch ([R4.2]), closing the loop toward the next workout. With an active
-    /// programme it names the slot the next design will target; ad-hoc, it simply points at
-    /// `/nextworkout`. This is the suffix-assembly seam the programme-complete branch ([R4.1])
-    /// composes its own ending onto.
-    async fn next_step_suffix(&self, user: &User) -> String {
+    /// The pointer forward that a completed review's reply carries — step 6 of the North Star,
+    /// both branches of it, decided in this one place.
+    ///
+    /// Achieved ([R4.1]): the programme this session finished is over, so the loop closes back on
+    /// programme-building rather than on the next workout — there is no next workout to point at.
+    /// Not yet ([R4.2]): with an active programme the pointer names the slot the next design will
+    /// target; ad-hoc, it simply points at `/nextworkout`.
+    ///
+    /// The completion is read off the review rather than re-queried, because by now the check has
+    /// already flipped the programme out of `active` and a second query would find nothing.
+    async fn next_step_suffix(&self, user: &User, review: &SessionReviewView) -> String {
+        if review.programme_complete.is_some() {
+            return "Programme complete — run /programme when you're ready to build the next one.".to_string();
+        }
         let next_slot = {
             let db = self.db.lock().await;
             active_next_slot(&db, user.id)
@@ -367,6 +414,7 @@ struct ReviewFacts {
     goals: Vec<GoalProgress>,
     achieved_goals: Vec<String>,
     position: Option<StoredPosition>,
+    programme_complete: Option<StoredProgrammeComplete>,
 }
 
 impl ReviewFacts {
@@ -385,6 +433,8 @@ impl ReviewFacts {
         let position = slot_id.map(|slot_id| position_for_slot(db, slot_id)).transpose()?.flatten();
 
         let goals = db.goal_progress_report(user.id, None, None)?;
+        // Before the completion check, never after: a programme finishes *because* this session
+        // reached the last goal it served, and the check reads the flag this call writes.
         let achieved_goals = mark_and_collect_achieved(db, &goals)?;
 
         Ok(Self {
@@ -395,6 +445,7 @@ impl ReviewFacts {
             records: db.session_personal_records(session_id)?,
             streak: db.workout_streak(user.id)?,
             week: db.week_summary(user.id)?,
+            programme_complete: complete_programme_if_finished(db, user.id, slot_id, &goals)?,
             goals,
             achieved_goals,
             position,
@@ -431,6 +482,7 @@ impl ReviewFacts {
             streak_days: u32::try_from(self.streak).ok(),
             week_line: Some(week_line(&self.week)),
             notes: Vec::new(),
+            programme_complete: self.programme_complete,
         }
     }
 }
@@ -449,6 +501,112 @@ fn mark_and_collect_achieved(db: &Database, goals: &[GoalProgress]) -> anyhow::R
             db.mark_goal_achieved(g.goal.id)?;
             Ok(goal_label(g))
         })
+        .collect()
+}
+
+// ── Programme completion ([R4.1]) ─────────────────────────────────────────────
+
+/// Decide whether the programme this review speaks for has finished, and stamp it completed
+/// if it has.
+///
+/// Deterministic, which is the ticket's whole point: a programme ends because its goals, its
+/// grid or the calendar say so, never because a model judged the user done. It runs inside the
+/// review's deterministic half, before any commentary call, so the banner is part of the record
+/// the session ended with rather than a later observation about it.
+fn complete_programme_if_finished(
+    db: &Database,
+    user_id: i64,
+    slot_id: Option<i64>,
+    goals: &[GoalProgress],
+) -> anyhow::Result<Option<StoredProgrammeComplete>> {
+    let Some(programme) = review_programme(db, user_id, slot_id)? else {
+        return Ok(None);
+    };
+    // A draft was never started and an abandoned one was walked away from; neither has
+    // anything to finish. An already-`completed` programme is re-checked on purpose — see
+    // [`review_programme`].
+    if !matches!(programme.status, LifecycleStatus::Active | LifecycleStatus::Completed) {
+        return Ok(None);
+    }
+    let status = db.programme_status(&programme, &today_str())?;
+    let served = db.list_programme_goals(programme.id)?;
+    let Some(reason) = completion_reason(&programme, &status, &served) else {
+        return Ok(None);
+    };
+    db.set_programme_status(programme.id, LifecycleStatus::Completed)?;
+    tracing::info!(programme_id = programme.id, reason, "programme completed");
+    Ok(Some(StoredProgrammeComplete {
+        title: programme.title,
+        reason: reason.to_string(),
+        trained: u32::try_from(status.counts.trained).unwrap_or(0),
+        total: u32::try_from(status.counts.total).unwrap_or(0),
+        achieved_goals: achieved_served_goals(&served, goals),
+    }))
+}
+
+/// The programme a review speaks for: the one this session's slot belongs to, else the user's
+/// active programme.
+///
+/// The slot comes first so that regenerating a review reaches the same programme it did the
+/// first time. That is not a rare path — correcting the session effort regenerates the latest
+/// review as a matter of course — and by then the programme is no longer *active*, precisely
+/// because the first pass completed it. Reading through the slot, plus re-running a check that
+/// is a pure predicate over the programme, is what makes the banner survive.
+fn review_programme(db: &Database, user_id: i64, slot_id: Option<i64>) -> anyhow::Result<Option<Programme>> {
+    let from_slot = slot_id.map(|id| programme_for_slot(db, id)).transpose()?.flatten();
+    match from_slot {
+        Some(programme) => Ok(Some(programme)),
+        None => db.active_programme_for_user(user_id),
+    }
+}
+
+fn programme_for_slot(db: &Database, slot_id: i64) -> anyhow::Result<Option<Programme>> {
+    let Some(slot) = db.get_programme_slot(slot_id)? else {
+        return Ok(None);
+    };
+    db.get_programme(slot.programme_id)
+}
+
+/// Which of the three endings applies, or `None` while the programme still has road ahead.
+///
+/// Tested win-first, because the reason is what the congratulation is grounded in and only the
+/// first of them is unambiguously good news:
+/// 1. **Every goal it served is reached** — the programme did the thing it was built to do.
+/// 2. **Every slot is settled** — the grid has been walked to its end, trained or missed.
+/// 3. **The target end date has passed** — the calendar ran out, whatever the grid still holds.
+///
+/// Both structural tests are guarded against their vacuous case: a programme serving no goals
+/// has not met them all, and an empty grid has not been walked. Without those guards every
+/// goal-less or slot-less programme would declare itself finished on its owner's first session.
+fn completion_reason(programme: &Programme, status: &ProgrammeStatus, served: &[Goal]) -> Option<&'static str> {
+    if !served.is_empty() && served.iter().all(|g| g.achieved) {
+        return Some("every goal it served is reached");
+    }
+    if status.counts.total > 0 && status.next_slot.is_none() {
+        return Some("every session in the plan is settled");
+    }
+    programme.target_end_date.as_deref().filter(|end| date_passed(end)).map(|_| "its target end date has passed")
+}
+
+/// Whether a target end date is behind us — strictly, so a programme still has the day it aimed
+/// to finish on. Compared as text, which is what ISO dates are for; a stored timestamp is cut
+/// back to its date part first, and anything too short to be a date never passes.
+fn date_passed(end_date: &str) -> bool {
+    let end = end_date.get(..10).unwrap_or_default();
+    !end.is_empty() && end < today_str().as_str()
+}
+
+/// Display lines for the goals the programme served and reached, in the same
+/// `"<exercise> to <target>"` vocabulary the review's own achieved list uses ([R4.2]).
+///
+/// Read off the progress report rather than rendered from the bare `Goal` rows, so one goal
+/// never reads two ways in one review. A served goal outside the report's window contributes no
+/// line here; it can still have decided the completion, which is what `Goal::achieved` is for.
+fn achieved_served_goals(served: &[Goal], goals: &[GoalProgress]) -> Vec<String> {
+    goals
+        .iter()
+        .filter(|g| g.status == GoalStatus::Achieved && served.iter().any(|s| s.id == g.goal.id))
+        .map(goal_label)
         .collect()
 }
 

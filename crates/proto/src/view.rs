@@ -1104,6 +1104,10 @@ pub struct SessionReviewView {
     /// Free-text caveats — a goal with too little data, a metric that could not be
     /// compared, a commentary call that failed.
     pub notes: Vec<String>,
+    /// Set only on the review of the session that finished a programme ([R4.1]), which
+    /// is one review in a hundred. Appended last: postcard is positional, so a field
+    /// added anywhere else would reinterpret every review already on the wire.
+    pub programme_complete: Option<ProgrammeCompleteView>,
 }
 
 impl SessionReviewView {
@@ -1116,6 +1120,46 @@ impl SessionReviewView {
         } else {
             self.headline.clone()
         }
+    }
+}
+
+/// The programme this session finished ([R4.1]) — step 6 of the North Star, achieved branch.
+///
+/// The server decides completion deterministically and stamps the programme completed before
+/// building this; a client that sees it can state the programme is over as fact.
+///
+/// The counts are carried rather than a ready-made compliment because the three ways a
+/// programme ends are not equally good news. One that reached every goal it served has earned
+/// the congratulation; one whose target end date simply arrived with four of twenty-four
+/// sessions trained has not, and [`Self::verdict`] says so in the same words either way.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProgrammeCompleteView {
+    pub title: String,
+    /// What ended it, phrased as the completion check decided it — "every goal it served is
+    /// reached", "every session in the plan is settled", "its target end date has passed".
+    pub reason: String,
+    /// Slots of the grid actually trained, out of every slot it had.
+    pub trained: u32,
+    pub total: u32,
+    /// The goals the programme served that were reached, as display lines — the same
+    /// `"<exercise> to <target>"` shape [`SessionReviewView::achieved_goals`] uses.
+    pub achieved_goals: Vec<String>,
+}
+
+impl ProgrammeCompleteView {
+    /// The banner a review leads with, e.g. `Programme complete: 12-week hypertrophy`.
+    pub fn banner(&self) -> String {
+        format!("Programme complete: {}", self.title)
+    }
+
+    /// How it actually went, in one line: the reason it ended and the adherence behind that,
+    /// e.g. `Every goal it served is reached — 22 of 24 sessions trained.`
+    pub fn verdict(&self) -> String {
+        let mut reason = self.reason.clone();
+        if let Some(first) = reason.get_mut(..1) {
+            first.make_ascii_uppercase();
+        }
+        format!("{reason} — {} of {} sessions trained.", self.trained, self.total)
     }
 }
 
@@ -1425,7 +1469,40 @@ pub(crate) mod tests {
             week_line: Some("3 sessions, 12400 kg total volume".into()),
             series: vec![trend()],
             notes: vec!["Squat has too few sessions to trend yet.".into()],
+            programme_complete: None,
         }
+    }
+
+    /// The review of the session that finished a programme, every goal it served reached.
+    pub(crate) fn completed_review_view() -> SessionReviewView {
+        SessionReviewView {
+            programme_complete: Some(ProgrammeCompleteView {
+                title: "12-week hypertrophy".into(),
+                reason: "every goal it served is reached".into(),
+                trained: 22,
+                total: 24,
+                achieved_goals: vec!["Overhead Press to 40kg".into()],
+            }),
+            ..session_review_view()
+        }
+    }
+
+    /// The banner states the programme is over; the verdict states how it went, and the
+    /// adherence rides along so the wording cannot flatter a programme the calendar merely
+    /// ran out on.
+    #[test]
+    fn a_completed_programme_reports_its_adherence_alongside_its_reason() {
+        let won = completed_review_view().programme_complete.expect("the completion");
+        assert_eq!(won.banner(), "Programme complete: 12-week hypertrophy");
+        assert_eq!(won.verdict(), "Every goal it served is reached — 22 of 24 sessions trained.");
+
+        let ran_out = ProgrammeCompleteView {
+            reason: "its target end date has passed".into(),
+            trained: 4,
+            achieved_goals: vec![],
+            ..won
+        };
+        assert_eq!(ran_out.verdict(), "Its target end date has passed — 4 of 24 sessions trained.");
     }
 
     /// The ad-hoc tier: no commentary, no programme position, no prescription to

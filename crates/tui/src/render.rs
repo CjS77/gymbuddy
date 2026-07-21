@@ -72,6 +72,7 @@ pub fn render_view(view: &View, width: u16) -> Vec<Line<'static>> {
 /// `/progress` uses, degrading to text where the width or the point count is too small.
 fn render_session_review(r: &SessionReviewView, width: u16) -> Vec<Line<'static>> {
     let mut lines = review_header(r);
+    lines.extend(review_completion(r));
     lines.extend(review_achievements(r));
     lines.extend(review_exercises(r));
     lines.extend(review_records(r));
@@ -90,6 +91,24 @@ fn review_header(r: &SessionReviewView) -> Vec<Line<'static>> {
     lines.extend(r.position.iter().map(|p| muted(p.summary())));
     lines.extend(r.intent.iter().map(|i| muted(format!("Aiming for {i}"))));
     lines
+}
+
+/// The programme this session finished ([R4.1]), above even the session's own achievements:
+/// completing the plan is the larger news, and it is the one review section that points the
+/// user somewhere other than the next workout.
+///
+/// The banner is coloured as the win it usually is, but the verdict beneath it is Core's
+/// sentence rendered verbatim — a programme whose target date simply arrived with four of
+/// twenty-four sessions trained says exactly that, in the same place a finished one says it did.
+fn review_completion(r: &SessionReviewView) -> Vec<Line<'static>> {
+    let Some(done) = &r.programme_complete else {
+        return Vec::new();
+    };
+    let win = Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD);
+    [Line::from(""), Line::from(Span::styled(done.banner(), win)), Line::from(done.verdict())]
+        .into_iter()
+        .chain(done.achieved_goals.iter().map(|g| Line::from(format!("  • Goal reached: {g}"))))
+        .collect()
 }
 
 /// Goals finished this session — led with, and coloured as the win they are. The word
@@ -712,6 +731,7 @@ mod tests {
             week_line: None,
             series: vec![],
             notes: vec![],
+            programme_complete: None,
         }));
         let text = flat(&render(&view));
         assert!(text.contains("Solid session — 2 of 3 prescribed exercises completed"), "{text}");
@@ -758,6 +778,7 @@ mod tests {
             week_line: Some("3 sessions, 12400 kg total volume".into()),
             series: vec![],
             notes: vec!["Squat has too few sessions to trend yet.".into()],
+            programme_complete: None,
         }
     }
 

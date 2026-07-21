@@ -284,6 +284,17 @@ fn render_session_review(r: &SessionReviewView) -> String {
         out.push_str(&format!("<i>Set out to: {}</i>\n", escape_html(intent)));
     }
 
+    // Finishing the programme ([R4.1]) outranks anything one session inside it did, so the
+    // banner sits above the session's own achievements. The verdict line carries the adherence
+    // Core computed with it: the congratulation is the true sentence, not the warm one.
+    if let Some(done) = &r.programme_complete {
+        out.push_str(&format!("\n<b>{}</b>\n{}\n", escape_html(&done.banner()), escape_html(&done.verdict())));
+        if !done.achieved_goals.is_empty() {
+            out.push_str("Goals reached under it:\n");
+            out.extend(done.achieved_goals.iter().map(|g| format!("- {}\n", escape_html(g))));
+        }
+    }
+
     if !r.achieved_goals.is_empty() {
         out.push_str("\n<b>Goal reached</b>\n");
         out.extend(r.achieved_goals.iter().map(|g| format!("- {}\n", escape_html(g))));
@@ -738,6 +749,7 @@ mod tests {
             week_line: Some("3 sessions, 12400 kg total volume".into()),
             series: vec![],
             notes: vec![],
+            programme_complete: None,
         }
     }
 
