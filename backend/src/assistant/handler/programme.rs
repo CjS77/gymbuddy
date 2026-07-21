@@ -585,6 +585,7 @@ mod tests {
     use super::AssistantHandler;
     use crate::db::{Database, LifecycleStatus, SlotStatus, User, new_exercise_goal};
     use crate::telegram::Message as TgMessage;
+    use gymbuddy_proto::{Direction, ProgrammeProgressView, RescheduleView, SeriesShape, View};
 
     /// A valid three-day, six-week proposal — the happy path most tests start from.
     const PROPOSAL: &str = r#"{"message": "Here's the shape I'd suggest.", "actions": [
@@ -1073,6 +1074,130 @@ mod tests {
 
         let reply = handler.handle_text_message(&msg, "/programme").await.unwrap();
         assert!(shown(&reply).contains("Let's build your multi-week programme"), "got: {}", shown(&reply));
+    }
+
+    // ── The full report ([C4.6]) ──────────────────────────────────────────────
+
+    /// The [`ProgrammeProgressView`] behind a `/programme status` reply.
+    async fn status_report(handler: &AssistantHandler, msg: &TgMessage) -> ProgrammeProgressView {
+        match handler.handle_text_message(msg, "/programme status").await.unwrap().view {
+            View::ProgrammeProgress(report) => *report,
+            other => panic!("/programme status must answer with a programme report, got {other:?}"),
+        }
+    }
+
+    /// Train the given slots: a roster bound to the slot and to a started session, which
+    /// is the executed-roster test every adherence reading in the app applies.
+    fn train_slots(db: &Database, user_id: i64, slot_ids: &[i64]) {
+        slot_ids.iter().for_each(|slot_id| {
+            let roster = db.create_roster(user_id, "Trained", None, None).unwrap();
+            db.bind_roster_to_slot(roster, *slot_id).unwrap();
+            let session = db.start_session(user_id, None).unwrap();
+            db.bind_roster_to_session(roster, session.id).unwrap();
+        });
+    }
+
+    /// Adherence is measured over the slots the calendar has closed, and the day the user
+    /// keeps missing travels as data — a client can offer to move it, not just print that
+    /// it should be moved.
+    #[tokio::test]
+    async fn the_report_measures_adherence_over_the_settled_grid() {
+        let (handler, _llm) = setup_handler("").await;
+        let msg = make_message(12345, "hello");
+        let user = setup_ready_user(&handler, &msg).await;
+        {
+            let db = handler.db.lock().await;
+            let programme_id = activate_programme_started(&db, user.id, 3, 6);
+            // Day 2 ("lower") trained for the three elapsed weeks; day 1 ("upper") lapses.
+            let slots = db.list_programme_slots(programme_id).unwrap();
+            train_slots(&db, user.id, &[slots[1].id, slots[3].id, slots[5].id]);
+        }
+
+        let report = status_report(&handler, &msg).await;
+        let adherence = &report.adherence;
+        assert_eq!((adherence.settled, adherence.trained), (6, 3), "three elapsed weeks of a two-day week have settled");
+        assert_eq!(adherence.rate(), Some(0.5));
+        assert_eq!(adherence.rate_line(), "Trained 3 of the 6 sessions due so far (50%)");
+        assert_eq!(adherence.drifting_days.len(), 1, "only the missed day drifts");
+        assert_eq!(adherence.drifting_days[0].line(), "Day 1 (upper): 0 of 3 trained");
+        assert_eq!(adherence.reschedule, Some(RescheduleView::Shift { day_idx: 1, focus: "upper".into() }));
+
+        // The [R2.1] position half still travels whole inside the report.
+        assert_eq!(report.programme.position_line().as_deref(), Some("Week 4 of 6"));
+        assert_eq!(report.programme.status.as_ref().unwrap().counts_line(), "3 trained · 3 missed · 0 skipped · 6 to go");
+    }
+
+    /// Slots still ahead have been neither kept nor missed: a programme starting today has
+    /// no adherence to report, and must not be told it has missed everything.
+    #[tokio::test]
+    async fn a_programme_that_just_started_has_no_adherence_to_report() {
+        let (handler, _llm) = setup_handler("").await;
+        let msg = make_message(12345, "hello");
+        let user = setup_ready_user(&handler, &msg).await;
+        {
+            let db = handler.db.lock().await;
+            activate_programme_started(&db, user.id, 0, 6);
+        }
+
+        let report = status_report(&handler, &msg).await;
+        assert_eq!(report.adherence.settled, 0);
+        assert_eq!(report.adherence.rate(), None, "nothing has come due, so there is no share to report");
+        assert_eq!(report.adherence.rate_line(), "Nothing has come due yet.");
+        assert!(report.adherence.drifting_days.is_empty());
+        assert!(report.adherence.reschedule.is_none(), "a programme with nothing settled cannot be drifting");
+    }
+
+    /// The other half of [C4.6]: the goals the programme serves arrive as the same [C6.2]
+    /// trajectories `/progress` charts, target included — and as nothing else, since where
+    /// those readings *land* is [C6.4]'s question.
+    #[tokio::test]
+    async fn the_report_charts_the_goals_the_programme_serves() {
+        let (handler, _llm) = setup_handler("").await;
+        let msg = make_message(12345, "hello");
+        let user = setup_ready_user(&handler, &msg).await;
+        {
+            let db = handler.db.lock().await;
+            let programme_id = activate_programme_started(&db, user.id, 1, 6);
+            let goal_id = db.goal_progress_report(user.id, None, None).unwrap()[0].goal.id;
+            db.add_programme_goal(programme_id, goal_id).unwrap();
+            log_bench(&db, user.id, 85.0);
+        }
+
+        let report = status_report(&handler, &msg).await;
+        assert_eq!(report.goals.len(), 1, "one linked goal, one trajectory");
+        let bench = &report.goals[0];
+        assert!(bench.title.starts_with("Bench Press"), "got: {}", bench.title);
+        assert_eq!(bench.shape, SeriesShape::Trajectory { target: 100.0 }, "the target rides with the series");
+        assert_eq!(bench.better, Direction::Higher, "more weight is progress");
+        assert_eq!(bench.latest().unwrap().value, 85.0);
+        assert_eq!(report.programme.goals, vec!["Bench Press to 100.0".to_string()], "and the label the skeleton lists");
+    }
+
+    /// A goal nobody linked to the programme is not the programme's to report on.
+    #[tokio::test]
+    async fn an_unlinked_goal_is_left_out_of_the_report() {
+        let (handler, _llm) = setup_handler("").await;
+        let msg = make_message(12345, "hello");
+        let user = setup_ready_user(&handler, &msg).await;
+        {
+            let db = handler.db.lock().await;
+            activate_programme_started(&db, user.id, 1, 6);
+            log_bench(&db, user.id, 85.0);
+        }
+
+        assert!(status_report(&handler, &msg).await.goals.is_empty(), "the seeded goal serves no programme");
+    }
+
+    /// One logged bench top set, so the goal the programme serves has a reading to chart.
+    /// Dated yesterday: the series is bounded by date, and a set logged later today sorts
+    /// past a bare `YYYY-MM-DD` upper bound.
+    fn log_bench(db: &Database, user_id: i64, kg: f64) {
+        let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+        let entry = db.insert_entry(&crate::db::new_exercise_entry(user_id, None, None)).unwrap();
+        let mut set = crate::db::new_exercise_set(entry, bench.id, crate::db::MeasurementType::WeightReps, kg);
+        set.count = Some(5);
+        set.logged_at = format!("{} 10:00:00", (chrono::Utc::now() - chrono::Duration::days(1)).format("%Y-%m-%d"));
+        db.insert_set(&set).unwrap();
     }
 
     /// Unrecognised words after the command are not a typo'd subcommand — they are

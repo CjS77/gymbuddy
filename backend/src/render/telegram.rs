@@ -404,8 +404,8 @@ pub(crate) fn escape_html(s: &str) -> String {
 mod tests {
     use super::*;
     use gymbuddy_proto::{
-        CatalogEntry, CatalogGroup, Direction, ExerciseLog, HealthNote, Measurement, ReviewEffortView, ReviewExerciseView,
-        ReviewKindView, ReviewRecordView, SeriesPointView, SessionView,
+        CatalogEntry, CatalogGroup, Direction, ExerciseLog, HealthNote, Measurement, ProgrammeAdherenceView, ReviewEffortView,
+        ReviewExerciseView, ReviewKindView, ReviewRecordView, SeriesPointView, SessionView,
     };
 
     fn set(count: Option<u32>, value: f64) -> SetLine {
@@ -872,6 +872,81 @@ mod tests {
         assert!(html.contains("Week 6 of 6\n"), "no block means no focus suffix: {html}");
         assert!(!html.contains("Next:"), "nothing is due: {html}");
         assert!(html.contains("10 trained · 2 missed · 0 skipped · 0 to go"));
+    }
+
+    /// [C4.6]: the full report keeps the [R2.1] position layout it already had and adds
+    /// the two halves it exists for — how well the week is being kept to, and where the
+    /// goals it serves are heading.
+    #[test]
+    fn programme_report_html_adds_adherence_and_goals_under_the_position() {
+        let View::Programme(programme) = programme(Some(gymbuddy_proto::ProgrammeStatusView {
+            current_week: 3,
+            block_focus: Some("accumulation".into()),
+            next_slot: Some(gymbuddy_proto::ProgrammeSlotView { week_idx: 3, day_idx: 2, focus: "lower".into() }),
+            trained: 3,
+            missed: 3,
+            skipped: 0,
+            remaining: 6,
+        })) else {
+            panic!("the fixture builds a programme view");
+        };
+
+        let (html, mode) = Telegram.render(&View::ProgrammeProgress(Box::new(ProgrammeProgressView {
+            programme: *programme,
+            adherence: ProgrammeAdherenceView {
+                settled: 6,
+                trained: 3,
+                drifting_days: vec![gymbuddy_proto::DayAdherenceView {
+                    day_idx: 1,
+                    focus: "upper & <heavy>".into(),
+                    trained: 0,
+                    missed: 3,
+                }],
+                reschedule: Some(gymbuddy_proto::RescheduleView::Shift { day_idx: 1, focus: "upper".into() }),
+            },
+            goals: vec![SeriesView {
+                title: "Bench Press — daily best".into(),
+                unit: "kg".into(),
+                better: Direction::Higher,
+                shape: SeriesShape::Trajectory { target: 100.0 },
+                points: points(&[("2026-05-01", 80.0), ("2026-07-01", 92.5)]),
+            }],
+        })));
+
+        assert_eq!(mode, Some("HTML"));
+        assert!(html.contains("Week 3 of 6 — accumulation"), "the position still leads: {html}");
+        assert!(html.contains("<b>Keeping to it:</b>\nTrained 3 of the 6 sessions due so far (50%)"), "got: {html}");
+        assert!(html.contains("- Day 1 (upper &amp; &lt;heavy&gt;): 0 of 3 trained"), "the drifting day is named and escaped: {html}");
+        assert!(html.contains("shift it"), "and the offer to move it is made: {html}");
+        assert!(html.contains("<b>Goals:</b>"), "got: {html}");
+        assert!(html.contains("80 → 92.5 kg (+12.5, better)"), "the goal charts through the [C6.2] renderer: {html}");
+        assert!(html.contains("Target: 100 kg"), "with the target it is aimed at: {html}");
+    }
+
+    /// A programme being kept to says so plainly: no drifting days, no offer to move
+    /// anything, and nothing that reads as a reprimand.
+    #[test]
+    fn a_kept_programme_report_carries_no_reschedule_offer() {
+        let View::Programme(programme) = programme(Some(gymbuddy_proto::ProgrammeStatusView {
+            current_week: 1,
+            block_focus: None,
+            next_slot: None,
+            trained: 0,
+            missed: 0,
+            skipped: 0,
+            remaining: 12,
+        })) else {
+            panic!("the fixture builds a programme view");
+        };
+
+        let (html, _) = Telegram.render(&View::ProgrammeProgress(Box::new(ProgrammeProgressView {
+            programme: *programme,
+            adherence: ProgrammeAdherenceView { settled: 0, trained: 0, drifting_days: vec![], reschedule: None },
+            goals: vec![],
+        })));
+        assert!(html.contains("Nothing has come due yet."), "a programme that just started has missed nothing: {html}");
+        assert!(!html.contains("shift it") && !html.contains("drop it"), "and is not offered a reschedule: {html}");
+        assert!(!html.contains("<b>Goals:</b>"), "no goals linked, no empty section: {html}");
     }
 
     /// [C1.4]: an explicit one-off during an active programme says so, and says the

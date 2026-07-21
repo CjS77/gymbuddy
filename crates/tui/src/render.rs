@@ -1181,6 +1181,39 @@ mod tests {
         assert!(draft.contains(PROGRAMME_LOCK_IN_ASK));
     }
 
+    /// The [C4.6] report has no layout of its own yet ([T2.1] gives it one), but it must
+    /// still say what it is: an unhandled variant renders as "[unsupported message]", and
+    /// a programme report reaching the user as that would be worse than no report.
+    #[test]
+    fn a_programme_report_announces_itself_before_it_has_a_layout() {
+        let View::Programme(programme) = programme_view(Some(gymbuddy_proto::ProgrammeStatusView {
+            current_week: 3,
+            block_focus: Some("accumulation".into()),
+            next_slot: None,
+            trained: 2,
+            missed: 2,
+            skipped: 0,
+            remaining: 8,
+        })) else {
+            panic!("the fixture builds a programme view");
+        };
+
+        let report = gymbuddy_proto::ProgrammeProgressView {
+            programme: *programme,
+            adherence: gymbuddy_proto::ProgrammeAdherenceView {
+                settled: 4,
+                trained: 2,
+                drifting_days: vec![],
+                reschedule: None,
+            },
+            goals: vec![],
+        };
+        let text = flat(&render(&View::ProgrammeProgress(Box::new(report))));
+        assert!(text.contains("6-week base"), "the programme is named: {text}");
+        assert!(text.contains("Week 3 of 6 — accumulation"), "and the position reaches the user: {text}");
+        assert!(!text.contains("unsupported"), "the variant is handled, however plainly: {text}");
+    }
+
     #[test]
     fn catalog_columns_align() {
         let view = View::Catalog(CatalogView {
