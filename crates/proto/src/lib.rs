@@ -9,9 +9,10 @@ use serde::{Deserialize, Serialize};
 
 pub mod view;
 pub use view::{
-    CatalogEntry, CatalogGroup, CatalogView, Direction, ExerciseLog, HealthNote, HistoryView, Measurement, ProgrammeBlockView,
-    ProgrammeDayView, ProgrammeSlotView, ProgrammeStatusView, ProgrammeView, ProgressView, Render, ReviewEffortView, ReviewExerciseView,
-    ReviewKindView, ReviewRecordView, RosterExerciseView, SeriesPointView, SeriesShape, SeriesView, SessionReviewView, SessionRosterView,
+    CatalogEntry, CatalogGroup, CatalogView, DayAdherenceView, Direction, ExerciseLog, HealthNote, HistoryView, Measurement,
+    ProgrammeAdherenceView, ProgrammeBlockView, ProgrammeDayView, ProgrammeProgressView, ProgrammeSlotView, ProgrammeStatusView,
+    ProgrammeView, ProgressView, Render, RescheduleView, ReviewEffortView, ReviewExerciseView, ReviewKindView, ReviewRecordView,
+    RosterExerciseView, SeriesPointView, SeriesShape, SeriesView, SessionReviewView, SessionRosterView,
     SessionSummaryView, SessionView,
     SetLine, StatusView, TrainingModeView, View,
 };
@@ -149,7 +150,9 @@ pub fn decode_response(data: &[u8]) -> postcard::Result<ServerResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use view::tests::{adhoc_review_view, programme_status_view, programme_view, progress_view, session_review_view};
+    use view::tests::{
+        adhoc_review_view, programme_progress_view, programme_status_view, programme_view, progress_view, session_review_view,
+    };
 
     fn roundtrip_request(req: ClientRequest) {
         let bytes = encode_request(&req).expect("encode");
@@ -258,6 +261,7 @@ mod tests {
             View::SessionReview(Box::new(adhoc_review_view())),
             // [R2.1]: the same variant carrying a live programme's position.
             View::Programme(Box::new(programme_status_view())),
+            View::ProgrammeProgress(Box::new(programme_progress_view())),
         ] {
             roundtrip_response(ServerResponse::Reply { view, timer: None });
         }
@@ -296,6 +300,46 @@ mod tests {
         assert_eq!(tag(&View::Programme(Box::new(programme_view()))), 8, "Programme appended for [C4.2]");
         assert_eq!(tag(&View::Progress(progress_view())), 9, "Progress appended for [C6.2]");
         assert_eq!(tag(&View::SessionReview(Box::new(session_review_view()))), 10, "SessionReview appended for [C6.5]");
+        assert_eq!(tag(&View::ProgrammeProgress(Box::new(programme_progress_view()))), 11, "ProgrammeProgress appended for [C4.6]");
+    }
+
+    /// `RescheduleView` rides inside tag 11, so its own variant order is wire format too.
+    /// The three policies are different actions on the user's calendar — a shifted day is
+    /// not a dropped one — so a reorder would have an older client offering to delete a
+    /// training day the server only meant to move.
+    #[test]
+    fn reschedule_discriminants_are_pinned_to_their_wire_tags() {
+        let tag = |policy: &view::RescheduleView| postcard::to_allocvec(policy).unwrap()[0];
+        assert_eq!(tag(&view::RescheduleView::Shift { day_idx: 1, focus: "upper".into() }), 0, "Shift");
+        assert_eq!(tag(&view::RescheduleView::Drop { day_idx: 1, focus: "upper".into() }), 1, "Drop");
+        assert_eq!(tag(&view::RescheduleView::Compress), 2, "Compress");
+    }
+
+    /// The [C4.6] report carries three separately-sourced halves — the grid's position,
+    /// the drift over it and the goal trajectories — and all three have to survive intact,
+    /// since a client renders them side by side.
+    #[test]
+    fn a_programme_report_survives_the_wire_whole() {
+        let sent = programme_progress_view();
+        let bytes = encode_response(&ServerResponse::Reply { view: View::ProgrammeProgress(Box::new(sent.clone())), timer: None }).unwrap();
+        let ServerResponse::Reply { view: View::ProgrammeProgress(got), .. } = decode_response(&bytes).unwrap() else {
+            panic!("expected a ProgrammeProgress reply");
+        };
+        assert_eq!(*got, sent);
+        assert_eq!(got.programme.position_line().as_deref(), Some("Week 3 of 12 — accumulation"));
+        assert_eq!(got.adherence.reschedule, Some(view::RescheduleView::Shift { day_idx: 1, focus: "upper".into() }));
+        assert_eq!(got.goals[0].bounds(), Some((80.0, 100.0)), "the goal trajectory kept its target");
+    }
+
+    /// Boxing the report is an in-memory decision, exactly as for the two variants before
+    /// it, and must stay invisible on the wire.
+    #[test]
+    fn boxing_the_programme_report_does_not_change_its_wire_bytes() {
+        let report = programme_progress_view();
+        let boxed = postcard::to_allocvec(&View::ProgrammeProgress(Box::new(report.clone()))).unwrap();
+        let bare = postcard::to_allocvec(&report).unwrap();
+        assert_eq!(boxed[0], 11);
+        assert_eq!(&boxed[1..], &bare[..], "the box must add nothing to the encoding");
     }
 
     /// `ReviewKindView` rides inside tag 10, so its own variant order is wire format

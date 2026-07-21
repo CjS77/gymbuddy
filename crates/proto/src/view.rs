@@ -69,6 +69,14 @@ pub enum View {
     /// `View` travels inside `ServerResponse` on every reply. `Box` is transparent to
     /// serde, so the wire bytes are exactly those of an unboxed `SessionReviewView`.
     SessionReview(Box<SessionReviewView>),
+    /// The full report on a live programme ( `/programme status` , [C4.6]): where the
+    /// user is, how well the grid is being kept to, and where the goals it serves are
+    /// heading.
+    ///
+    /// A new variant rather than more fields on [`ProgrammeView`], which is closed — see
+    /// the append-only note on its `status` field. Boxed like its two neighbours, and for
+    /// the same reason.
+    ProgrammeProgress(Box<ProgrammeProgressView>),
 }
 
 impl View {
@@ -104,6 +112,7 @@ impl View {
             View::Programme(p) => format!("Here's a programme: {} ({}).", p.title, p.shape_line()),
             View::Progress(p) => p.summary_line(),
             View::SessionReview(r) => r.summary_line(),
+            View::ProgrammeProgress(p) => p.summary_line(),
         }
     }
 }
@@ -377,14 +386,9 @@ impl ProgrammeView {
     }
 
     /// Where the user is, e.g. "Week 3 of 12 — accumulation", or `None` for a programme
-    /// with no [`status`](Self::status) to report. Lives here rather than on
-    /// [`ProgrammeStatusView`] because the span it counts against is the programme's.
+    /// with no [`status`](Self::status) to report.
     pub fn position_line(&self) -> Option<String> {
-        let status = self.status.as_ref()?;
-        Some(match &status.block_focus {
-            Some(focus) => format!("Week {} of {} — {focus}", status.current_week, self.weeks),
-            None => format!("Week {} of {}", status.current_week, self.weeks),
-        })
+        Some(self.status.as_ref()?.position_line(self.weeks))
     }
 }
 
@@ -421,6 +425,18 @@ impl ProgrammeStatusView {
     /// by every client renderer so the tally reads identically everywhere.
     pub fn counts_line(&self) -> String {
         format!("{} trained · {} missed · {} skipped · {} to go", self.trained, self.missed, self.skipped, self.remaining)
+    }
+
+    /// Where the user is against a programme of `weeks` weeks, e.g.
+    /// "Week 3 of 12 — accumulation". Takes the span as an argument because it belongs to
+    /// the programme, not to the position — [`ProgrammeView::position_line`] and
+    /// [`ProgrammeProgressView`] both read it from here so the two reports cannot end up
+    /// with two spellings of the same sentence.
+    pub fn position_line(&self, weeks: u32) -> String {
+        match &self.block_focus {
+            Some(focus) => format!("Week {} of {weeks} — {focus}", self.current_week),
+            None => format!("Week {} of {weeks}", self.current_week),
+        }
     }
 }
 
@@ -849,6 +865,141 @@ impl ReviewRecordView {
     }
 }
 
+// ── /programme status ────────────────────────────────────────────────────────────
+
+/// The full report on a live programme ([C4.6]): the skeleton being walked, how well it
+/// is being kept to, and where the goals it serves are heading.
+///
+/// The three questions §2 asks of a programme, in the order a user asks them: *where am
+/// I* (the [`ProgrammeView`]'s own [`status`](ProgrammeView::status)), *am I keeping to
+/// it* ([`adherence`](Self::adherence)), *is it working* ([`goals`](Self::goals)).
+///
+/// The programme travels whole rather than restated field by field: the position half
+/// already ships inside a [`ProgrammeView`] ([R2.1]), and a client that can render one
+/// needs no second layout for the same nine fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProgrammeProgressView {
+    /// The programme being reported on. Always live and always carrying a
+    /// [`ProgrammeStatusView`] — a draft has nowhere to be and nothing to adhere to.
+    pub programme: ProgrammeView,
+    /// How well the repeating week is actually being kept to.
+    pub adherence: ProgrammeAdherenceView,
+    /// One [`SeriesShape::Trajectory`] per goal the programme serves, highest priority
+    /// first — the [C6.2] contract, so no client needs new chart code to plot them.
+    ///
+    /// The readings and the target, nothing more: what they are *likely* to add up to is
+    /// a separate question ([C6.4]) with its own answer, and is deliberately not folded
+    /// into the numbers here.
+    pub goals: Vec<SeriesView>,
+}
+
+impl ProgrammeProgressView {
+    /// The line every renderer leads with, e.g. "12-week hypertrophy — Week 3 of 12 —
+    /// accumulation". Falls back to the programme's shape if it somehow arrives without a
+    /// position, so the view still announces itself.
+    pub fn summary_line(&self) -> String {
+        let tail = self.programme.position_line().unwrap_or_else(|| self.programme.shape_line());
+        format!("{} — {tail}", self.programme.title)
+    }
+}
+
+/// How well a live programme is being kept to ([C4.6]), read off the drift [C4.4] already
+/// measured rather than re-derived here.
+///
+/// Counts *settled* slots — those the calendar has closed — because a slot still ahead has
+/// been neither kept nor missed, and counting it as either would report every programme as
+/// failing until its final week.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgrammeAdherenceView {
+    /// Slots the calendar has closed: trained, missed and skipped together.
+    pub settled: u32,
+    /// Of those, the ones actually trained.
+    pub trained: u32,
+    /// Every recurring day whose misses are a standing pattern rather than one bad week,
+    /// worst first. Empty while the programme is being kept to.
+    pub drifting_days: Vec<DayAdherenceView>,
+    /// What to do about that pattern, or `None` when nothing needs moving.
+    pub reschedule: Option<RescheduleView>,
+}
+
+impl ProgrammeAdherenceView {
+    /// Share of the settled slots that were trained, `0.0..=1.0`.
+    ///
+    /// `None` before the calendar has closed a single slot: a programme starting today has
+    /// missed nothing, and "0%" would read as a failure the user has not yet had the
+    /// chance to have.
+    pub fn rate(&self) -> Option<f64> {
+        (self.settled > 0).then(|| f64::from(self.trained) / f64::from(self.settled))
+    }
+
+    /// The adherence line, e.g. "Trained 5 of the 6 sessions due so far (83%)". Shared by
+    /// every client renderer so the figure reads identically everywhere.
+    pub fn rate_line(&self) -> String {
+        match self.rate() {
+            Some(rate) => format!("Trained {} of the {} sessions due so far ({:.0}%)", self.trained, self.settled, rate * 100.0),
+            None => "Nothing has come due yet.".to_string(),
+        }
+    }
+}
+
+/// One recurring training day of the programme's repeating week, rolled up over every
+/// settled slot that shares it ([C4.4]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DayAdherenceView {
+    /// 1-based ordinal training day within the week, never a calendar weekday — the same
+    /// index [`ProgrammeDayView`] carries.
+    pub day_idx: u32,
+    /// The day's focus, shared across every week it repeats in.
+    pub focus: String,
+    pub trained: u32,
+    pub missed: u32,
+}
+
+impl DayAdherenceView {
+    /// The per-day line, e.g. "Day 1 (upper): 1 of 4 trained".
+    pub fn line(&self) -> String {
+        format!("Day {} ({}): {} of {} trained", self.day_idx, self.focus, self.trained, self.trained + self.missed)
+    }
+}
+
+/// What to do about a day the user keeps missing ([C4.4]) — shift it, drop it, or compress
+/// what is left — as a decision a client can act on rather than only a sentence to print.
+///
+/// Rides inside an appended `View` variant, so its own variant order is wire format too.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RescheduleView {
+    /// One recurring day is repeatedly missed while the rest of the week holds: move it to
+    /// a day the user can make. Weekly volume and the programme's span both unchanged.
+    Shift { day_idx: u32, focus: String },
+    /// The user is realistically training fewer days a week than the plan asks: drop the
+    /// worst-adhered day from the weeks ahead. Lower weekly volume, same span.
+    Drop { day_idx: u32, focus: String },
+    /// The user is behind and the target end date is closing in: consolidate the remaining
+    /// work into the weeks that are left.
+    Compress,
+}
+
+impl RescheduleView {
+    /// The offer to put to the user, in words — a PT moving leg day, not a scold, and
+    /// always an offer rather than a change already made. Lives here so every client makes
+    /// the same one.
+    pub fn offer(&self) -> String {
+        match self {
+            Self::Shift { day_idx, focus } => format!(
+                "You keep missing day {day_idx} ({focus}) -- that usually means the day is wrong, not the effort. \
+                 Tell me a day that works and I'll shift it."
+            ),
+            Self::Drop { day_idx, focus } => format!(
+                "Day {day_idx} ({focus}) keeps slipping -- it may be one day a week more than fits your life right now. \
+                 Say the word and I'll drop it from the weeks ahead."
+            ),
+            Self::Compress => "You're behind where the calendar expected and the end date is close. I can compress what's left into \
+                 the weeks that remain so it still lands on time -- want me to?"
+                .to_string(),
+        }
+    }
+}
+
 /// Render a change with an explicit sign, so "+2.5" and "-2.5" read as movement
 /// rather than as values.
 fn signed(v: f64) -> String {
@@ -884,6 +1035,7 @@ pub(crate) mod tests {
             View::Progress(ProgressView { headline: String::new(), series: vec![], notes: vec![] }),
             View::SessionReview(Box::new(session_review_view())),
             View::SessionReview(Box::new(SessionReviewView { headline: String::new(), ..session_review_view() })),
+            View::ProgrammeProgress(Box::new(programme_progress_view())),
         ];
         for view in &views {
             assert!(!view.fallback_text().is_empty(), "empty fallback for {view:?}");
@@ -1209,6 +1361,55 @@ pub(crate) mod tests {
             }),
             ..programme_view()
         }
+    }
+
+    /// The full [C4.6] report on that same live programme: its position, the day it keeps
+    /// missing, and the goal it serves as a trajectory.
+    pub(crate) fn programme_progress_view() -> ProgrammeProgressView {
+        ProgrammeProgressView {
+            programme: programme_status_view(),
+            adherence: ProgrammeAdherenceView {
+                settled: 6,
+                trained: 5,
+                drifting_days: vec![DayAdherenceView { day_idx: 1, focus: "upper".into(), trained: 1, missed: 3 }],
+                reschedule: Some(RescheduleView::Shift { day_idx: 1, focus: "upper".into() }),
+            },
+            goals: vec![trend()],
+        }
+    }
+
+    #[test]
+    fn programme_progress_lines_read_for_humans() {
+        let view = programme_progress_view();
+        assert_eq!(view.summary_line(), "12-week hypertrophy — Week 3 of 12 — accumulation");
+        assert_eq!(view.adherence.rate_line(), "Trained 5 of the 6 sessions due so far (83%)");
+        assert_eq!(view.adherence.drifting_days[0].line(), "Day 1 (upper): 1 of 4 trained");
+
+        let offer = view.adherence.reschedule.unwrap().offer();
+        assert!(offer.contains("missing day 1 (upper)"), "the offer must name the day: {offer}");
+        assert!(offer.contains("shift it"), "and offer to move it rather than scold: {offer}");
+    }
+
+    /// A programme that started today has missed nothing, and "0%" would report a failure
+    /// the user has not yet had the chance to have.
+    #[test]
+    fn adherence_withholds_a_rate_until_something_has_settled() {
+        let fresh = ProgrammeAdherenceView { settled: 0, trained: 0, drifting_days: vec![], reschedule: None };
+        assert_eq!(fresh.rate(), None);
+        assert_eq!(fresh.rate_line(), "Nothing has come due yet.");
+
+        let missed_everything = ProgrammeAdherenceView { settled: 4, trained: 0, ..fresh };
+        assert_eq!(missed_everything.rate(), Some(0.0), "settled and untrained is a real 0%, not an absent reading");
+    }
+
+    /// Goals ride in as trajectories and nothing more: the target and the readings, with
+    /// the question of where they land left to [C6.4].
+    #[test]
+    fn programme_goals_travel_as_plain_trajectories() {
+        let view = programme_progress_view();
+        assert_eq!(view.goals[0].shape, SeriesShape::Trajectory { target: 100.0 });
+        assert_eq!(view.goals[0].target_line(), "Target: 100 kg");
+        assert_eq!(view.goals[0].change_line(), "80 → 92.5 kg (+12.5, better)");
     }
 
     #[test]
