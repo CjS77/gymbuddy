@@ -887,11 +887,7 @@ fn trim_decimal(v: f64) -> String {
 mod tests {
     use super::super::test_support::*;
     use super::*;
-    use crate::db::{
-        Goal, GoalKind, LifecycleStatus, Programme, ProgrammeSlot, RosterExercise, SlotStatus, new_exercise_entry_at, new_exercise_goal,
-        new_exercise_set,
-    };
-    use crate::db::SetEdit;
+    use crate::db::{GoalKind, RosterExercise, SetEdit, SlotStatus, new_exercise_entry_at, new_exercise_goal, new_exercise_set};
     use gymbuddy_proto::{ReviewKindView, View};
 
     /// A canned commentary reply in the envelope every prompt asks for.
@@ -947,35 +943,41 @@ mod tests {
         .unwrap();
 
         if programme {
-            let programme_id = db
-                .create_programme(&Programme {
-                    id: 0,
-                    user_id: user.id,
-                    title: "12-week hypertrophy".into(),
-                    start_date: "2026-06-01".into(),
-                    target_end_date: None,
-                    days_per_week: 3,
-                    split: "upper/lower".into(),
-                    progression_policy: "double progression".into(),
-                    status: LifecycleStatus::Active,
-                    created_at: String::new(),
-                    updated_at: String::new(),
-                })
-                .unwrap();
-            let slot_id = db
-                .add_programme_slot(&ProgrammeSlot {
-                    id: 0,
-                    programme_id,
-                    week_idx: 2,
-                    day_idx: 1,
-                    focus: "upper".into(),
-                    status: SlotStatus::Pending,
-                    updated_at: String::new(),
-                })
-                .unwrap();
+            let programme_id = db.create_programme(&programme_row(user.id, "2026-06-01", None)).unwrap();
+            let slot_id = db.add_programme_slot(&pending_slot(programme_id, 2, 1, "upper")).unwrap();
             db.bind_roster_to_slot(roster_id, slot_id).unwrap();
         }
         db.bind_roster_to_session(roster_id, session_id).unwrap();
+    }
+
+    /// The programme row every fixture below starts from — three days a week, upper/lower.
+    /// `create_programme` always writes a draft, so activating is a separate step.
+    fn programme_row(user_id: i64, start_date: &str, target_end_date: Option<&str>) -> Programme {
+        Programme {
+            id: 0,
+            user_id,
+            title: "12-week hypertrophy".into(),
+            start_date: start_date.to_string(),
+            target_end_date: target_end_date.map(str::to_string),
+            days_per_week: 3,
+            split: "upper/lower".into(),
+            progression_policy: "double progression".into(),
+            status: LifecycleStatus::Active,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    fn pending_slot(programme_id: i64, week: i32, day: i32, focus: &str) -> ProgrammeSlot {
+        ProgrammeSlot {
+            id: 0,
+            programme_id,
+            week_idx: week,
+            day_idx: day,
+            focus: focus.into(),
+            status: SlotStatus::Pending,
+            updated_at: String::new(),
+        }
     }
 
     // ── The two-tier split ────────────────────────────────────────────────────
@@ -1312,33 +1314,10 @@ mod tests {
     /// design would target it, so the review's pointer must name it.
     async fn active_programme_with_pending_slot(handler: &AssistantHandler, user: &User, week: i32, day: i32, focus: &str) {
         let db = handler.db.lock().await;
-        let programme_id = db
-            .create_programme(&Programme {
-                id: 0,
-                user_id: user.id,
-                title: "12-week hypertrophy".into(),
-                // Today, so the target week is still in the future and the sweep leaves it pending.
-                start_date: today_str(),
-                target_end_date: None,
-                days_per_week: 3,
-                split: "upper/lower".into(),
-                progression_policy: "double progression".into(),
-                status: LifecycleStatus::Active,
-                created_at: String::new(),
-                updated_at: String::new(),
-            })
-            .unwrap();
+        // Started today, so the target week is still in the future and the sweep leaves it pending.
+        let programme_id = db.create_programme(&programme_row(user.id, &today_str(), None)).unwrap();
         db.activate_programme(programme_id).unwrap();
-        db.add_programme_slot(&ProgrammeSlot {
-            id: 0,
-            programme_id,
-            week_idx: week,
-            day_idx: day,
-            focus: focus.into(),
-            status: SlotStatus::Pending,
-            updated_at: String::new(),
-        })
-        .unwrap();
+        db.add_programme_slot(&pending_slot(programme_id, week, day, focus)).unwrap();
     }
 
     /// Direction-awareness is the correctness bar the ticket sets: a decrease goal's distance
@@ -1387,5 +1366,174 @@ mod tests {
 
         let suffix = handler.write_session_review(&user, session_id).await.expect("a review note");
         assert!(suffix.contains("Next up — week 3, day 2: pull. /nextworkout when you're ready."), "{suffix}");
+    }
+
+    // ── Programme completion ([R4.1]) ─────────────────────────────────────────
+
+    /// An active programme serving one bench-press goal at `target`, with a pending slot in a
+    /// week the calendar has not closed. The only ending available to it is its goals.
+    async fn programme_serving_a_goal(handler: &AssistantHandler, user: &User, target: f64) -> i64 {
+        let db = handler.db.lock().await;
+        let bench = db.get_exercise_type_by_name("Bench Press").unwrap().unwrap();
+        let mut goal = new_exercise_goal(user.id, bench.id, target);
+        goal.start_date = "2026-01-01".into();
+        let goal_id = db.insert_goal(&goal).unwrap();
+
+        let programme_id = db.create_programme(&programme_row(user.id, &today_str(), None)).unwrap();
+        db.activate_programme(programme_id).unwrap();
+        db.add_programme_goal(programme_id, goal_id).unwrap();
+        db.add_programme_slot(&pending_slot(programme_id, 1, 1, "upper")).unwrap();
+        programme_id
+    }
+
+    /// Bind an executed roster to `slot_id` and to the session — the state a programme session
+    /// is in once it has been run, which is what makes its slot count as trained rather than
+    /// merely designed.
+    async fn run_slot(handler: &AssistantHandler, user: &User, session_id: i64, slot_id: i64) {
+        let db = handler.db.lock().await;
+        let roster_id = db.create_roster(user.id, "Upper push", None, None).unwrap();
+        db.bind_roster_to_slot(roster_id, slot_id).unwrap();
+        db.bind_roster_to_session(roster_id, session_id).unwrap();
+        db.set_roster_status(roster_id, LifecycleStatus::Completed).unwrap();
+    }
+
+    async fn programme_status_of(handler: &AssistantHandler, programme_id: i64) -> LifecycleStatus {
+        handler.db.lock().await.get_programme(programme_id).unwrap().unwrap().status
+    }
+
+    /// The spec's end-to-end case, driven through the real turn loop: a programme whose last
+    /// goal this session reaches is over, the reply closes the loop back onto `/programme`
+    /// rather than onto the next workout, and `/review` carries the congratulation.
+    #[tokio::test]
+    async fn finishing_a_programmes_goals_congratulates_and_proposes_the_next() {
+        let log = r#"{"message": "Logged.", "actions": [
+            {"type": "log_exercise", "exercise": "Bench Press", "sets": 3, "reps": 6, "weight_kg": 80.0}
+        ]}"#;
+        let (handler, llm) = setup_handler(log).await;
+        let msg = make_message(12345, "hello");
+        let _ = handler.handle_text_message(&msg, "hello").await.unwrap();
+        let user = { handler.db.lock().await.get_user_by_telegram_id("12345").unwrap().unwrap() };
+        // An earlier session already put the goal within reach; this one is the session the
+        // review speaks for, and the one the completion check runs inside.
+        let _earlier = logged_session(&handler, &user, 80.0, 3).await;
+        let programme_id = programme_serving_a_goal(&handler, &user, 60.0).await;
+
+        let _ = handler.handle_text_message(&msg, "bench 80kg 6 reps").await.unwrap();
+        llm.set_response(r#"{"message": "Ending.", "actions": [{"type": "end_session"}]}"#);
+        let ended = shown(&handler.handle_text_message(&msg, "done").await.unwrap());
+
+        assert!(ended.contains("Programme complete — run /programme when you're ready to build the next one."), "{ended}");
+        assert!(!ended.contains("/nextworkout"), "a finished programme has no next slot to point at: {ended}");
+        assert_eq!(programme_status_of(&handler, programme_id).await, LifecycleStatus::Completed);
+
+        let replayed = shown(&handler.handle_text_message(&msg, "/review").await.unwrap());
+        assert!(replayed.contains("Programme complete: 12-week hypertrophy"), "the banner: {replayed}");
+        assert!(replayed.contains("Every goal it served is reached"), "the congratulation: {replayed}");
+        assert!(replayed.contains("Bench Press to 60"), "named in the achieved-goals framing: {replayed}");
+    }
+
+    /// The unflattering ending. A programme whose target date arrived with the plan untrained
+    /// still completes — the calendar is not negotiable — but the banner reports the adherence
+    /// rather than congratulating a programme nobody ran.
+    #[tokio::test]
+    async fn a_programme_that_ran_out_of_calendar_is_completed_without_a_compliment() {
+        let (handler, _) = setup_handler(COMMENTARY).await;
+        let user = ready_user(&handler).await;
+        let programme_id = {
+            let db = handler.db.lock().await;
+            let id = db.create_programme(&programme_row(user.id, "2026-01-01", Some("2026-03-01"))).unwrap();
+            db.activate_programme(id).unwrap();
+            // Designed and never run. `filled` survives the missed-slot sweep, so the grid is
+            // still unsettled and the target date is the only thing that can end this.
+            (1..=4).for_each(|day| {
+                let slot_id = db.add_programme_slot(&pending_slot(id, 1, day, "upper")).unwrap();
+                db.set_slot_status(slot_id, SlotStatus::Filled).unwrap();
+            });
+            id
+        };
+        let session_id = logged_session(&handler, &user, 82.5, 3).await;
+
+        let view = handler.generate_session_review(&user, session_id).await.unwrap();
+        let done = view.programme_complete.expect("the calendar ended it");
+        assert_eq!(done.verdict(), "Its target end date has passed — 0 of 4 sessions trained.");
+        assert!(done.achieved_goals.is_empty(), "nothing was reached, so nothing is claimed");
+        assert_eq!(programme_status_of(&handler, programme_id).await, LifecycleStatus::Completed);
+    }
+
+    /// The grid ending, plus the snapshot promise over it: this session resolves the last slot,
+    /// and regenerating the review — which correcting the session effort does as a matter of
+    /// course — reproduces the banner instead of losing it to a programme that is, by then, no
+    /// longer active.
+    #[tokio::test]
+    async fn a_settled_grid_completes_the_programme_and_the_banner_survives_regeneration() {
+        let (handler, _) = setup_handler(COMMENTARY).await;
+        let user = ready_user(&handler).await;
+        let session_id = logged_session(&handler, &user, 82.5, 3).await;
+        let (programme_id, first_slot) = {
+            let db = handler.db.lock().await;
+            // Week 1 is long closed, so the day the user never trained sweeps to missed.
+            let id = db.create_programme(&programme_row(user.id, "2026-01-01", None)).unwrap();
+            db.activate_programme(id).unwrap();
+            let first = db.add_programme_slot(&pending_slot(id, 1, 1, "upper")).unwrap();
+            db.add_programme_slot(&pending_slot(id, 1, 2, "lower")).unwrap();
+            (id, first)
+        };
+        run_slot(&handler, &user, session_id, first_slot).await;
+
+        let view = handler.generate_session_review(&user, session_id).await.unwrap();
+        let done = view.programme_complete.clone().expect("the grid is settled");
+        assert_eq!(done.verdict(), "Every session in the plan is settled — 1 of 2 sessions trained.");
+        assert_eq!(programme_status_of(&handler, programme_id).await, LifecycleStatus::Completed);
+
+        let again = handler.generate_session_review(&user, session_id).await.unwrap();
+        assert_eq!(again.programme_complete, view.programme_complete, "the banner is part of the record, not of the moment");
+    }
+
+    /// The guards on the two structural endings. A programme that serves no goals has not met
+    /// them all, and a grid with no slots has not been walked — vacuously true is not true.
+    /// Without these the very first session under any bare programme would finish it.
+    #[tokio::test]
+    async fn a_programme_with_nothing_to_finish_does_not_finish_itself() {
+        let (handler, _) = setup_handler(COMMENTARY).await;
+        let user = ready_user(&handler).await;
+        let programme_id = {
+            let db = handler.db.lock().await;
+            let id = db.create_programme(&programme_row(user.id, &today_str(), None)).unwrap();
+            db.activate_programme(id).unwrap();
+            id
+        };
+        let session_id = logged_session(&handler, &user, 82.5, 3).await;
+
+        let view = handler.generate_session_review(&user, session_id).await.unwrap();
+        assert!(view.programme_complete.is_none(), "no goals and no grid is nothing to have finished");
+        assert_eq!(programme_status_of(&handler, programme_id).await, LifecycleStatus::Active);
+
+        let suffix = handler.write_session_review(&user, session_id).await.expect("a review note");
+        assert!(suffix.contains("/nextworkout when you're ready."), "the [R4.2] ending still applies: {suffix}");
+        assert!(!suffix.contains("/programme"), "{suffix}");
+    }
+
+    /// The completion reaches the commentary prompt as the same two lines the user is shown.
+    /// A model told only that the programme is finished writes the celebration every time;
+    /// told four of twenty-four sessions were trained, it cannot.
+    #[tokio::test]
+    async fn the_commentary_prompt_is_told_how_the_programme_actually_went() {
+        let (handler, llm) = setup_handler(COMMENTARY).await;
+        let user = ready_user(&handler).await;
+        let session_id = logged_session(&handler, &user, 82.5, 3).await;
+        let slot_id = {
+            let db = handler.db.lock().await;
+            let id = db.create_programme(&programme_row(user.id, "2026-01-01", None)).unwrap();
+            db.activate_programme(id).unwrap();
+            db.add_programme_slot(&pending_slot(id, 1, 1, "upper")).unwrap()
+        };
+        run_slot(&handler, &user, session_id, slot_id).await;
+        let before = llm.recorded_requests().len();
+
+        handler.generate_session_review(&user, session_id).await.unwrap();
+
+        let prompt = &llm.recorded_requests()[before].messages[0].content;
+        assert!(prompt.contains("PROGRAMME FINISHED BY THIS SESSION"), "{prompt}");
+        assert!(prompt.contains("Every session in the plan is settled — 1 of 1 sessions trained."), "{prompt}");
     }
 }

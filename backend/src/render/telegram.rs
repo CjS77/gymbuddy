@@ -415,7 +415,8 @@ pub(crate) fn escape_html(s: &str) -> String {
 mod tests {
     use super::*;
     use gymbuddy_proto::{
-        CatalogEntry, CatalogGroup, Direction, ExerciseLog, HealthNote, Measurement, ProgrammeAdherenceView, ReviewEffortView,
+        CatalogEntry, CatalogGroup, Direction, ExerciseLog, HealthNote, Measurement, ProgrammeAdherenceView, ProgrammeCompleteView,
+        ReviewEffortView,
         ReviewExerciseView, ReviewKindView, ReviewRecordView, SeriesPointView, SessionView,
     };
 
@@ -663,6 +664,33 @@ mod tests {
                         Streak: 4 days\n\
                         This week: 3 sessions, 12400 kg total volume\n";
         assert_eq!(html, expected);
+    }
+
+    /// The [R4.1] banner leads the review, above even the goal this session finished, and
+    /// carries the adherence Core computed with it. A programme that ended because its target
+    /// date arrived is not dressed up as one that met its goals.
+    #[test]
+    fn a_completed_programme_leads_the_review_with_how_it_actually_went() {
+        let complete = |reason: &str, trained| ProgrammeCompleteView {
+            title: "12-week hypertrophy".into(),
+            reason: reason.into(),
+            trained,
+            total: 24,
+            achieved_goals: vec!["Overhead Press to 40".into()],
+        };
+
+        let won = SessionReviewView { programme_complete: Some(complete("every goal it served is reached", 22)), ..review_fixture() };
+        let (html, _) = Telegram.render(&View::SessionReview(Box::new(won)));
+        assert!(html.contains("<b>Programme complete: 12-week hypertrophy</b>"), "{html}");
+        assert!(html.contains("Every goal it served is reached — 22 of 24 sessions trained."), "{html}");
+        assert!(html.contains("Goals reached under it:\n- Overhead Press to 40\n"), "the achieved-goals framing: {html}");
+        let banner = html.find("Programme complete").expect("the banner");
+        let session_goal = html.find("<b>Goal reached</b>").expect("the session's own achievement");
+        assert!(banner < session_goal, "finishing the plan outranks one session inside it: {html}");
+
+        let ran_out = SessionReviewView { programme_complete: Some(complete("its target end date has passed", 4)), ..review_fixture() };
+        let (html, _) = Telegram.render(&View::SessionReview(Box::new(ran_out)));
+        assert!(html.contains("Its target end date has passed — 4 of 24 sessions trained."), "no compliment is invented: {html}");
     }
 
     /// A derived effort says so, so the user knows it is open to correction — the note

@@ -819,6 +819,37 @@ mod tests {
         assert_eq!(lines[goal].spans.last().unwrap().style.fg, Some(SUCCESS), "a reached goal is coloured as the win it is");
     }
 
+    /// A finished programme ([R4.1]) renders above the session's own achievement, coloured as
+    /// the win it is — and its verdict line is Core's sentence verbatim, so a programme the
+    /// calendar merely ran out on reads as one in the very same place.
+    #[test]
+    fn session_review_leads_with_a_finished_programme() {
+        use gymbuddy_proto::ProgrammeCompleteView;
+        let complete = |reason: &str, trained| ProgrammeCompleteView {
+            title: "12-week hypertrophy".into(),
+            reason: reason.into(),
+            trained,
+            total: 24,
+            achieved_goals: vec!["Overhead Press to 40kg".into()],
+        };
+
+        let won = SessionReviewView { programme_complete: Some(complete("every goal it served is reached", 22)), ..full_review() };
+        let lines = render(&View::SessionReview(Box::new(won)));
+        let text = flat(&lines);
+        assert!(text.contains("Programme complete: 12-week hypertrophy"), "the banner: {text}");
+        assert!(text.contains("Every goal it served is reached — 22 of 24 sessions trained."), "the verdict: {text}");
+
+        let banner = lines.iter().position(|l| flat(std::slice::from_ref(l)).starts_with("Programme complete")).expect("the banner");
+        let achievement =
+            lines.iter().position(|l| flat(std::slice::from_ref(l)).starts_with("Goal reached")).expect("the session's achievement");
+        assert!(banner < achievement, "finishing the plan outranks one session inside it: {banner} vs {achievement}");
+        assert_eq!(lines[banner].spans[0].style.fg, Some(SUCCESS), "the banner is coloured as the win it is");
+
+        let ran_out = SessionReviewView { programme_complete: Some(complete("its target end date has passed", 4)), ..full_review() };
+        let text = flat(&render(&View::SessionReview(Box::new(ran_out))));
+        assert!(text.contains("Its target end date has passed — 4 of 24 sessions trained."), "no compliment is invented: {text}");
+    }
+
     /// The verdict is Core's, and a blunt one is not softened in the render — a partial
     /// session says so, verbatim.
     #[test]
