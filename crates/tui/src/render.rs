@@ -11,8 +11,9 @@
 //! this side of the wall, where `app.rs` never has to know about them ([T1.1]).
 
 use gymbuddy_proto::{
-    CatalogView, ExerciseLog, HistoryView, PROGRAMME_LOCK_IN_ASK, ProgrammeView, ProgressView, ReviewEffortView, ReviewExerciseView,
-    ReviewRecordView, SeriesShape, SeriesView, SessionReviewView, SessionRosterView, SetLine, StatusView, TrainingModeView, View,
+    CatalogView, DayAdherenceView, ExerciseLog, HistoryView, PROGRAMME_LOCK_IN_ASK, ProgrammeAdherenceView, ProgrammeProgressView,
+    ProgrammeView, ProgressView, ReviewEffortView, ReviewExerciseView, ReviewRecordView, SeriesShape, SeriesView, SessionReviewView,
+    SessionRosterView, SetLine, StatusView, TrainingModeView, View,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -30,10 +31,10 @@ const MUTED: Color = Color::DarkGray;
 /// Render a view into transcript lines (without the speaker prefix, which the
 /// transcript adds).
 ///
-/// `width` is the room the transcript has for a line. The charts of [`View::Progress`]
-/// and [`View::SessionReview`] use it, and they need it: a `Chart` is drawn into a fixed
-/// area, and one drawn wider than the transcript would be folded by the `Paragraph`'s
-/// wrap into something worse than no chart at all.
+/// `width` is the room the transcript has for a line. The charts of [`View::Progress`],
+/// [`View::SessionReview`] and [`View::ProgrammeProgress`] use it, and they need it: a
+/// `Chart` is drawn into a fixed area, and one drawn wider than the transcript would be
+/// folded by the `Paragraph`'s wrap into something worse than no chart at all.
 pub fn render_view(view: &View, width: u16) -> Vec<Line<'static>> {
     match view {
         View::Message { text, notes, failures } => render_message(text, notes, failures),
@@ -46,10 +47,7 @@ pub fn render_view(view: &View, width: u16) -> Vec<Line<'static>> {
         View::Programme(programme) => render_programme(programme),
         View::Progress(progress) => render_progress(progress, width),
         View::SessionReview(review) => render_session_review(review, width),
-        // [C4.6] lands as its headline until [T2.1] gives it a layout: a programme is
-        // long-lived context, and whether it belongs in the transcript or beside it in the
-        // persistent frame is that ticket's call.
-        View::ProgrammeProgress(report) => plain_lines(&report.summary_line()),
+        View::ProgrammeProgress(report) => render_programme_progress(report, width),
         View::Timers { enabled } => vec![Line::from(Span::styled(
             format!("Rest timers {}", if *enabled { "on" } else { "off" }),
             Style::default().fg(if *enabled { SUCCESS } else { MUTED }).add_modifier(Modifier::BOLD),
@@ -425,6 +423,59 @@ fn next_and_counts(p: &ProgrammeView) -> Vec<String> {
     };
     let next = status.next_slot.as_ref().map(|slot| format!("Next: {}", slot.label()));
     next.into_iter().chain([status.counts_line()]).collect()
+}
+
+/// The full report on a live programme ([C4.6]): where the user is, whether they are
+/// keeping to it, and where the goals it serves are heading.
+///
+/// **In the transcript, not the sidebar.** The sidebar holds state this client owns and
+/// can keep true — the rest-timer switch is flipped locally and every `/timers` reply
+/// confirms it. A programme report is a server snapshot the TUI only glimpses when the
+/// user asks for one, and there is no channel to refresh it: parked in a persistent pane,
+/// its adherence, its next slot and its week number would go stale with nothing to say
+/// so, which is worse than not showing them. The 20-column pane could not hold them
+/// either — no goal would ever chart in it (see [`MIN_CHART_WIDTH`]), and the reschedule
+/// offer is a sentence, not a field. In the transcript the report stays anchored to the
+/// turn that asked for it, dated by where it sits in the scrollback, and next to the
+/// input line the offer wants an answer from.
+///
+/// Leads with the position, then the programme exactly as `/programme` shows it: with a
+/// live programme `/programme` *is* this report, so a layout that dropped the blocks and
+/// the repeating week would leave no way to see them at all.
+fn render_programme_progress(r: &ProgrammeProgressView, width: u16) -> Vec<Line<'static>> {
+    let mut lines = programme_lines(heading(r.summary_line()), &r.programme, next_and_counts(&r.programme));
+    lines.extend(programme_adherence(&r.adherence));
+    lines.extend(programme_goals(&r.goals, width));
+    lines
+}
+
+/// How well the repeating week is being kept to: the rate, the days that are a standing
+/// pattern rather than one bad week, and the offer to do something about them.
+///
+/// No verdict is drawn from the rate — a percentage is a number, and the only judgement
+/// here is the one Core already made in `drifting_days` ([C4.4]). That judgement is
+/// carried by a section which is *absent* when nothing is drifting and says "keep
+/// missing" when something is; the warning colour only underlines the wording.
+fn programme_adherence(a: &ProgrammeAdherenceView) -> Vec<Line<'static>> {
+    let mut lines = bullet_section("Keeping to it", &[a.rate_line()]);
+    let drifting = a.drifting_days.iter().map(DayAdherenceView::line).collect();
+    lines.extend(titled_bullets(warning_heading("Days you keep missing"), drifting));
+    // Core's offer, verbatim and unmuted: it is the one line in the report that asks the
+    // user a question, and the answer is the next thing they type.
+    lines.extend(a.reschedule.iter().flat_map(|r| std::iter::once(Line::from("")).chain(plain_lines(&r.offer()))));
+    lines
+}
+
+/// The goals as trajectories, plotted by the same [T2.2] helpers `/progress` uses — the
+/// [C6.2] promise that every chart travels one path, degrading to a sparkline on a narrow
+/// transcript exactly as those do. Whether a goal will *arrive* is a separate question
+/// ([C6.4]) and is deliberately not answered here.
+fn programme_goals(goals: &[SeriesView], width: u16) -> Vec<Line<'static>> {
+    if goals.is_empty() {
+        return Vec::new();
+    }
+    let charts = goals.iter().enumerate().flat_map(|(i, s)| (i > 0).then(|| Line::from("")).into_iter().chain(render_series(s, width)));
+    [Line::from(""), bold("Where the goals are heading")].into_iter().chain(charts).collect()
 }
 
 /// Charts are indented to sit under the series title, like every other detail line.
