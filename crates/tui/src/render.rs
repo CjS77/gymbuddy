@@ -46,6 +46,10 @@ pub fn render_view(view: &View, width: u16) -> Vec<Line<'static>> {
         View::Programme(programme) => render_programme(programme),
         View::Progress(progress) => render_progress(progress, width),
         View::SessionReview(review) => render_session_review(review, width),
+        // [C4.6] lands as its headline until [T2.1] gives it a layout: a programme is
+        // long-lived context, and whether it belongs in the transcript or beside it in the
+        // persistent frame is that ticket's call.
+        View::ProgrammeProgress(report) => plain_lines(&report.summary_line()),
         View::Timers { enabled } => vec![Line::from(Span::styled(
             format!("Rest timers {}", if *enabled { "on" } else { "off" }),
             Style::default().fg(if *enabled { SUCCESS } else { MUTED }).add_modifier(Modifier::BOLD),

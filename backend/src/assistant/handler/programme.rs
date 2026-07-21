@@ -20,13 +20,16 @@ use crate::assistant::actions::{AssistantAction, ProposedProgrammeBlock, Propose
 use crate::assistant::parser::parse_assistant_response;
 use crate::assistant::prompts::build_programme_prompt;
 use crate::db::{
-    Database, GoalProgress, InterviewState, Programme, ProgrammeDrift, ProgrammeStatus, ReschedulePolicy, User, new_programme,
-    new_programme_block, new_programme_slot, today_str,
+    Database, GoalProgress, InterviewState, Programme, ProgrammeDrift, ProgrammeStatus, ReschedulePolicy, SlotCounts, SlotDrift, User,
+    new_programme, new_programme_block, new_programme_slot, today_str,
 };
 
 use super::AssistantHandler;
 use super::affirmative::is_affirmative;
-use gymbuddy_proto::{ProgrammeBlockView, ProgrammeDayView, ProgrammeSlotView, ProgrammeStatusView, ProgrammeView, View};
+use gymbuddy_proto::{
+    DayAdherenceView, ProgrammeAdherenceView, ProgrammeBlockView, ProgrammeDayView, ProgrammeProgressView, ProgrammeSlotView,
+    ProgrammeStatusView, ProgrammeView, RescheduleView, SeriesView, View,
+};
 
 /// The `interview_states.mode` value this interview runs under. The column's CHECK
 /// constraint accepts exactly `'philosophy'` and `'programme'`.
@@ -67,12 +70,13 @@ impl AssistantHandler {
         }
     }
 
-    /// `/programme status`: where the user is in their live programme.
+    /// `/programme status`: the full report on a live programme ([C4.6]) — where the user
+    /// is, whether they are keeping to it, and where the goals it serves are heading.
     ///
-    /// Costs no LLM call — every figure is read from the grid and the calendar. The
-    /// artefact is the same [`View::Programme`] the interview emits, carrying a
-    /// [`ProgrammeStatusView`] the draft has no equivalent of, so a client that can show
-    /// a programme can already show this one.
+    /// Costs no LLM call: the position and the tally come off the grid and the calendar,
+    /// adherence off the drift [C4.4] measured over the same settled slots, and each goal
+    /// arrives as the [C6.2] trajectory `/progress` already charts it as. Nothing here
+    /// judges whether a goal *arrives* — that is [C6.4]'s question.
     async fn cmd_programme_status(&self, user: &User, programme: &Programme) -> anyhow::Result<View> {
         let db = self.db.lock().await;
         // Sweeps stale weeks before reading, so the counts can never show a week as
@@ -80,14 +84,26 @@ impl AssistantHandler {
         let today = today_str();
         let status = db.programme_status(programme, &today)?;
         // Drift reads the same settled grid ([C4.4]): a consistently missed day earns a
-        // kind, actionable suggestion under the tally rather than a scolding in it.
+        // kind, actionable offer beside the tally rather than a scolding in it.
         let drift = db.programme_drift(programme, &today)?;
-        let goals = linked_goal_labels(&db, user.id, programme.id)?;
-        let notes = [next_step_note(&status)].into_iter().chain(drift_note(&drift)).collect();
-        let view = stored_programme_view(&db, programme, goals, notes, true)?;
+        let served = linked_goal_progress(&db, user.id, programme.id)?;
+        let labels = served.iter().map(goal_label).collect();
+        let view = stored_programme_view(&db, programme, labels, vec![next_step_note(&status)], true)?;
+        let goals = self.goal_trajectories(&db, user.id, &served)?;
 
         tracing::info!(user_id = user.id, programme_id = programme.id, week = status.current_week, "programme status");
-        Ok(View::Programme(Box::new(ProgrammeView { status: Some(status_view(&status)), ..view })))
+        Ok(View::ProgrammeProgress(Box::new(ProgrammeProgressView {
+            programme: ProgrammeView { status: Some(status_view(&status)), ..view },
+            adherence: adherence_view(&status.counts, &drift),
+            goals,
+        })))
+    }
+
+    /// One [C6.2] trajectory per goal the programme serves, charted exactly as `/progress`
+    /// charts it — the same series, asked for from the programme's side.
+    fn goal_trajectories(&self, db: &Database, user_id: i64, served: &[GoalProgress]) -> anyhow::Result<Vec<SeriesView>> {
+        let today = chrono::Utc::now().date_naive();
+        served.iter().map(|gp| self.goal_series(db, user_id, gp, today)).collect()
     }
 
     /// Enter the multi-turn `/programme` interview and return the opening question.
@@ -283,25 +299,41 @@ fn next_step_note(status: &ProgrammeStatus) -> String {
     }
 }
 
-/// The reschedule suggestion, when drift ([C4.4]) has earned one, as a note under the status
-/// report. Voices only the recommendation and offers to act — a PT moving leg day, not a scold —
-/// and leaves the per-day arithmetic to the tally above it. `None` when the programme is on track,
-/// so a kept programme's status carries no drift line at all.
-fn drift_note(drift: &ProgrammeDrift) -> Option<String> {
-    match drift.recommendation.as_ref()? {
-        ReschedulePolicy::Shift { day_idx, focus } => Some(format!(
-            "You keep missing day {day_idx} ({focus}) -- that usually means the day is wrong, not the effort. \
-             Tell me a day that works and I'll shift it."
-        )),
-        ReschedulePolicy::Drop { day_idx, focus } => Some(format!(
-            "Day {day_idx} ({focus}) keeps slipping -- it may be one day a week more than fits your life right now. \
-             Say the word and I'll drop it from the weeks ahead."
-        )),
-        ReschedulePolicy::Compress => Some(
-            "You're behind where the calendar expected and the end date is close. I can compress what's left into \
-             the weeks that remain so it still lands on time -- want me to?"
-                .to_string(),
-        ),
+/// The wire view of how well the programme is being kept to ([C4.6]): the settled slots,
+/// the days that keep lapsing, and the one reschedule they earn.
+///
+/// Both halves are read as [C4.4] and [R2.1] left them — the counts come from the swept
+/// grid and the drift from [`Database::programme_drift`], neither re-derived here. The
+/// only arithmetic is which of the counts have settled, since a slot still ahead has been
+/// neither kept nor missed.
+fn adherence_view(counts: &SlotCounts, drift: &ProgrammeDrift) -> ProgrammeAdherenceView {
+    let settled = counts.trained + counts.missed + counts.skipped;
+    ProgrammeAdherenceView {
+        settled: settled.max(0) as u32,
+        trained: counts.trained.max(0) as u32,
+        drifting_days: drift.drifting.iter().map(day_adherence_view).collect(),
+        reschedule: drift.recommendation.as_ref().map(reschedule_view),
+    }
+}
+
+/// One recurring day's adherence on the wire.
+fn day_adherence_view(day: &SlotDrift) -> DayAdherenceView {
+    DayAdherenceView {
+        day_idx: day.day_idx.max(0) as u32,
+        focus: day.focus.clone(),
+        trained: day.trained.max(0) as u32,
+        missed: day.missed.max(0) as u32,
+    }
+}
+
+/// The recommended reschedule on the wire. The offer's wording lives on
+/// [`RescheduleView::offer`], so every client makes the user the same one.
+fn reschedule_view(policy: &ReschedulePolicy) -> RescheduleView {
+    let day = |idx: &i32| (*idx).max(0) as u32;
+    match policy {
+        ReschedulePolicy::Shift { day_idx, focus } => RescheduleView::Shift { day_idx: day(day_idx), focus: focus.clone() },
+        ReschedulePolicy::Drop { day_idx, focus } => RescheduleView::Drop { day_idx: day(day_idx), focus: focus.clone() },
+        ReschedulePolicy::Compress => RescheduleView::Compress,
     }
 }
 
@@ -533,12 +565,17 @@ fn goal_label(gp: &GoalProgress) -> String {
 
 /// The display labels for the goals `programme_id` serves, in the DAO's priority order.
 fn linked_goal_labels(db: &Database, user_id: i64, programme_id: i64) -> anyhow::Result<Vec<String>> {
+    Ok(linked_goal_progress(db, user_id, programme_id)?.iter().map(goal_label).collect())
+}
+
+/// The goals `programme_id` serves, in the DAO's priority order, with the progress behind
+/// each — what both the labels and the [C4.6] report's trajectories are drawn from.
+fn linked_goal_progress(db: &Database, user_id: i64, programme_id: i64) -> anyhow::Result<Vec<GoalProgress>> {
     let progress = db.goal_progress_report(user_id, None, None)?;
     Ok(db
         .list_programme_goals(programme_id)?
         .iter()
-        .filter_map(|goal| progress.iter().find(|gp| gp.goal.id == goal.id))
-        .map(goal_label)
+        .filter_map(|goal| progress.iter().find(|gp| gp.goal.id == goal.id).cloned())
         .collect())
 }
 

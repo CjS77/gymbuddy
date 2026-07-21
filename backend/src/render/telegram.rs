@@ -4,8 +4,8 @@
 //! the Telegram bot is visually unchanged — locked down by golden tests below.
 
 use gymbuddy_proto::{
-    CatalogView, HistoryView, PROGRAMME_LOCK_IN_ASK, ProgrammeView, ProgressView, Render, SeriesShape, SeriesView, SessionReviewView,
-    SessionRosterView, SetLine, StatusView, TrainingModeView, View,
+    CatalogView, HistoryView, PROGRAMME_LOCK_IN_ASK, ProgrammeProgressView, ProgrammeView, ProgressView, Render, SeriesShape, SeriesView,
+    SessionReviewView, SessionRosterView, SetLine, StatusView, TrainingModeView, View,
 };
 
 /// The Telegram renderer. `Output` is `(text, parse_mode)` — `parse_mode` is
@@ -27,6 +27,7 @@ impl Render for Telegram {
             View::Programme(programme) => (render_programme(programme), Some("HTML")),
             View::Progress(progress) => (render_progress(progress), Some("HTML")),
             View::SessionReview(review) => (render_session_review(review), Some("HTML")),
+            View::ProgrammeProgress(report) => (render_programme_progress(report), Some("HTML")),
             View::Timers { enabled } => (format!("Rest timers are now {}.", if *enabled { "on" } else { "off" }), None),
             // `View` is `#[non_exhaustive]`: a variant from a newer server lands here.
             // Degrade to plain text rather than sending Telegram an empty message
@@ -222,6 +223,29 @@ fn render_programme(p: &ProgrammeView) -> String {
         result.push_str(&format!("\n{PROGRAMME_LOCK_IN_ASK}"));
     }
     result
+}
+
+/// Render the full report on a live programme ([C4.6]).
+///
+/// Leads with the programme itself — the same layout `/programme` produces, position
+/// included — because "where am I?" is the question the command was asked. Then the two
+/// halves this view adds: how well the week is being kept to, and where the goals it
+/// serves are heading. The charts go through the [C6.2] series renderer, never a second
+/// one grown here.
+fn render_programme_progress(p: &ProgrammeProgressView) -> String {
+    let mut out = render_programme(&p.programme);
+
+    out.push_str(&format!("\n<b>Keeping to it:</b>\n{}\n", escape_html(&p.adherence.rate_line())));
+    out.extend(p.adherence.drifting_days.iter().map(|day| format!("- {}\n", escape_html(&day.line()))));
+    if let Some(reschedule) = &p.adherence.reschedule {
+        out.push_str(&format!("\n{}\n", escape_html(&reschedule.offer())));
+    }
+
+    if !p.goals.is_empty() {
+        out.push_str("\n<b>Goals:</b>\n");
+        out.extend(p.goals.iter().map(|series| format!("\n{}", render_series(series))));
+    }
+    out
 }
 
 /// How wide a [`SeriesShape::Breakdown`] bar may grow. Telegram wraps on narrow

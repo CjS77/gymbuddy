@@ -916,7 +916,7 @@ pub struct ProgrammeAdherenceView {
     /// Of those, the ones actually trained.
     pub trained: u32,
     /// Every recurring day whose misses are a standing pattern rather than one bad week,
-    /// worst first. Empty while the programme is being kept to.
+    /// in day order. Empty while the programme is being kept to.
     pub drifting_days: Vec<DayAdherenceView>,
     /// What to do about that pattern, or `None` when nothing needs moving.
     pub reschedule: Option<RescheduleView>,

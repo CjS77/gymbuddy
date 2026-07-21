@@ -73,7 +73,10 @@ impl AssistantHandler {
     /// target. Exercise goals read their daily bests from the log (rolled up over the
     /// exercise's subtree, matching how the goal itself is judged); metric goals read
     /// the user's measurement series.
-    fn goal_series(&self, db: &Database, user_id: i64, gp: &GoalProgress, today: NaiveDate) -> anyhow::Result<SeriesView> {
+    ///
+    /// Shared with the programme report ([C4.6]), which charts the goals a programme
+    /// serves: one goal has one trajectory, however it is being asked for.
+    pub(super) fn goal_series(&self, db: &Database, user_id: i64, gp: &GoalProgress, today: NaiveDate) -> anyhow::Result<SeriesView> {
         let from = date_part(&gp.goal.start_date);
         let to = today.format("%Y-%m-%d").to_string();
 
