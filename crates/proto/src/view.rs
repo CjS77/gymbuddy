@@ -373,8 +373,9 @@ pub struct ProgrammeView {
     /// clients use this to decide whether to ask for that confirmation.
     pub active: bool,
     /// Where the user has got to, present only when the programme is being *reported on*
-    /// (`/programme status`) rather than proposed. A freshly designed programme has no
-    /// position to report, so this stays `None` through the whole `/programme` interview.
+    /// (inside a [`ProgrammeProgressView`]) rather than proposed. A freshly designed
+    /// programme has no position to report, so this stays `None` through the whole
+    /// `/programme` interview.
     pub status: Option<ProgrammeStatusView>,
 }
 
@@ -396,8 +397,8 @@ impl ProgrammeView {
 /// it, the next session due, and how the grid behind the user has resolved.
 ///
 /// Only the cheap half of programme reporting — counts of settled slots, no adherence
-/// ratios and no drift verdict. Those are [C4.4]'s, and will be built on these numbers
-/// rather than beside them.
+/// ratios and no drift verdict. Those live in [`ProgrammeAdherenceView`] ([C4.6]), built
+/// on these numbers rather than beside them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgrammeStatusView {
     /// The 1-based week the calendar puts the user in, clamped to the programme's span.
