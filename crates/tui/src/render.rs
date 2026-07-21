@@ -209,13 +209,21 @@ fn review_footer(r: &SessionReviewView) -> Vec<Line<'static>> {
 /// A bulleted section — a bold title over `  • item` lines, led by a blank line — or
 /// nothing at all when there is nothing to list.
 fn bullet_section(title: &str, items: &[String]) -> Vec<Line<'static>> {
+    titled_bullets(bold(title), items.to_vec())
+}
+
+/// [`bullet_section`] under a title line the caller styles — for a section whose title
+/// carries a verdict the plain bold heading cannot.
+fn titled_bullets(title: Line<'static>, items: Vec<String>) -> Vec<Line<'static>> {
     if items.is_empty() {
         return Vec::new();
     }
-    std::iter::once(Line::from(""))
-        .chain(std::iter::once(bold(title)))
-        .chain(items.iter().map(|item| Line::from(vec![Span::styled("  • ", Style::default().fg(MUTED)), Span::raw(item.clone())])))
-        .collect()
+    [Line::from(""), title].into_iter().chain(items.into_iter().map(bullet)).collect()
+}
+
+/// One `  • item` line, the marker muted so the item reads first.
+fn bullet(item: String) -> Line<'static> {
+    Line::from(vec![Span::styled("  • ", Style::default().fg(MUTED)), Span::raw(item)])
 }
 
 fn render_message(text: &str, notes: &[String], failures: &[String]) -> Vec<Line<'static>> {
@@ -258,7 +266,7 @@ fn render_status(status: &StatusView) -> Vec<Line<'static>> {
 
     if !status.health.is_empty() {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("Active health issues", Style::default().fg(WARNING).add_modifier(Modifier::BOLD))));
+        lines.push(warning_heading("Active health issues"));
         for note in &status.health {
             lines.push(Line::from(vec![
                 Span::styled("  • ", Style::default().fg(WARNING)),
@@ -350,13 +358,7 @@ fn render_session_roster(roster: &SessionRosterView, mode: Option<&TrainingModeV
         }
     }
 
-    if !roster.notes.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(bold("Notes"));
-        for note in &roster.notes {
-            lines.push(Line::from(vec![Span::styled("  • ", Style::default().fg(MUTED)), Span::raw(note.clone())]));
-        }
-    }
+    lines.extend(bullet_section("Notes", &roster.notes));
 
     lines.push(Line::from(""));
     lines.push(muted("Nothing is logged yet — log your sets as you go and I'll adjust.".into()));
@@ -368,49 +370,61 @@ fn render_session_roster(roster: &SessionRosterView, mode: Option<&TrainingModeV
 /// `/nextworkout` designs a roster for a slot.
 ///
 /// A draft closes with the lock-in ask; an active programme has nothing left to confirm.
-/// The "where you are" bullets of a live programme, or empty for one that is merely
-/// proposed — which renders as no section at all, the same as any other empty list.
-fn position_items(p: &ProgrammeView) -> Vec<String> {
-    let (Some(position), Some(status)) = (p.position_line(), p.status.as_ref()) else {
-        return Vec::new();
-    };
-    let next = status.next_slot.as_ref().map(|slot| format!("Next: {}", slot.label()));
-    [position].into_iter().chain(next).chain([status.counts_line()]).collect()
-}
-
 fn render_programme(p: &ProgrammeView) -> Vec<Line<'static>> {
-    let mut lines = vec![heading(p.title.clone()), muted(p.shape_line())];
-
-    lines.push(muted(match &p.target_end_date {
-        Some(end) => format!("{} to {end}", p.start_date),
-        None => format!("from {}", p.start_date),
-    }));
-    lines.push(muted(format!("Progression: {}", p.progression_policy)));
-
-    let section = |lines: &mut Vec<Line<'static>>, title: &str, items: Vec<String>| {
-        if items.is_empty() {
-            return;
-        }
-        lines.push(Line::from(""));
-        lines.push(bold(title));
-        lines.extend(
-            items.into_iter().map(|item| Line::from(vec![Span::styled("  • ", Style::default().fg(MUTED)), Span::raw(item)])),
-        );
-    };
-
-    // [R2.1]: present only on a live programme being reported on, and rendered first,
-    // because "where am I?" is the whole question `/programme status` was asked.
-    section(&mut lines, "Where you are", position_items(p));
-    section(&mut lines, "Goals served", p.goals.clone());
-    section(&mut lines, "Blocks", p.blocks.iter().map(|b| format!("{}: {}", b.weeks_label(), b.focus)).collect());
-    section(&mut lines, "Each week", p.week_template.iter().map(|d| format!("Day {}: {}", d.day_idx, d.focus)).collect());
-    section(&mut lines, "Notes", p.notes.clone());
-
+    let mut lines = programme_lines(heading(p.title.clone()), p, position_items(p));
     if !p.active {
         lines.push(Line::from(""));
         lines.push(muted(PROGRAMME_LOCK_IN_ASK.to_string()));
     }
     lines
+}
+
+/// The programme skeleton under a lead line of the caller's choosing: the shape, the span,
+/// the progression, then a section per list it carries.
+///
+/// Shared with the [C4.6] report so a live programme reads the same whether it is being
+/// shown or reported on — the report only differs in what it leads with, and in the two
+/// sections it appends.
+fn programme_lines(lead: Line<'static>, p: &ProgrammeView, where_you_are: Vec<String>) -> Vec<Line<'static>> {
+    let mut lines = vec![lead, muted(p.shape_line()), muted(span_line(p)), muted(format!("Progression: {}", p.progression_policy))];
+    // [R2.1]: present only on a live programme, and rendered first, because "where am I?"
+    // is the whole question `/programme status` was asked.
+    lines.extend(bullet_section("Where you are", &where_you_are));
+    lines.extend(bullet_section("Goals served", &p.goals));
+    lines.extend(bullet_section("Blocks", &p.blocks.iter().map(|b| format!("{}: {}", b.weeks_label(), b.focus)).collect::<Vec<_>>()));
+    lines.extend(bullet_section(
+        "Each week",
+        &p.week_template.iter().map(|d| format!("Day {}: {}", d.day_idx, d.focus)).collect::<Vec<_>>(),
+    ));
+    lines.extend(bullet_section("Notes", &p.notes));
+    lines
+}
+
+/// The dates the programme runs between, or the day it started when it is open-ended.
+fn span_line(p: &ProgrammeView) -> String {
+    match &p.target_end_date {
+        Some(end) => format!("{} to {end}", p.start_date),
+        None => format!("from {}", p.start_date),
+    }
+}
+
+/// The "where you are" bullets of a live programme, or empty for one that is merely
+/// proposed — which renders as no section at all, the same as any other empty list.
+fn position_items(p: &ProgrammeView) -> Vec<String> {
+    let Some(position) = p.position_line() else {
+        return Vec::new();
+    };
+    [position].into_iter().chain(next_and_counts(p)).collect()
+}
+
+/// What is next and how the grid behind it resolved — the half of the position that a
+/// report does not already say in its headline.
+fn next_and_counts(p: &ProgrammeView) -> Vec<String> {
+    let Some(status) = p.status.as_ref() else {
+        return Vec::new();
+    };
+    let next = status.next_slot.as_ref().map(|slot| format!("Next: {}", slot.label()));
+    next.into_iter().chain([status.counts_line()]).collect()
 }
 
 /// Charts are indented to sit under the series title, like every other detail line.
@@ -437,14 +451,7 @@ const BAR_TICKS: u64 = 10_000;
 fn render_progress(p: &ProgressView, width: u16) -> Vec<Line<'static>> {
     let mut lines = vec![heading(p.summary_line())];
     lines.extend(p.series.iter().flat_map(|s| std::iter::once(Line::from("")).chain(render_series(s, width))));
-
-    if !p.notes.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(bold("Notes"));
-        lines.extend(
-            p.notes.iter().map(|n| Line::from(vec![Span::styled("  • ", Style::default().fg(MUTED)), Span::raw(n.clone())])),
-        );
-    }
+    lines.extend(bullet_section("Notes", &p.notes));
     lines
 }
 
@@ -687,6 +694,12 @@ fn heading(text: String) -> Line<'static> {
 
 fn bold(text: &str) -> Line<'static> {
     Line::from(Span::styled(text.to_string(), Style::default().add_modifier(Modifier::BOLD)))
+}
+
+/// A heading for something the user should act on. The warning colour only underlines the
+/// wording — a terminal that renders it as plain text must still read as a warning.
+fn warning_heading(text: &str) -> Line<'static> {
+    Line::from(Span::styled(text.to_string(), Style::default().fg(WARNING).add_modifier(Modifier::BOLD)))
 }
 
 fn muted(text: String) -> Line<'static> {
